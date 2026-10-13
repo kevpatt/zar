@@ -1,5 +1,5 @@
-// Random access to an archive on disk. After open(), every const member is
-// safe to call from several threads at once.
+// Access to an archive on disk or in a stream. After opening, every const
+// member is safe to call from several threads at once.
 #pragma once
 
 #include "zar/format.hpp"
@@ -10,6 +10,7 @@
 #include <memory>
 #include <set>
 #include <string_view>
+#include <utility>
 
 struct ZSTD_DDict_s;
 
@@ -22,6 +23,15 @@ public:
     // be worked around, such as a damaged index copy, go to `on_warning`.
     static ArchiveReader open(const std::filesystem::path& path,
                               std::function<void(std::string_view)> on_warning = {});
+
+    // Reads an archive from a stream such as a pipe, which works when its
+    // index is at the head (§5.4). The header and the index are read now;
+    // data blocks must then be fetched in order with next_block(). The
+    // caller keeps ownership of `fd`.
+    static ArchiveReader open_stream(int fd, std::string name,
+                                     std::function<void(std::string_view)> on_warning = {});
+
+    bool streaming() const noexcept;
 
     ArchiveReader(ArchiveReader&&) noexcept;
     ~ArchiveReader();
@@ -47,6 +57,14 @@ public:
     // and returns an empty buffer.
     Bytes chunk(const Entry& entry, std::size_t index, std::uint64_t expected_length,
                 bool decompress) const;
+
+    // The same, for a block already read (e.g. by next_block()).
+    Bytes decode_chunk(const Entry& entry, const BlockHeader& block, ByteView payload,
+                       std::uint64_t expected_length, bool decompress) const;
+
+    // Stream only: reads the block at `offset`, skipping anything before it.
+    // Offsets must increase from call to call. Verifies the payload's CRC.
+    std::pair<BlockHeader, Bytes> next_block(std::int64_t offset);
 
 private:
     struct File;

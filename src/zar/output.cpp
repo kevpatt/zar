@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -43,8 +44,8 @@ mode_t current_umask()
 
 } // namespace
 
-Output::Output(int fd, std::filesystem::path temp, std::filesystem::path final_path)
-    : fd_(fd), temp_path_(std::move(temp)), final_path_(std::move(final_path))
+Output::Output(int fd, bool owns_fd, std::filesystem::path temp, std::filesystem::path final_path)
+    : fd_(fd), owns_fd_(owns_fd), temp_path_(std::move(temp)), final_path_(std::move(final_path))
 {
     buffer_.reserve(kBufferSize);
     struct stat st {};
@@ -68,18 +69,55 @@ Output Output::create_file(const std::filesystem::path& path, bool overwrite)
     if (fd < 0)
         throw_errno(path.string());
     ::fchmod(fd, 0666 & ~current_umask());    // mkstemp creates 0600
-    return Output(fd, temp, path);
+    return Output(fd, true, temp, path);
 }
 
 Output Output::standard_output()
 {
     if (::isatty(STDOUT_FILENO))
         throw std::runtime_error("refusing to write an archive to a terminal");
-    return Output(STDOUT_FILENO, {}, {});
+    return Output(STDOUT_FILENO, false, {}, "standard output");
+}
+
+Output Output::make_spool() const
+{
+    std::filesystem::path dir;
+    if (!temp_path_.empty()) {
+        dir = final_path_.parent_path();
+    } else {
+        const char* tmpdir = std::getenv("TMPDIR");
+        dir = tmpdir && *tmpdir ? tmpdir : "/tmp";
+    }
+    if (dir.empty())
+        dir = ".";
+
+    std::string temp = (dir / ".zar-spool-XXXXXX").string();
+    const int fd = ::mkstemp(temp.data());
+    if (fd < 0)
+        throw_errno(temp);
+    ::unlink(temp.c_str());    // anonymous: gone as soon as it's closed
+    return Output(fd, true, {}, "temporary file");
+}
+
+void Output::copy_to(Output& dest)
+{
+    flush();
+    Bytes chunk(kBufferSize);
+    for (std::uint64_t done = 0; done < position_;) {
+        const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(chunk.size(), position_ - done));
+        const auto n = ::pread(fd_, chunk.data(), want, static_cast<off_t>(done));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw_errno(final_path_.string());
+        dest.write({chunk.data(), static_cast<std::size_t>(n)});
+        done += static_cast<std::uint64_t>(n);
+    }
 }
 
 Output::Output(Output&& other) noexcept
     : fd_(std::exchange(other.fd_, -1)),
+      owns_fd_(other.owns_fd_),
       temp_path_(std::move(other.temp_path_)),
       final_path_(std::move(other.final_path_)),
       buffer_(std::move(other.buffer_)),
@@ -93,10 +131,10 @@ Output::Output(Output&& other) noexcept
 
 Output::~Output()
 {
-    if (!temp_path_.empty()) {
+    if (owns_fd_ && fd_ >= 0)
         ::close(fd_);
+    if (!temp_path_.empty())
         ::unlink(temp_path_.c_str());
-    }
 }
 
 void Output::write(ByteView bytes)

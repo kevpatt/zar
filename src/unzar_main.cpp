@@ -5,6 +5,7 @@
 
 #include <charconv>
 #include <ctime>
+#include <functional>
 #include <getopt.h>
 #include <iostream>
 #include <optional>
@@ -12,12 +13,17 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 #include <zstd.h>
 
 namespace {
 
 constexpr std::string_view kUsage = R"(usage: unzar [options] ARCHIVE [PATH...]
+
+ARCHIVE may be '-' for standard input. Reading from a pipe works for
+archives created with zar --head-index.
 
   -C, --directory=DIR    extract into DIR (default: current directory)
   -l, --list             print a listing: each directory on its own line,
@@ -227,6 +233,21 @@ bool selected(std::string_view path, const std::vector<std::string>& selections,
     return false;
 }
 
+// "-" reads stdin: at random if it's a file, otherwise as a stream.
+zar::ArchiveReader open_archive(const std::string& archive,
+                                const std::function<void(std::string_view)>& warn)
+{
+    if (archive != "-")
+        return zar::ArchiveReader::open(archive, warn);
+
+    struct stat st {};
+    if (::fstat(STDIN_FILENO, &st) == 0 && S_ISREG(st.st_mode))
+        return zar::ArchiveReader::open("/dev/fd/0", warn);
+    if (::isatty(STDIN_FILENO))
+        throw std::runtime_error("refusing to read an archive from a terminal");
+    return zar::ArchiveReader::open_stream(STDIN_FILENO, "standard input", warn);
+}
+
 int run(Command& cmd)
 {
     std::uint64_t warnings = 0;
@@ -236,7 +257,7 @@ int run(Command& cmd)
     };
     cmd.options.on_warning = warn;
 
-    const auto reader = zar::ArchiveReader::open(cmd.archive, warn);
+    auto reader = open_archive(cmd.archive, warn);
 
     std::vector<zar::Entry> chosen;
     std::set<std::string_view> matched;

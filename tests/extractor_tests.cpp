@@ -10,6 +10,8 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace zar;
@@ -20,7 +22,7 @@ namespace {
 fs::path make_archive(const fs::path& archive, const fs::path& source)
 {
     auto out = Output::create_file(archive, true);
-    create_archive(out, std::vector{source}, {});
+    create_archive(out, std::vector{source / "."}, {});
     out.commit();
     return archive;
 }
@@ -43,7 +45,7 @@ fs::path craft_archive(const fs::path& archive, std::vector<Item> items)
         }
         encode_entry(index, entry);
     }
-    writer.finish(writer.write_block(BlockType::IndexRaw, index));
+    writer.finish(BlockType::IndexRaw, index);
     out.commit();
     return archive;
 }
@@ -66,7 +68,7 @@ Run run(const fs::path& archive, ExtractOptions options)
 {
     Run result;
     options.on_warning = [&](std::string_view m) { result.warnings.emplace_back(m); };
-    const auto reader = ArchiveReader::open(archive, options.on_warning);
+    auto reader = ArchiveReader::open(archive, options.on_warning);
     const auto groups = group_by_directory(reader.entries());
     Extractor extractor(reader, options);
     extractor.prepare(groups);
@@ -231,7 +233,7 @@ TEST(parallel_extraction_is_exact_at_any_thread_count)
         auto out = Output::create_file(archive, true);
         CreateOptions options;
         options.chunk_size = 4096;
-        create_archive(out, std::vector{src}, options);
+        create_archive(out, std::vector{src / "."}, options);
         out.commit();
     }
 
@@ -262,7 +264,7 @@ TEST(damage_in_one_chunk_fails_only_that_file)
         auto out = Output::create_file(archive, true);
         CreateOptions options;
         options.chunk_size = 8192;
-        create_archive(out, std::vector{src}, options);
+        create_archive(out, std::vector{src / "."}, options);
         out.commit();
     }
 
@@ -363,7 +365,7 @@ TEST(sub_indexes_load_and_must_form_a_tree)
         for (const auto& e : root)
             encode_entry(root_index, e);
         CHECK(writer.write_block(BlockType::IndexRaw, sub_index) == kFirst);
-        writer.finish(writer.write_block(BlockType::IndexRaw, root_index));
+        writer.finish(BlockType::IndexRaw, root_index);
         out.commit();
         return path;
     };
@@ -383,6 +385,90 @@ TEST(sub_indexes_load_and_must_form_a_tree)
 
     // Two directories sharing one sub-index.
     CHECK_THROWS(ArchiveReader::open(write({}, {dir_with_subindex("d1"), dir_with_subindex("d2")})));
+}
+
+TEST(head_index_archives_extract_from_a_pipe)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    std::vector<std::pair<std::string, Bytes>> files;
+    for (unsigned i = 0; i < 25; ++i) {
+        files.emplace_back("d" + std::to_string(i % 3) + "/f" + std::to_string(i),
+                           random_bytes((i * 4999) % 30'000, i));
+        write_file(src / files.back().first, files.back().second);
+    }
+    fs::create_symlink("d0/f0", src / "link");
+    fs::create_hard_link(src / "d1/f1", src / "hard");
+
+    for (const std::uint8_t align : {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{12}}) {
+        const auto archive = tmp.path() / "head.zar";
+        {
+            auto out = Output::create_file(archive, true);
+            CreateOptions options;
+            options.head_index = true;
+            options.chunk_size = 4096;
+            options.align_log2 = align;
+            create_archive(out, std::vector{src / "."}, options);
+            out.commit();
+        }
+        const auto bytes = read_file(archive);
+
+        // Random access still works, through the head copy of the index.
+        CHECK(ArchiveReader::open(archive).header().index_offset < 0);
+
+        // Feed the archive through a pipe from another thread.
+        int fds[2];
+        CHECK(::pipe(fds) == 0);
+        std::jthread feeder([&, fd = fds[1]] {
+            for (std::size_t done = 0; done < bytes.size();) {
+                const auto n = ::write(fd, bytes.data() + done, std::min<std::size_t>(65'536, bytes.size() - done));
+                if (n <= 0)
+                    break;
+                done += static_cast<std::size_t>(n);
+            }
+            ::close(fd);
+        });
+
+        auto reader = ArchiveReader::open_stream(fds[0], "pipe");
+        CHECK(reader.streaming());
+        const auto dest = tmp.path() / ("out" + std::to_string(align));
+        auto options = into(dest);
+        options.threads = 4;
+        Run result;
+        options.on_warning = [&](std::string_view m) { result.warnings.emplace_back(m); };
+        const auto groups = group_by_directory(reader.entries());
+        Extractor extractor(reader, options);
+        extractor.prepare(groups);
+        for (const auto& group : groups) {
+            extractor.enter(group);
+            for (const auto* member : group.members)
+                extractor.extract(*member);
+        }
+        extractor.finish();
+        feeder.join();
+        ::close(fds[0]);
+
+        CHECK(result.warnings.empty());
+        for (const auto& [path, data] : files)
+            CHECK(read_file(dest / path) == data);
+        CHECK(read_file(dest / "hard") == files[1].second);
+        CHECK(fs::read_symlink(dest / "link") == "d0/f0");
+    }
+}
+
+TEST(streaming_needs_a_head_index)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/f", text("x"));
+    const auto archive = make_archive(tmp.path() / "a.zar", tmp.path() / "src");
+    const auto bytes = read_file(archive);
+
+    int fds[2];
+    CHECK(::pipe(fds) == 0);
+    CHECK(::write(fds[1], bytes.data(), bytes.size()) == static_cast<ssize_t>(bytes.size()));
+    ::close(fds[1]);
+    CHECK_THROWS(ArchiveReader::open_stream(fds[0], "pipe"));
+    ::close(fds[0]);
 }
 
 TEST(reader_finds_an_archive_after_other_data)

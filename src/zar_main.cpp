@@ -23,18 +23,24 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::string_view kUsage = R"(usage: zar [options] PATH...
+constexpr std::string_view kUsage = R"(usage: zar [options] PATH
+       zar [options] -m -o ARCHIVE PATH...
 
-A single directory is archived by its contents; otherwise each PATH is
-stored under its own name.
+PATH is stored under its own name, so extracting recreates it:
+  zar proj      proj (file, directory, or symlink) is stored as proj
+  zar proj/     the same, but proj must be a directory (symlinks followed)
+  zar proj/.    the contents of proj are stored, without proj itself
+  zar .         the contents of the current directory
 
-  -o, --output=FILE      archive to write ('-' for stdout); with a single
-                         PATH, defaults to PATH.zar
+  -o, --output=FILE      archive to write ('-' for stdout); defaults to
+                         PATH.zar beside PATH, or NAME.zar here for '.'
+  -m, --many             archive several PATHs into one archive (needs -o)
   -y, --yes              overwrite an existing archive
   -l, --level=N          zstd compression level (default 3)
   -j, --threads[=N]      worker threads (default: one per CPU core)
       --chunk-size=SIZE  split files into independently compressed chunks
-                         of SIZE bytes, 4K-1G (default 1M)
+                         of SIZE bytes: a power of two from 4K to 1G, with
+                         an optional K, M, or G suffix (default 1M)
       --align[=N]        align block payloads to N bytes (default 8; with no
                          N, the CPU's cache-line size)
       --owner[=WHICH]    store file ownership: ids, names, or both (default)
@@ -42,6 +48,8 @@ stored under its own name.
       --all-times        store access, change, and birth times too
       --names=MODE       non-UTF-8 file names: raw (default), skip, latin1
       --compress-all     compress even files that are usually precompressed
+      --head-index       also put the index at the front, so the archive can
+                         be extracted from a pipe (data is written twice)
   -v, --verbose          list files as they are added
   -h, --help             show this help
       --version          show version information
@@ -113,27 +121,11 @@ int parse_level(std::string_view text)
     return static_cast<int>(level);
 }
 
-// "photos" -> "photos.zar", "dir/" -> "dir.zar", "." -> "../<cwd name>.zar".
-std::string default_archive_name(const fs::path& input)
-{
-    std::string path = input.string();
-    while (path.size() > 1 && path.back() == '/')
-        path.pop_back();
-    const auto name = fs::path(path).filename();
-    if (name.empty() || name == "." || name == "..") {
-        std::error_code ec;
-        const auto canonical = fs::weakly_canonical(input, ec);
-        if (ec || canonical.filename().empty())
-            throw UsageError("can't name an archive after " + input.string() + "; use -o");
-        path = canonical.string();
-    }
-    return path + ".zar";
-}
-
 struct Command {
     zar::CreateOptions options;
     std::string output;
     bool overwrite = false;
+    bool many = false;
     bool verbose = false;
     std::vector<fs::path> inputs;
 };
@@ -146,6 +138,7 @@ enum LongOnly {
     kAllTimes,
     kNames,
     kCompressAll,
+    kHeadIndex,
     kVersion,
 };
 
@@ -155,6 +148,7 @@ std::optional<Command> parse(int argc, char** argv)
     static const option kOptions[] = {
         {"output", required_argument, nullptr, 'o'},
         {"yes", no_argument, nullptr, 'y'},
+        {"many", no_argument, nullptr, 'm'},
         {"level", required_argument, nullptr, 'l'},
         {"threads", optional_argument, nullptr, 'j'},
         {"chunk-size", required_argument, nullptr, kChunkSize},
@@ -164,6 +158,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"all-times", no_argument, nullptr, kAllTimes},
         {"names", required_argument, nullptr, kNames},
         {"compress-all", no_argument, nullptr, kCompressAll},
+        {"head-index", no_argument, nullptr, kHeadIndex},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, kVersion},
@@ -173,11 +168,12 @@ std::optional<Command> parse(int argc, char** argv)
     Command cmd;
     auto& opt = cmd.options;
     int c;
-    while ((c = ::getopt_long(argc, argv, "o:yl:j::vh", kOptions, nullptr)) != -1) {
+    while ((c = ::getopt_long(argc, argv, "o:myl:j::vh", kOptions, nullptr)) != -1) {
         const std::string_view arg = optarg ? optarg : "";
         switch (c) {
         case 'o': cmd.output = arg; break;
         case 'y': cmd.overwrite = true; break;
+        case 'm': cmd.many = true; break;
         case 'l': opt.level = parse_level(arg); break;
         case 'j':
             opt.threads = 0;    // one per core
@@ -190,8 +186,9 @@ std::optional<Command> parse(int argc, char** argv)
             break;
         case kChunkSize:
             opt.chunk_size = parse_size(arg, "chunk size");
-            if (opt.chunk_size < (1 << 12) || opt.chunk_size > (1 << 30))
-                throw UsageError("chunk size must be between 4K and 1G");
+            if (!std::has_single_bit(opt.chunk_size) || opt.chunk_size < (1 << 12) ||
+                opt.chunk_size > (1 << 30))
+                throw UsageError("chunk size must be a power of two from 4K to 1G");
             break;
         case kAlign: opt.align_log2 = parse_alignment(optarg); break;
         case kOwner:
@@ -217,6 +214,7 @@ std::optional<Command> parse(int argc, char** argv)
                 throw UsageError("--names must be raw, skip, or latin1");
             break;
         case kCompressAll: opt.compress_all = true; break;
+        case kHeadIndex: opt.head_index = true; break;
         case 'v': cmd.verbose = true; break;
         case 'h':
             std::cout << kUsage;
@@ -234,10 +232,14 @@ std::optional<Command> parse(int argc, char** argv)
         cmd.inputs.emplace_back(argv[i]);
     if (cmd.inputs.empty())
         throw UsageError("nothing to archive");
-    if (cmd.output.empty()) {
+    if (cmd.many) {
+        if (cmd.output.empty())
+            throw UsageError("-m needs -o to name the archive");
+    } else {
         if (cmd.inputs.size() > 1)
-            throw UsageError("with several inputs, name the archive with -o");
-        cmd.output = default_archive_name(cmd.inputs.front());
+            throw UsageError("one PATH at a time; use -m -o ARCHIVE for several");
+        if (cmd.output.empty())
+            cmd.output = zar::default_archive_path(zar::parse_input(cmd.inputs.front()));
     }
     return cmd;
 }

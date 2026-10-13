@@ -26,6 +26,7 @@ struct CreateOptions {
     bool all_times = false;    // atime, ctime, and btime as well as mtime
     NameMode names = NameMode::Raw;
     bool compress_all = false;
+    bool head_index = false;    // also put the index first, for streaming (§5.4)
 
     std::function<void(std::string_view)> on_warning;
     std::function<void(std::string_view)> on_entry;    // each archive path as it's added
@@ -41,13 +42,35 @@ struct CreateStats {
     std::uint64_t warnings = 0;
 };
 
+// How a path given to zar is archived, following POSIX path resolution:
+//
+//   "proj"     a file, directory, or symlink (not followed), stored under its
+//              own name, so extracting recreates proj
+//   "proj/"    the same, but proj must be a directory (a symlink to one is
+//              followed, and stored as a directory named proj)
+//   "proj/."   the directory's contents, stored at the top level
+//   "."        the current directory's contents
+struct InputSpec {
+    std::filesystem::path path;    // as given
+    std::string name;              // the stored name; empty for contents
+    bool contents = false;
+    bool must_be_directory = false;
+};
+
+// Throws std::runtime_error for paths that can't be archived by name, like "/".
+InputSpec parse_input(const std::filesystem::path& input);
+
+// The archive name zar uses when -o isn't given: "proj" or "proj/." become
+// "proj.zar" beside proj; "." becomes "<current directory's name>.zar" in
+// the current directory.
+std::filesystem::path default_archive_path(const InputSpec& input);
+
 // Writes a complete archive of `inputs` to `out` (without committing it).
 //
-// A single directory input is stored by its contents, so its files appear
-// at the top level of the archive. Otherwise each input is stored under its
-// own name. Problems with individual files are reported through
-// options.on_warning and skipped; anything else, including every input
-// being unreadable, throws.
+// Problems with individual files below an input are reported through
+// options.on_warning and skipped. Anything else throws: a missing input, an
+// input with a trailing slash that isn't a directory, or two inputs that
+// would store the same path.
 CreateStats create_archive(Output& out, std::span<const std::filesystem::path> inputs,
                            const CreateOptions& options);
 

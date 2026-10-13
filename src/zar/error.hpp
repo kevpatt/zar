@@ -9,4 +9,9 @@ struct FormatError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// The archive ends before data it refers to.
+struct TruncatedError : FormatError {
+    TruncatedError() : FormatError("archive is truncated") {}
+};
+
 } // namespace zar

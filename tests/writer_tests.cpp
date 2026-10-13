@@ -131,7 +131,7 @@ TEST(writer_round_trips_a_tree)
     options.chunk_size = 4096;
     options.threads = 3;
     CreateStats stats;
-    const auto archive = build(tmp.path() / "out.zar", {src}, options, &stats);
+    const auto archive = build(tmp.path() / "out.zar", {src / "."}, options, &stats);
 
     CHECK(stats.warnings == 0);
     CHECK(stats.files == 5);
@@ -139,7 +139,7 @@ TEST(writer_round_trips_a_tree)
     CHECK(stats.symlinks == 1);
     CHECK(archive.header.align_log2 == kAlignLog2Default);
 
-    // A single directory is stored by its contents.
+    // "project/." stores the directory's contents, not the directory.
     CHECK(archive.find("project") == nullptr);
     CHECK(archive.entries.size() == 9);
 
@@ -203,7 +203,7 @@ TEST(writer_aligns_payloads)
     for (const std::uint8_t log2 : {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{7}}) {
         CreateOptions options;
         options.align_log2 = log2;
-        const auto archive = build(tmp.path() / "out.zar", {tmp.path() / "in"}, options);
+        const auto archive = build(tmp.path() / "out.zar", {tmp.path() / "in" / "."}, options);
         CHECK(archive.header.align_log2 == log2);
         CHECK((archive.header.index_offset + 32) % (1 << log2) == 0);
         for (const auto& [path, entry] : archive.entries)
@@ -223,18 +223,18 @@ TEST(writer_handles_non_utf8_names)
     }
 
     CreateStats stats;
-    auto archive = build(tmp.path() / "out.zar", {tmp.path() / "in"}, {}, &stats);
+    auto archive = build(tmp.path() / "out.zar", {tmp.path() / "in" / "."}, {}, &stats);
     CHECK(stats.warnings == 1);
     CHECK(archive.find(latin1_name) && archive.find(latin1_name)->flags == entry_flags::kPathRaw);
 
     CreateOptions latin1;
     latin1.names = NameMode::Latin1;
-    archive = build(tmp.path() / "out.zar", {tmp.path() / "in"}, latin1);
+    archive = build(tmp.path() / "out.zar", {tmp.path() / "in" / "."}, latin1);
     CHECK(archive.find("caf\xc3\xa9.txt") && archive.find("caf\xc3\xa9.txt")->flags == 0);
 
     CreateOptions skip;
     skip.names = NameMode::Skip;
-    archive = build(tmp.path() / "out.zar", {tmp.path() / "in"}, skip);
+    archive = build(tmp.path() / "out.zar", {tmp.path() / "in" / "."}, skip);
     CHECK(archive.entries.size() == 1);
 }
 
@@ -252,7 +252,7 @@ TEST(writer_streams_without_seeking)
     {
         auto out = Output::standard_output();
         CHECK(!out.seekable());
-        create_archive(out, std::vector{tmp.path() / "in"}, {});
+        create_archive(out, std::vector{tmp.path() / "in" / "."}, {});
         out.commit();
     }
     ::dup2(saved, STDOUT_FILENO);
@@ -272,4 +272,72 @@ TEST(writer_streams_without_seeking)
     std::copy(encoded.begin(), encoded.end(), patched.begin());
     const Archive archive(patched);
     CHECK(archive.find("x") && archive.content(*archive.find("x")) == text("streamed"));
+}
+
+TEST(inputs_follow_posix_path_rules)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "proj/src/main.cpp", text("int main() {}"));
+    write_file(tmp.path() / "file.txt", text("plain"));
+    fs::create_directory_symlink("proj", tmp.path() / "link");
+    const auto out = tmp.path() / "out.zar";
+
+    // A directory is stored under its own name.
+    auto archive = build(out, {tmp.path() / "proj"}, {});
+    CHECK(archive.find("proj") && archive.find("proj")->type == EntryType::Dir);
+    CHECK(archive.find("proj/src/main.cpp") != nullptr);
+
+    // A trailing slash changes nothing for a directory...
+    archive = build(out, {tmp.path() / "proj/"}, {});
+    CHECK(archive.find("proj/src/main.cpp") != nullptr);
+
+    // ...but a file with one is an error, as in POSIX.
+    CHECK_THROWS(build(out, {tmp.path() / "file.txt/"}, {}));
+    archive = build(out, {tmp.path() / "file.txt"}, {});
+    CHECK(archive.entries.size() == 1 && archive.find("file.txt"));
+
+    // "/." stores the contents.
+    archive = build(out, {tmp.path() / "proj/."}, {});
+    CHECK(archive.find("proj") == nullptr);
+    CHECK(archive.find("src/main.cpp") != nullptr);
+
+    // A symlink is stored as a symlink, unless a slash says to follow it.
+    archive = build(out, {tmp.path() / "link"}, {});
+    CHECK(archive.entries.size() == 1 && archive.find("link")->type == EntryType::Symlink);
+    archive = build(out, {tmp.path() / "link/"}, {});
+    CHECK(archive.find("link") && archive.find("link")->type == EntryType::Dir);
+    CHECK(archive.find("link/src/main.cpp") != nullptr);
+
+    // Missing inputs and the root by name are errors.
+    CHECK_THROWS(build(out, {tmp.path() / "missing"}, {}));
+    CHECK_THROWS(build(out, {"/"}, {}));
+}
+
+TEST(several_inputs_must_not_collide)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "a/src/one.txt", text("1"));
+    write_file(tmp.path() / "b/src/two.txt", text("2"));
+    write_file(tmp.path() / "b/same.txt", text("b"));
+    write_file(tmp.path() / "c/same.txt", text("c"));
+    const auto out = tmp.path() / "out.zar";
+
+    const auto archive = build(out, {tmp.path() / "a", tmp.path() / "b"}, {});
+    CHECK(archive.find("a/src/one.txt") && archive.find("b/src/two.txt"));
+
+    CHECK_THROWS(build(out, {tmp.path() / "a/src", tmp.path() / "b/src"}, {}));    // both "src"
+    CHECK_THROWS(build(out, {tmp.path() / "b/.", tmp.path() / "c/."}, {}));        // both "same.txt"
+}
+
+TEST(default_archive_names)
+{
+    const auto name = [](const char* input) { return default_archive_path(parse_input(input)).native(); };
+    CHECK(name("proj") == "proj.zar");
+    CHECK(name("proj/") == "proj.zar");
+    CHECK(name("proj/.") == "proj.zar");
+    CHECK(name("a/b/proj//") == "a/b/proj.zar");
+    CHECK(name("notes.txt") == "notes.txt.zar");
+    CHECK(name(".") == fs::current_path().filename().native() + ".zar");    // here, not beside
+    CHECK(name("./") == name("."));
+    CHECK_THROWS(name("/."));
 }

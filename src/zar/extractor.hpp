@@ -58,7 +58,8 @@ std::string_view base_name(std::string_view path);
 
 class Extractor {
 public:
-    Extractor(const ArchiveReader& reader, const ExtractOptions& options);
+    // A streaming reader is read forward as finish() extracts the data.
+    Extractor(ArchiveReader& reader, const ExtractOptions& options);
     ~Extractor();
 
     // Checks the destination before anything is written. Throws if any path

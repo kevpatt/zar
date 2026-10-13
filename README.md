@@ -30,20 +30,38 @@ ctest --test-dir build
 
 ```sh
 zar ~/src/project                    # writes ~/src/project.zar
-zar -o p.zar a b.txt                 # several inputs need -o
 zar -o - ~/src/project | ssh host 'cat > project.zar'
+zar --head-index -o - proj | ssh host 'unzar -'    # extract as it arrives
+zar -m -o bundle.zar notes.txt photos    # several inputs need -m and -o
 
 unzar project.zar                    # extract into the current directory
 unzar -C /tmp/out project.zar        # extract elsewhere
-unzar project.zar src/main.cpp       # extract one file
+unzar project.zar project/src/main.cpp   # extract one file
 unzar --list --scan project.zar      # list contents while checking the archive
 unzar --test project.zar             # decompress and verify everything
+curl -s https://example.com/proj.zar | unzar -   # needs a --head-index archive
 ```
 
-Archiving a single directory stores paths relative to that directory, so
-`zar ~/src/project` stores `src/main.cpp`, not `project/src/main.cpp`. With
-several inputs, each is stored under its own name (`zar -o p.zar a b.txt`
-stores `a/...` and `b.txt`).
+### What gets stored
+
+zar follows POSIX path rules, as `tar` and `cp` do:
+
+| Input | Stored as | Extracting creates |
+|---|---|---|
+| `proj` (a directory) | `proj`, `proj/src/main.cpp`, … | `proj/` |
+| `proj/` | the same, but fails if `proj` isn't a directory | `proj/` |
+| `proj/.` | `src/main.cpp`, … (the contents only) | the contents, directly |
+| `.` | the current directory's contents | the contents, directly |
+| `notes.txt` | `notes.txt` | `notes.txt` |
+| `link` (a symlink) | the symlink itself | the symlink |
+| `link/` | the directory it points to, named `link` | `link/` |
+
+Without `-o`, the archive is named after the input and written beside it:
+`proj`, `proj/` and `proj/.` all produce `proj.zar`. For `.`, the archive is
+named after the current directory and written inside it.
+
+zar archives one input unless `-m` is given. With `-m`, inputs that would
+store the same path (two directories both named `src`, say) are an error.
 
 Both commands exit with 0 on success, 1 if some files had problems (each
 reported on stderr), and 2 on a fatal error. A fatal error in `zar` leaves no
@@ -53,17 +71,19 @@ archive behind.
 
 | Option | Meaning |
 |---|---|
-| `-o, --output=FILE` | archive to write (`-` for stdout); with a single input, defaults to the input's path plus `.zar` |
+| `-o, --output=FILE` | archive to write (`-` for stdout); see above for the default |
+| `-m, --many` | archive several inputs (requires `-o`) |
 | `-y, --yes` | overwrite an existing archive |
 | `-l, --level=N` | zstd compression level (default 3) |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
-| `--chunk-size=SIZE` | split files into independently compressed chunks of SIZE bytes (default 1M) |
+| `--chunk-size=SIZE` | split files into independently compressed chunks of SIZE bytes: a power of two from 4K to 1G, with an optional `K`, `M`, or `G` suffix (default 1M) |
 | `--align[=N]` | align block payloads to N bytes; with no N, the CPU's cache-line size. The default is 8. N must be a power of two up to 1M; values below 8 pack tighter but leave fields unaligned. |
 | `--owner[=WHICH]` | store ownership: `ids`, `names`, or `both` (the default when given); omitted otherwise |
 | `--nsec` | store the sub-second part of timestamps (omitted by default) |
 | `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
+| `--head-index` | also put the index at the front, so the archive can be extracted from a pipe; data is staged in a temporary file and written twice |
 | `-v, --verbose` | list files as they are added |
 
 Files whose extension marks them as already compressed — `.jpg`, `.png`,
@@ -84,6 +104,10 @@ shrink is stored raw.
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core); chunks are verified, decompressed, and written in parallel |
 | `-v, --verbose` | add permissions and owner to the listing; print a summary |
+
+`ARCHIVE` may be `-` for standard input. If that's a pipe, the archive must
+have been made with `zar --head-index`: `unzar` reads the index from the
+front, then extracts each file as its data arrives.
 
 Before extracting anything, `unzar` checks whether any target already exists;
 if one does and `-y` wasn't given, it stops without writing anything.

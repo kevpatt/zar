@@ -178,6 +178,24 @@ rewrite the 32-byte zar header in place, setting `index_offset` to -1 or to
 the new index. Superseded blocks, including the old trailer, become
 unreferenced data.
 
+### 5.4 Head index and streaming
+
+A writer may put a copy of the root index before the base (§2.2), so the
+zar header's `index_offset` is negative, and the trailer points to a second
+copy at the end. Such an archive can be read from a stream, such as a pipe,
+in a single forward pass:
+
+1. Read the zar header and everything up to the base. That region holds the
+   root index and, if the writer put them there, sub-indexes and
+   dictionaries, so a reader can hold it in memory and look things up in it.
+2. Read the data blocks that the index references, in increasing offset
+   order, skipping anything in between.
+
+Anything a streaming reader needs other than data blocks must lie before the
+base. A writer can only produce a head index once it knows every data
+block's offset, so a streaming writer has to stage the data (for example in
+a temporary file) before emitting the archive.
+
 ## 6. Index
 
 An index block's (decompressed) payload is a concatenation of **entries**,
@@ -316,9 +334,11 @@ the one encountered later in a depth-first walk of the indexes wins.
 
 ## 7. Paths
 
-Paths are stored relative to the root of whatever was archived: archiving
-`/home/me/proj` stores `src/main.cpp`, not `proj/src/main.cpp` or an
-absolute path. Archiving a single file stores just its name.
+Paths are relative; the writer decides what they are relative to, and
+extractors place them under a destination directory. For example, `zar`
+stores a directory `/home/me/proj` as `proj`, `proj/src/main.cpp`, and so
+on, so extracting recreates `proj`; given `proj/.`, it stores only the
+contents (`src/main.cpp`). Absolute paths are never stored.
 
 A path:
 

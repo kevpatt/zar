@@ -179,12 +179,27 @@ struct Extractor::Impl {
         std::atomic<bool> failed = false;
         std::mutex mutex;
         std::string error;
+        std::string dir_path;    // archive path of its directory
         std::string name;
+        bool opened = false;     // stream: creation was attempted
         Fd dir;    // its directory, so a failed file can be removed
         Fd out;
     };
 
-    const ArchiveReader& reader;
+    // Stream: a chunk waiting for its block to be read.
+    struct StreamedChunk {
+        std::shared_ptr<FileJob> job;
+        std::size_t index;
+        std::uint64_t position;
+    };
+
+    std::map<std::int64_t, std::vector<StreamedChunk>> streamed;    // by block offset
+    // Once a stream breaks (it was truncated, say), every later block is lost
+    // too; those files are counted and reported once rather than one by one.
+    std::string stream_error;
+    std::uint64_t lost_to_stream = 0;
+
+    ArchiveReader& reader;
     const ExtractOptions& options;
     const bool writing = options.mode == ExtractMode::Extract;
     const bool decompress = options.mode != ExtractMode::Scan;
@@ -207,7 +222,7 @@ struct Extractor::Impl {
     std::counting_semaphore<> in_flight{static_cast<std::ptrdiff_t>(threads) * 4};
     ThreadPool pool{threads};    // last: destroyed first, while what its jobs use still exists
 
-    Impl(const ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o)
+    Impl(ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o)
     {
         if (!writing)
             return;
@@ -381,27 +396,27 @@ struct Extractor::Impl {
         }
     }
 
-    // Creates the file and queues its chunks; the pool does the rest.
+    // Creates the file and queues its chunks; the pool does the rest. When
+    // reading a stream, chunks wait for their blocks to come by, and the file
+    // is created when its first one does.
     void extract_file(const Entry& entry)
     {
         auto job = std::make_shared<FileJob>(entry, ArchiveReader::chunk_lengths(entry));
+        job->dir_path = current_path;
+        if (writing && !current)
+            throw ExtractError("its directory could not be created");
 
-        if (writing) {
-            if (!current)
-                throw ExtractError("its directory could not be created");
-            job->name = base_name(entry.path);
-            for (;;) {
-                job->out = Fd(::openat(current.get(), job->name.c_str(),
-                                       O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
-                if (job->out || errno != EEXIST)
-                    break;
-                remove_existing(current.get(), job->name);
+        if (reader.streaming() && !job->lengths.empty()) {
+            std::uint64_t position = 0;
+            for (std::size_t i = 0; i < job->lengths.size(); ++i) {
+                streamed[entry.chunks[i]].push_back({job, i, position});
+                position += job->lengths[i];
             }
-            if (!job->out)
-                throw_errno("cannot create file");
-            job->dir = Fd(::dup(current.get()));
+            return;
         }
 
+        if (writing)
+            create_file(*job, current.get());
         if (job->lengths.empty()) {
             complete(*job);
             return;
@@ -409,17 +424,36 @@ struct Extractor::Impl {
         std::uint64_t position = 0;
         for (std::size_t i = 0; i < job->lengths.size(); ++i) {
             in_flight.acquire();
-            pool.submit([this, job, i, position] { extract_chunk(*job, i, position); });
+            pool.submit([this, job, i, position] {
+                run_chunk(*job, i, position,
+                          [&] { return reader.chunk(job->entry, i, job->lengths[i], decompress); });
+            });
             position += job->lengths[i];
         }
     }
 
-    // Runs on a worker thread.
-    void extract_chunk(FileJob& job, std::size_t index, std::uint64_t position)
+    void create_file(FileJob& job, int dir)
+    {
+        job.name = base_name(job.entry.path);
+        for (;;) {
+            job.out = Fd(::openat(dir, job.name.c_str(),
+                                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+            if (job.out || errno != EEXIST)
+                break;
+            remove_existing(dir, job.name);
+        }
+        if (!job.out)
+            throw_errno("cannot create file");
+        job.dir = Fd(::dup(dir));
+    }
+
+    // Runs on a worker thread: `load` produces the chunk's (decompressed) data.
+    template <typename Load>
+    void run_chunk(FileJob& job, std::size_t index, std::uint64_t position, Load load)
     {
         if (!job.failed) {
             try {
-                const auto data = reader.chunk(job.entry, index, job.lengths[index], decompress);
+                const auto data = load();
                 job.crcs[index] = crc32c(data);
                 if (job.out)
                     write_all_at(job.out.get(), data, position);
@@ -430,6 +464,50 @@ struct Extractor::Impl {
         in_flight.release();
         if (--job.remaining == 0)
             complete(job);
+    }
+
+    // Stream only: reads every needed block in archive order, handing each
+    // chunk that uses it to the pool.
+    void run_stream()
+    {
+        for (const auto& [offset, refs] : streamed) {
+            std::shared_ptr<const std::pair<BlockHeader, Bytes>> block;
+            std::string error = stream_error;
+            if (stream_error.empty()) {
+                try {
+                    block = std::make_shared<const std::pair<BlockHeader, Bytes>>(reader.next_block(offset));
+                } catch (const TruncatedError& e) {
+                    error = stream_error = e.what();
+                } catch (const FormatError& e) {
+                    error = e.what();    // just this block is bad; the next can still be found
+                } catch (const std::exception& e) {
+                    error = stream_error = e.what();    // e.g. a read error
+                }
+            }
+
+            for (const auto& ref : refs) {
+                auto& job = *ref.job;
+                if (writing && !job.opened) {
+                    job.opened = true;
+                    try {
+                        create_file(job, open_directory(job.dir_path, true).get());
+                    } catch (const std::exception& e) {
+                        job.fail(e.what());
+                    }
+                }
+                in_flight.acquire();
+                pool.submit([this, ref, block, error] {
+                    const auto& job = *ref.job;
+                    run_chunk(*ref.job, ref.index, ref.position, [&] {
+                        if (!block)
+                            throw FormatError(error);
+                        return reader.decode_chunk(job.entry, block->first, block->second,
+                                                   job.lengths[ref.index], decompress);
+                    });
+                });
+            }
+        }
+        streamed.clear();
     }
 
     // Runs once all of a file's chunks are done, on whichever thread finished last.
@@ -448,7 +526,12 @@ struct Extractor::Impl {
         } catch (const std::exception& e) {
             if (job.out)
                 ::unlinkat(job.dir.get(), job.name.c_str(), 0);    // don't leave a partial file
-            warn(job.entry.path + ": " + e.what());
+            if (!stream_error.empty() && job.error == stream_error) {
+                std::lock_guard lock(mutex);
+                ++lost_to_stream;
+            } else {
+                warn(job.entry.path + ": " + e.what());
+            }
             return;
         }
 
@@ -487,7 +570,12 @@ struct Extractor::Impl {
 
     ExtractStats finish()
     {
+        if (reader.streaming())
+            run_stream();
         pool.wait();
+        if (lost_to_stream)
+            warn(stream_error + "; " + std::to_string(lost_to_stream) +
+                 (lost_to_stream == 1 ? " file was" : " files were") + " not extracted");
         if (!writing)
             return stats;
         current = Fd();
@@ -510,7 +598,7 @@ struct Extractor::Impl {
     }
 };
 
-Extractor::Extractor(const ArchiveReader& reader, const ExtractOptions& options)
+Extractor::Extractor(ArchiveReader& reader, const ExtractOptions& options)
     : impl_(std::make_unique<Impl>(reader, options))
 {
 }

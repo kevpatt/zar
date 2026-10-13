@@ -15,10 +15,18 @@
 
 namespace zar {
 
+// The archive's bytes: a file read at random, or a stream (a pipe) whose
+// head -- everything before the base -- is held in memory and whose data
+// blocks are read once, in order.
 struct ArchiveReader::File {
     int fd = -1;
+    bool owns_fd = true;
     std::uint64_t size = 0;
     std::string name;
+
+    bool stream = false;
+    Bytes head;                       // stream: bytes [0, base)
+    std::uint64_t stream_position = 0;    // stream: bytes consumed so far
 
     std::mutex dictionaries_mutex;
     std::map<std::int64_t, ZSTD_DDict*> dictionaries;
@@ -27,14 +35,20 @@ struct ArchiveReader::File {
     {
         for (const auto& [offset, dict] : dictionaries)
             ZSTD_freeDDict(dict);
-        if (fd >= 0)
+        if (fd >= 0 && owns_fd)
             ::close(fd);
     }
 
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const
     {
+        if (stream) {
+            if (position > head.size() || out.size() > head.size() - position)
+                throw FormatError("data needed out of order; it can't be read from a pipe");
+            std::copy_n(head.begin() + static_cast<std::ptrdiff_t>(position), out.size(), out.begin());
+            return;
+        }
         if (position > size || out.size() > size - position)
-            throw FormatError("archive is truncated");
+            throw TruncatedError();
         std::size_t done = 0;
         while (done < out.size()) {
             const auto n = ::pread(fd, out.data() + done, out.size() - done,
@@ -44,8 +58,36 @@ struct ArchiveReader::File {
             if (n < 0)
                 throw std::system_error(errno, std::generic_category(), name);
             if (n == 0)
-                throw FormatError("archive is truncated");
+                throw TruncatedError();
             done += static_cast<std::size_t>(n);
+        }
+    }
+
+    // Stream: the next `out.size()` bytes.
+    void read_next(std::span<std::uint8_t> out)
+    {
+        std::size_t done = 0;
+        while (done < out.size()) {
+            const auto n = ::read(fd, out.data() + done, out.size() - done);
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0)
+                throw std::system_error(errno, std::generic_category(), name);
+            if (n == 0)
+                throw TruncatedError();
+            done += static_cast<std::size_t>(n);
+        }
+        stream_position += out.size();
+    }
+
+    void skip_to(std::uint64_t position)
+    {
+        if (position < stream_position)
+            throw FormatError("blocks are out of order; this archive can't be read from a pipe");
+        std::uint8_t discard[64 * 1024];
+        while (stream_position < position) {
+            const auto n = std::min<std::uint64_t>(sizeof discard, position - stream_position);
+            read_next({discard, static_cast<std::size_t>(n)});
         }
     }
 };
@@ -221,7 +263,7 @@ BlockHeader ArchiveReader::block_header(std::int64_t offset) const
     file_->read_at(static_cast<std::uint64_t>(position), bytes);
     const auto block = BlockHeader::decode(bytes, offset);
     const auto payload_at = static_cast<std::uint64_t>(position) + kHeaderSize;
-    if (block.payload_size > file_->size - payload_at)
+    if (!file_->stream && block.payload_size > file_->size - payload_at)
         throw FormatError(at(offset) + " extends past the end of the archive");
     return block;
 }
@@ -328,22 +370,87 @@ std::vector<std::uint64_t> ArchiveReader::chunk_lengths(const Entry& entry)
 Bytes ArchiveReader::chunk(const Entry& entry, std::size_t index, std::uint64_t expected_length,
                            bool decompress) const
 {
-    const auto offset = entry.chunks.at(index);
-    const auto block = block_header(offset);
+    const auto block = block_header(entry.chunks.at(index));
+    return decode_chunk(entry, block, payload(block), expected_length, decompress);
+}
+
+Bytes ArchiveReader::decode_chunk(const Entry& entry, const BlockHeader& block, ByteView bytes,
+                                  std::uint64_t expected_length, bool decompress) const
+{
+    const auto offset = block.offset;
     if (block.type != BlockType::DataRaw && block.type != BlockType::DataZstd)
         throw FormatError(at(offset) + " is not a data block");
-    auto bytes = payload(block);
 
     if (block.type == BlockType::DataRaw) {
         if (bytes.size() != expected_length)
             throw FormatError(at(offset) + " has the wrong length");
-        return decompress ? bytes : Bytes{};
+        return decompress ? Bytes(bytes.begin(), bytes.end()) : Bytes{};
     }
 
     const ZSTD_DDict* dict = entry.dict ? dictionary(*entry.dict) : nullptr;
     if (frame_content_size(bytes, offset) != expected_length)
         throw FormatError(at(offset) + " has the wrong decompressed length");
     return decompress ? decompress_frame(bytes, expected_length, dict, offset) : Bytes{};
+}
+
+std::pair<BlockHeader, Bytes> ArchiveReader::next_block(std::int64_t offset)
+{
+    if (!file_->stream)
+        throw std::logic_error("next_block() is for archives read from a stream");
+    const auto position = static_cast<std::int64_t>(base_) + offset;
+    if (offset == kNoOffset || position < 0)
+        throw FormatError("invalid block offset " + std::to_string(offset));
+
+    file_->skip_to(static_cast<std::uint64_t>(position));
+    HeaderBytes header_bytes;
+    file_->read_next(header_bytes);
+    const auto block = BlockHeader::decode(header_bytes, offset);
+    if (block.payload_size > kMaxChunkSize + kHeaderSize)    // generous: a chunk plus zstd overhead
+        throw FormatError(at(offset) + " is larger than any chunk");
+
+    Bytes bytes(static_cast<std::size_t>(block.payload_size));
+    file_->read_next(bytes);
+    if (crc32c(bytes) != block.payload_crc)
+        throw FormatError(at(offset) + " fails its checksum");
+    return {block, std::move(bytes)};
+}
+
+ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
+                                         std::function<void(std::string_view)> on_warning)
+{
+    (void)on_warning;    // a stream has no trailer, so no backup index to fall back on
+
+    auto file = std::make_unique<File>();
+    file->fd = fd;
+    file->owns_fd = false;
+    file->name = std::move(name);
+    file->stream = true;
+
+    HeaderBytes header_bytes;
+    file->read_next(header_bytes);
+    const auto header = ArchiveHeader::decode(header_bytes);
+
+    // Only an archive whose root index lies before its data can be streamed (§5.4).
+    if (header.index_offset == kNoOffset || header.index_offset >= 0)
+        throw FormatError(file->name + ": the index isn't at the head of this archive, so it "
+                                       "can't be read from a pipe (create it with zar --head-index, "
+                                       "or save it to a file first)");
+
+    file->head.resize(header.base_offset);
+    std::copy(header_bytes.begin(), header_bytes.end(), file->head.begin());
+    file->read_next(std::span(file->head).subspan(kHeaderSize));
+
+    ArchiveReader reader(std::move(file), header, header.base_offset);
+    std::vector<Entry> entries;
+    std::set<std::int64_t> seen;
+    reader.load_index(header.index_offset, nullptr, 0, seen, entries);
+    reader.entries_ = last_wins(std::move(entries));
+    return reader;
+}
+
+bool ArchiveReader::streaming() const noexcept
+{
+    return file_->stream;
 }
 
 } // namespace zar

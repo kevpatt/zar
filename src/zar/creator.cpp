@@ -17,6 +17,7 @@
 #include <optional>
 #include <pwd.h>
 #include <set>
+#include <unordered_map>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -93,33 +94,44 @@ std::optional<std::string> group_name(gid_t gid)
     return std::string(result->gr_name);
 }
 
-// The name an input is stored under: its last component, or for paths like
-// "." and "dir/", the name of the directory they resolve to.
-std::string root_component(const fs::path& input)
+std::string without_trailing_slashes(std::string path)
 {
-    auto name = input.filename();
-    if (name.empty() || name == "." || name == "..") {
-        std::error_code ec;
-        name = fs::weakly_canonical(input, ec).filename();
-    }
-    return name.native();
+    while (path.size() > 1 && path.back() == '/')
+        path.pop_back();
+    return path;
+}
+
+std::string last_component(const std::string& path)
+{
+    const auto slash = path.rfind('/');
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+// The real name of a directory reached through "..".
+std::string resolved_name(const fs::path& path)
+{
+    std::error_code ec;
+    auto name = fs::weakly_canonical(path, ec).filename().native();
+    if (ec || name.empty())
+        throw std::runtime_error(path.string() + ": can't determine this directory's name");
+    return name;
 }
 
 // ---- the creator ------------------------------------------------------------
 
 class Creator {
 public:
-    Creator(Output& out, const CreateOptions& options)
-        : out_(out),
+    Creator(Output& out, const CreateOptions& options, bool check_duplicates)
+        : check_duplicates_(check_duplicates),
+          out_(out),
           options_(options),
           threads_(options.threads ? options.threads : std::max(1u, std::thread::hardware_concurrency())),
-          writer_(out, options.align_log2),
+          writer_(out, options.align_log2, options.head_index),
           compressor_(options.level, threads_)
     {
     }
 
-    // Returns false if the input couldn't be read at all.
-    bool add_input(const fs::path& input, bool contents_only);
+    void add_input(const InputSpec& input);
     CreateStats finish();
 
 private:
@@ -154,6 +166,11 @@ private:
 
     void drain(std::size_t keep);
     void warn(const std::string& message);
+
+    // Several inputs (or Latin-1 conversion) can map two files to one path;
+    // remember where each path came from to report that.
+    bool check_duplicates_;
+    std::unordered_map<std::string, std::string> origins_;
 
     Output& out_;
     const CreateOptions& options_;
@@ -202,31 +219,34 @@ std::optional<Creator::Name> Creator::child_name(const Name& parent, std::string
     return Name{parent.path.empty() ? part : parent.path + '/' + part, flags};
 }
 
-bool Creator::add_input(const fs::path& input, bool contents_only)
+void Creator::add_input(const InputSpec& input)
 {
+    // As in POSIX, a trailing slash (or "/.") resolves through a symlink.
     struct stat st {};
-    if (::stat(input.c_str(), &st) != 0) {    // command-line symlinks are followed
-        warn(input.string() + ": " + errno_text());
-        return false;
-    }
-    if (contents_only) {
-        add_directory_contents(input, Name{});
-        return true;
-    }
-    const auto component = root_component(input);
-    if (component.empty()) {
-        warn(input.string() + ": cannot archive a filesystem root by name");
-        return false;
-    }
-    if (auto name = child_name(Name{}, component, input))
-        add(input, *name, st);
-    return true;
+    const int rc = input.must_be_directory ? ::stat(input.path.c_str(), &st)
+                                           : ::lstat(input.path.c_str(), &st);
+    if (rc != 0)
+        throw std::runtime_error(input.path.string() + ": " + errno_text());
+    if (input.must_be_directory && !S_ISDIR(st.st_mode))
+        throw std::runtime_error(input.path.string() + ": not a directory");
+
+    if (input.contents)
+        add_directory_contents(input.path, Name{});
+    else if (auto name = child_name(Name{}, input.name, input.path))
+        add(input.path, *name, st);
 }
 
 void Creator::add(const fs::path& path, const Name& name, const struct stat& st)
 {
     if (st.st_dev == out_.device() && st.st_ino == out_.inode())
         return;    // the archive being written
+
+    if (check_duplicates_) {
+        const auto [it, inserted] = origins_.try_emplace(name.path, path.string());
+        if (!inserted)
+            throw std::runtime_error(name.path + ": would be archived twice, from " + it->second +
+                                     " and " + path.string());
+    }
 
     switch (st.st_mode & S_IFMT) {
     case S_IFREG:
@@ -468,10 +488,10 @@ CreateStats Creator::finish()
             encode_entry(index, entries_[i]);
 
     const auto packed = zstd_compress(index, options_.level);
-    const auto root = packed.size() < index.size()
-                          ? writer_.write_block(BlockType::IndexZstd, packed)
-                          : writer_.write_block(BlockType::IndexRaw, index);
-    writer_.finish(root);
+    if (packed.size() < index.size())
+        writer_.finish(BlockType::IndexZstd, packed);
+    else
+        writer_.finish(BlockType::IndexRaw, index);
 
     stats_.archive_bytes = out_.position();
     return stats_;
@@ -479,17 +499,54 @@ CreateStats Creator::finish()
 
 } // namespace
 
+InputSpec parse_input(const fs::path& input)
+{
+    const auto& given = input.native();
+    if (given.empty())
+        throw std::runtime_error("empty path");
+
+    const auto path = without_trailing_slashes(given);
+    const auto last = last_component(path);
+    InputSpec spec{input, {}, false, path.size() < given.size()};
+
+    if (last == ".") {
+        spec.contents = true;
+        spec.must_be_directory = true;
+    } else if (path == "/") {
+        throw std::runtime_error("/: can't archive the root directory by name; use /. for its contents");
+    } else {
+        spec.name = last == ".." ? resolved_name(path) : last;
+    }
+    return spec;
+}
+
+fs::path default_archive_path(const InputSpec& input)
+{
+    auto path = without_trailing_slashes(input.path.native());
+    if (input.contents) {
+        // "proj/." names the archive after proj; "." after the current directory.
+        while (path != "." && last_component(path) == ".")
+            path = without_trailing_slashes(path.substr(0, path.size() - 1));
+        if (path == ".")
+            return resolved_name(".") + ".zar";
+        if (path == "/")
+            throw std::runtime_error("can't name an archive of the root directory; use -o");
+    }
+    if (last_component(path) == "..")
+        return fs::weakly_canonical(path).native() + ".zar";
+    return path + ".zar";
+}
+
 CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
                            const CreateOptions& options)
 {
-    Creator creator(out, options);
-    std::error_code ec;
-    const bool contents_only = inputs.size() == 1 && fs::is_directory(inputs[0], ec);
-    bool any = false;
+    std::vector<InputSpec> specs;    // check every name before writing anything
     for (const auto& input : inputs)
-        any |= creator.add_input(input, contents_only);
-    if (!any)
-        throw std::runtime_error("no inputs could be archived");
+        specs.push_back(parse_input(input));
+
+    Creator creator(out, options, specs.size() > 1 || options.names == NameMode::Latin1);
+    for (const auto& spec : specs)
+        creator.add_input(spec);
     return creator.finish();
 }
 
