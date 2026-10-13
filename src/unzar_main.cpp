@@ -44,9 +44,10 @@ archives created with zar --head-index.
                          (e.g. 10G): the selected files' total is checked
                          before anything is written, and a solid archive
                          stops decompressing once it passes SIZE
+  -h, --human-readable   show sizes as 512, 1.0K, 31.4M, 2.0G, ...
   -v, --verbose          with --list, also show permissions and owner;
                          print a summary at the end
-  -h, --help             show this help
+      --help             show this help
       --version          show version information
 
 If PATHs are given, only those entries (and directories' contents) are
@@ -63,12 +64,20 @@ struct Command {
     std::vector<std::string> selections;
     bool list = false;
     bool verbose = false;
+    bool human = false;
 };
 
-enum LongOnly { kScan = 256, kDirs, kMaxSize, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kHelp, kVersion };
+
+void print_help()
+{
+    zar::cli::print_banner(std::cout, "unzar", kDescription);
+    std::cout << kUsage;
+}
 
 std::optional<Command> parse(int argc, char** argv)
 {
+
     static const option kOptions[] = {
         {"directory", required_argument, nullptr, 'C'},
         {"list", no_argument, nullptr, 'l'},
@@ -79,7 +88,8 @@ std::optional<Command> parse(int argc, char** argv)
         {"threads", optional_argument, nullptr, 'j'},
         {"max-size", required_argument, nullptr, kMaxSize},
         {"verbose", no_argument, nullptr, 'v'},
-        {"help", no_argument, nullptr, 'h'},
+        {"human-readable", no_argument, nullptr, 'h'},
+        {"help", no_argument, nullptr, kHelp},
         {"version", no_argument, nullptr, kVersion},
         {nullptr, 0, nullptr, 0},
     };
@@ -104,9 +114,9 @@ std::optional<Command> parse(int argc, char** argv)
                 throw UsageError("--dirs must be merge or replace");
             break;
         case 'v': cmd.verbose = true; break;
-        case 'h':
-            zar::cli::print_banner(std::cout, "unzar", kDescription);
-            std::cout << kUsage;
+        case 'h': cmd.human = true; break;
+        case kHelp:
+            print_help();
             return std::nullopt;
         case kVersion:
             zar::cli::print_version(std::cout, "unzar");
@@ -185,7 +195,7 @@ std::string format_owner(const zar::Entry& e)
 
 class Listing {
 public:
-    explicit Listing(bool verbose) : verbose_(verbose) {}
+    Listing(bool verbose, bool human) : verbose_(verbose), human_(human) {}
 
     void directory(const zar::DirectoryGroup& group)
     {
@@ -204,7 +214,7 @@ public:
         std::string name = printable(zar::base_name(e.path));
         if (e.type == zar::EntryType::Symlink && e.link_target)
             name += " -> " + printable(*e.link_target);
-        const auto size = e.type == zar::EntryType::Symlink ? "-" : std::to_string(e.size.value_or(0));
+        const auto size = e.type == zar::EntryType::Symlink ? "-" : format_size(e.size.value_or(0));
 
         std::cout << "  " << name << '\t' << size << '\t' << format_time(e.mtime);
         if (verbose_)
@@ -214,7 +224,13 @@ public:
     }
 
 private:
+    std::string format_size(std::uint64_t bytes) const
+    {
+        return human_ ? zar::cli::human_size(bytes) : std::to_string(bytes);
+    }
+
     bool verbose_;
+    bool human_;
     bool printed_ = false;
 };
 
@@ -269,7 +285,7 @@ int run(Command& cmd)
             warn(s + ": not found in archive");
 
     const auto groups = zar::group_by_directory(chosen);
-    Listing listing(cmd.verbose);
+    Listing listing(cmd.verbose, cmd.human);
     zar::Extractor extractor(reader, cmd.options);
     extractor.prepare(groups);
     for (const auto& group : groups) {
@@ -288,9 +304,11 @@ int run(Command& cmd)
         const char* verb = cmd.options.mode == zar::ExtractMode::Extract ? "extracted"
                            : cmd.options.mode == zar::ExtractMode::Test  ? "tested"
                                                                          : "scanned";
+        const auto bytes = cmd.human ? zar::cli::human_size(stats.bytes)
+                                     : std::to_string(stats.bytes) + " bytes";
         std::cerr << verb << ' ' << stats.files << " files, " << stats.directories
-                  << " directories, " << stats.symlinks << " symlinks (" << stats.bytes
-                  << " bytes)" << (warnings ? "" : "; no problems found") << '\n';
+                  << " directories, " << stats.symlinks << " symlinks (" << bytes << ")"
+                  << (warnings ? "" : "; no problems found") << '\n';
     }
     return warnings ? 1 : 0;
 }

@@ -61,7 +61,7 @@ PATH is stored under its own name, so extracting recreates it:
                          better for many small files, but without random
                          access. Otherwise a normal archive is written.
   -v, --verbose          list files as they are added
-  -h, --help             show this help
+      --help             show this help
       --version          show version information
 )";
 
@@ -112,6 +112,7 @@ struct Command {
 };
 
 enum LongOnly {
+    kHelp = 255,
     kChunkSize = 256,
     kAlign,
     kOwner,
@@ -124,9 +125,16 @@ enum LongOnly {
     kVersion,
 };
 
+void print_help()
+{
+    zar::cli::print_banner(std::cout, "zar", kDescription);
+    std::cout << kUsage;
+}
+
 // Returns nullopt when the command was fully handled (--help, --version).
 std::optional<Command> parse(int argc, char** argv)
 {
+
     static const option kOptions[] = {
         {"output", required_argument, nullptr, 'o'},
         {"yes", no_argument, nullptr, 'y'},
@@ -143,7 +151,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"head-index", no_argument, nullptr, kHeadIndex},
         {"solid", required_argument, nullptr, kSolid},
         {"verbose", no_argument, nullptr, 'v'},
-        {"help", no_argument, nullptr, 'h'},
+        {"help", no_argument, nullptr, kHelp},
         {"version", no_argument, nullptr, kVersion},
         {nullptr, 0, nullptr, 0},
     };
@@ -151,7 +159,7 @@ std::optional<Command> parse(int argc, char** argv)
     Command cmd;
     auto& opt = cmd.options;
     int c;
-    while ((c = ::getopt_long(argc, argv, "o:myl:j::vh", kOptions, nullptr)) != -1) {
+    while ((c = ::getopt_long(argc, argv, "o:myl:j::v", kOptions, nullptr)) != -1) {
         const std::string_view arg = optarg ? optarg : "";
         switch (c) {
         case 'o': cmd.output = arg; break;
@@ -196,9 +204,8 @@ std::optional<Command> parse(int argc, char** argv)
                 throw UsageError("--solid needs a size above zero");
             break;
         case 'v': cmd.verbose = true; break;
-        case 'h':
-            zar::cli::print_banner(std::cout, "zar", kDescription);
-            std::cout << kUsage;
+        case kHelp:
+            print_help();
             return std::nullopt;
         case kVersion:
             zar::cli::print_version(std::cout, "zar");
@@ -224,20 +231,6 @@ std::optional<Command> parse(int argc, char** argv)
     return cmd;
 }
 
-std::string human_size(std::uint64_t bytes)
-{
-    constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
-    double value = static_cast<double>(bytes);
-    std::size_t unit = 0;
-    while (value >= 1024 && unit + 1 < std::size(kUnits)) {
-        value /= 1024;
-        ++unit;
-    }
-    char text[32];
-    std::snprintf(text, sizeof text, unit ? "%.1f %s" : "%.0f %s", value, kUnits[unit]);
-    return text;
-}
-
 int run(Command& cmd)
 {
     cmd.options.on_warning = [](std::string_view message) {
@@ -254,7 +247,8 @@ int run(Command& cmd)
     if (cmd.verbose) {
         std::cerr << stats.files << " files, " << stats.directories << " directories, "
                   << stats.symlinks << " symlinks, " << stats.hardlinks << " hard links: "
-                  << human_size(stats.input_bytes) << " -> " << human_size(stats.archive_bytes)
+                  << zar::cli::human_size(stats.input_bytes) << " -> "
+                  << zar::cli::human_size(stats.archive_bytes)
                   << (stats.solid ? " (solid)" : "") << '\n';
     }
     return stats.warnings ? 1 : 0;

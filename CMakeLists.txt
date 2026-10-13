@@ -90,6 +90,7 @@ if(ZAR_BUILD_TESTS)
     enable_testing()
     add_executable(zar_tests
         tests/main.cpp
+        tests/cli_tests.cpp
         tests/format_tests.cpp
         tests/index_tests.cpp
         tests/policy_tests.cpp

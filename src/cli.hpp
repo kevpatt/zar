@@ -5,7 +5,9 @@
 #include "zar/version.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -47,6 +49,26 @@ inline std::uint64_t parse_size(std::string_view text, std::string_view what)
     if (value > (~std::uint64_t{0} >> shift))
         throw UsageError(std::string(what) + " is too large");
     return value << shift;
+}
+
+// Sizes for people: plain bytes below 1 KiB, then one decimal place and a
+// binary suffix: "512", "1.0K", "31.4M", "2.0G".
+inline std::string human_size(std::uint64_t bytes)
+{
+    if (bytes < 1024)
+        return std::to_string(bytes);
+
+    constexpr char kSuffixes[] = "KMGTPE";
+    double value = static_cast<double>(bytes) / 1024;
+    std::size_t unit = 0;
+    // Compare after rounding, so 1023.97K shows as 1.0M rather than 1024.0K.
+    while (std::round(value * 10) / 10 >= 1024 && unit + 2 < sizeof kSuffixes) {
+        value /= 1024;
+        ++unit;
+    }
+    char text[32];
+    std::snprintf(text, sizeof text, "%.1f%c", value, kSuffixes[unit]);
+    return text;
 }
 
 // -j/--threads[=N]: 0 (one per core) without N.
