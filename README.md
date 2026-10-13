@@ -26,6 +26,11 @@ ctest --test-dir build
 
 `build/compile_commands.json` is generated for clangd and other tools.
 
+The version comes from `project()` in `CMakeLists.txt`. Each build also
+records the git revision (with `-dirty` if there are uncommitted changes)
+and the build time, shown by `--version` and `--help`; set
+`SOURCE_DATE_EPOCH` to fix the build time for reproducible builds.
+
 ## Usage
 
 ```sh
@@ -83,7 +88,7 @@ archive behind.
 | `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
-| `--head-index` | also put the index at the front, so the archive can be extracted from a pipe; data is staged in a temporary file and written twice |
+| `--head-index` | also put the index at the front, so the archive can be extracted from a pipe. The index is written twice, at the front and at the end; data is staged in a temporary file until the index is known. |
 | `--solid=SIZE` | first try compressing the whole archive as one stream, and keep that if it's at most SIZE bytes (e.g. `1M`); otherwise write a normal archive. See below. |
 | `-v, --verbose` | list files as they are added |
 

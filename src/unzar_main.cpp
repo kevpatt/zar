@@ -20,6 +20,11 @@
 
 namespace {
 
+constexpr std::string_view kDescription =
+    "Extracts a zar archive, or lists, tests, or scans it, from a file or a\n"
+    "pipe. Data is verified as it's extracted, and nothing is ever written\n"
+    "outside the destination directory.";
+
 constexpr std::string_view kUsage = R"(usage: unzar [options] ARCHIVE [PATH...]
 
 ARCHIVE may be '-' for standard input. Reading from a pipe works for
@@ -100,11 +105,11 @@ std::optional<Command> parse(int argc, char** argv)
             break;
         case 'v': cmd.verbose = true; break;
         case 'h':
+            zar::cli::print_banner(std::cout, "unzar", kDescription);
             std::cout << kUsage;
             return std::nullopt;
         case kVersion:
-            std::cout << "unzar " << ZAR_VERSION << " (format " << zar::kFormatVersion.to_string()
-                      << ", zstd " << ZSTD_versionString() << ")\n";
+            zar::cli::print_version(std::cout, "unzar");
             return std::nullopt;
         default:
             throw UsageError("");

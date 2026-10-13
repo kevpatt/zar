@@ -56,16 +56,33 @@ add_library(libzar STATIC
     src/zar/policy.cpp
     src/zar/thread_pool.cpp)
 set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
-target_include_directories(libzar PUBLIC src)
-target_compile_definitions(libzar PUBLIC ZAR_VERSION="${PROJECT_VERSION}")
+
+set(ZAR_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
+configure_file(src/zar/version.hpp.in ${ZAR_GENERATED_DIR}/zar/version.hpp @ONLY)
+target_include_directories(libzar PUBLIC src ${ZAR_GENERATED_DIR})
 find_package(Threads REQUIRED)
 target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads PRIVATE zar_warnings)
 
+# The build time and git revision, refreshed on every build. Only the
+# commands link this, so the library and tests don't rebuild for it.
+find_package(Git QUIET)
+add_custom_target(zar_build_info_source
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -DOUTPUT=${ZAR_GENERATED_DIR}/build_info.cpp
+        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_info.cmake
+    BYPRODUCTS ${ZAR_GENERATED_DIR}/build_info.cpp
+    COMMENT "Recording build time and git revision")
+add_library(zar_build_info STATIC ${ZAR_GENERATED_DIR}/build_info.cpp)
+add_dependencies(zar_build_info zar_build_info_source)
+target_include_directories(zar_build_info PUBLIC ${ZAR_GENERATED_DIR})
+
 add_executable(zar src/zar_main.cpp)
-target_link_libraries(zar PRIVATE libzar zar_warnings)
+target_link_libraries(zar PRIVATE libzar zar_build_info zar_warnings)
 
 add_executable(unzar src/unzar_main.cpp)
-target_link_libraries(unzar PRIVATE libzar zar_warnings)
+target_link_libraries(unzar PRIVATE libzar zar_build_info zar_warnings)
 
 install(TARGETS zar unzar RUNTIME DESTINATION bin)
 

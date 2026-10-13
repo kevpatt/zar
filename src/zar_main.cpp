@@ -24,6 +24,11 @@ namespace {
 
 namespace fs = std::filesystem;
 
+constexpr std::string_view kDescription =
+    "Creates a zar archive of a file or directory. Files are compressed with\n"
+    "zstd in independently checksummed chunks, so any file can be listed,\n"
+    "verified, or extracted without decompressing the rest.";
+
 constexpr std::string_view kUsage = R"(usage: zar [options] PATH
        zar [options] -m -o ARCHIVE PATH...
 
@@ -50,7 +55,7 @@ PATH is stored under its own name, so extracting recreates it:
       --names=MODE       non-UTF-8 file names: raw (default), skip, latin1
       --compress-all     compress even files that are usually precompressed
       --head-index       also put the index at the front, so the archive can
-                         be extracted from a pipe (data is written twice)
+                         be extracted from a pipe (index is written twice)
       --solid=SIZE       first try compressing everything as one stream, and
                          keep that if it's at most SIZE bytes (e.g. 1M);
                          better for many small files, but without random
@@ -192,11 +197,11 @@ std::optional<Command> parse(int argc, char** argv)
             break;
         case 'v': cmd.verbose = true; break;
         case 'h':
+            zar::cli::print_banner(std::cout, "zar", kDescription);
             std::cout << kUsage;
             return std::nullopt;
         case kVersion:
-            std::cout << "zar " << ZAR_VERSION << " (format " << zar::kFormatVersion.to_string()
-                      << ", zstd " << ZSTD_versionString() << ")\n";
+            zar::cli::print_version(std::cout, "zar");
             return std::nullopt;
         default:
             throw UsageError("");    // getopt has already described the problem

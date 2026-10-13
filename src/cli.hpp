@@ -1,11 +1,16 @@
 // Command-line helpers shared by zar and unzar.
 #pragma once
 
+#include "zar/format.hpp"
+#include "zar/version.hpp"
+
 #include <charconv>
 #include <cstdint>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <zstd.h>
 
 namespace zar::cli {
 
@@ -53,6 +58,23 @@ inline unsigned parse_threads(const char* arg)
     if (threads == 0 || threads > 1024)
         throw UsageError("thread count must be between 1 and 1024");
     return static_cast<unsigned>(threads);
+}
+
+// The top of --help: name, version, build, copyright, and what the tool does.
+inline void print_banner(std::ostream& out, std::string_view program, std::string_view description)
+{
+    out << program << ' ' << version::kVersion << " (git " << version::kGitRevision << ", built "
+        << version::kBuildTime << ")\n"
+        << version::kCopyright << "\n\n"
+        << description << "\n\n";
+}
+
+inline void print_version(std::ostream& out, std::string_view program)
+{
+    out << program << ' ' << version::kVersion << '\n'
+        << "archive format " << kFormatVersion.to_string() << ", zstd " << ZSTD_versionString() << '\n'
+        << "git " << version::kGitRevision << ", built " << version::kBuildTime << '\n'
+        << version::kCopyright << '\n';
 }
 
 } // namespace zar::cli
