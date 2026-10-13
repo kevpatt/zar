@@ -41,6 +41,7 @@ enum class BlockType : std::uint16_t {
     DataZstd = 0x0004,
     ZstdDict = 0x0005,
     Trailer = 0x0006,
+    ArchiveZstd = 0x0007,    // a whole archive, compressed as one frame (§5.5)
 };
 
 // §6.2

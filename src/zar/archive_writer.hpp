@@ -30,7 +30,6 @@ private:
     std::uint64_t alignment() const noexcept { return std::uint64_t{1} << header_.align_log2; }
     std::int64_t place(Output& sink, std::uint64_t relative, std::int64_t offset_shift,
                        BlockType type, ByteView payload);
-    void write_trailer(std::int64_t root_index);
 
     Output& out_;
     std::optional<Output> spool_;
@@ -38,5 +37,10 @@ private:
     std::uint64_t start_;     // position of the zar header in out_
     std::uint64_t origin_;    // position of the base in sink()
 };
+
+// Writes a solid archive (§5.5): a zar header, one ARCHIVE_ZSTD block whose
+// payload is `frame` (a compressed archive, with the given CRC), and a
+// trailer. The header points at the block, so it can be read from a pipe.
+void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc);
 
 } // namespace zar

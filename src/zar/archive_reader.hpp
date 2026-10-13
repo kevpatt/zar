@@ -68,6 +68,11 @@ public:
 
 private:
     struct File;
+    class Inflater;
+
+    static ArchiveReader from_file(std::unique_ptr<File> file,
+                                   std::function<void(std::string_view)> on_warning, bool allow_solid);
+    std::unique_ptr<File> unwrap(const BlockHeader& block) const;
 
     ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, std::uint64_t base);
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const;

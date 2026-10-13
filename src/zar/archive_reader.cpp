@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdlib>
 #include <fcntl.h>
 #include <map>
 #include <mutex>
@@ -24,6 +25,9 @@ struct ArchiveReader::File {
     std::uint64_t size = 0;
     std::string name;
 
+    bool in_memory = false;
+    Bytes memory;                     // in_memory: the whole archive
+
     bool stream = false;
     Bytes head;                       // stream: bytes [0, base)
     std::uint64_t stream_position = 0;    // stream: bytes consumed so far
@@ -41,6 +45,12 @@ struct ArchiveReader::File {
 
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const
     {
+        if (in_memory) {
+            if (position > memory.size() || out.size() > memory.size() - position)
+                throw TruncatedError();
+            std::copy_n(memory.begin() + static_cast<std::ptrdiff_t>(position), out.size(), out.begin());
+            return;
+        }
         if (stream) {
             if (position > head.size() || out.size() > head.size() - position)
                 throw FormatError("data needed out of order; it can't be read from a pipe");
@@ -157,6 +167,112 @@ std::vector<Entry> last_wins(std::vector<Entry> entries)
 
 } // namespace
 
+// Decompresses a solid archive's frame (§5.5) into memory or, past
+// kInMemoryLimit, into an anonymous temporary file.
+class ArchiveReader::Inflater {
+public:
+    explicit Inflater(std::string name) : name_(std::move(name))
+    {
+        if (!dstream_)
+            throw std::bad_alloc();
+    }
+
+    void feed(ByteView compressed)
+    {
+        crc_ = crc32c(crc_, compressed);
+        ZSTD_inBuffer in{compressed.data(), compressed.size(), 0};
+        for (;;) {
+            if (done_) {
+                if (in.pos < in.size)
+                    throw FormatError(name_ + ": data follows the end of the compressed archive");
+                return;
+            }
+            ZSTD_outBuffer out{buffer_.data(), buffer_.size(), 0};
+            const auto result = ZSTD_decompressStream(dstream_.get(), &out, &in);
+            if (ZSTD_isError(result))
+                throw FormatError(name_ + ": " + ZSTD_getErrorName(result));
+            store({buffer_.data(), out.pos});
+            done_ = result == 0;    // the frame is complete and fully flushed
+            // A full output buffer may mean zstd holds more, even with no input left.
+            if (in.pos == in.size && out.pos < out.size)
+                return;
+        }
+    }
+
+    // The decompressed archive, after checking it's complete and intact.
+    std::unique_ptr<File> finish(std::uint32_t expected_crc)
+    {
+        if (crc_ != expected_crc)
+            throw FormatError(name_ + ": the compressed archive fails its checksum");
+        if (!done_)
+            throw TruncatedError();
+
+        auto file = std::make_unique<File>();
+        file->name = name_;
+        if (spill_ < 0) {
+            file->in_memory = true;
+            file->size = memory_.size();
+            file->memory = std::move(memory_);
+        } else {
+            file->fd = std::exchange(spill_, -1);
+            file->size = spilled_;
+        }
+        return file;
+    }
+
+    ~Inflater()
+    {
+        if (spill_ >= 0)
+            ::close(spill_);
+    }
+
+private:
+    static constexpr std::size_t kInMemoryLimit = 64 << 20;
+
+    void store(ByteView data)
+    {
+        if (data.empty())
+            return;
+        if (spill_ < 0 && memory_.size() + data.size() <= kInMemoryLimit) {
+            memory_.insert(memory_.end(), data.begin(), data.end());
+            return;
+        }
+        if (spill_ < 0) {
+            const char* tmpdir = std::getenv("TMPDIR");
+            std::string path = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/.unzar-XXXXXX";
+            spill_ = ::mkstemp(path.data());
+            if (spill_ < 0)
+                throw std::system_error(errno, std::generic_category(), path);
+            ::unlink(path.c_str());
+            write(memory_);
+            memory_ = Bytes();
+        }
+        write(data);
+    }
+
+    void write(ByteView data)
+    {
+        while (!data.empty()) {
+            const auto n = ::write(spill_, data.data(), data.size());
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0)
+                throw std::system_error(errno, std::generic_category(), "temporary file");
+            data = data.subspan(static_cast<std::size_t>(n));
+            spilled_ += static_cast<std::uint64_t>(n);
+        }
+    }
+
+    std::string name_;
+    std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> dstream_{ZSTD_createDStream(), ZSTD_freeDStream};
+    Bytes buffer_ = Bytes(ZSTD_DStreamOutSize());
+    bool done_ = false;
+    std::uint32_t crc_ = 0;
+    Bytes memory_;
+    int spill_ = -1;
+    std::uint64_t spilled_ = 0;
+};
+
 ArchiveReader::ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, std::uint64_t base)
     : file_(std::move(file)), header_(header), base_(base)
 {
@@ -169,11 +285,6 @@ ArchiveReader::~ArchiveReader() = default;
 ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
                                   std::function<void(std::string_view)> on_warning)
 {
-    const auto warn = [&](const std::string& message) {
-        if (on_warning)
-            on_warning(message);
-    };
-
     auto file = std::make_unique<File>();
     file->name = path.string();
     file->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
@@ -185,6 +296,17 @@ ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
     if (!S_ISREG(st.st_mode))
         throw std::runtime_error(file->name + ": not a regular file");
     file->size = static_cast<std::uint64_t>(st.st_size);
+    return from_file(std::move(file), on_warning, true);
+}
+
+ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
+                                       std::function<void(std::string_view)> on_warning,
+                                       bool allow_solid)
+{
+    const auto warn = [&](const std::string& message) {
+        if (on_warning)
+            on_warning(message);
+    };
 
     // Where is the zar header? Normally at 0; otherwise the trailer says (§5.1).
     std::optional<std::uint64_t> start;
@@ -200,8 +322,9 @@ ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
         file->read_at(file->size - kTrailerSize, tail);
         const auto candidate = file->size - kTrailerSize;
         const auto distance = load_le<std::uint64_t>(&tail[kHeaderSize + 8]);
+        // The zar header must fit between the start of the file and the trailer.
         if (load_le<std::uint16_t>(tail) == static_cast<std::uint16_t>(BlockType::Trailer) &&
-            distance <= candidate - kHeaderSize) {
+            distance >= kHeaderSize && distance <= candidate) {
             if (!start)
                 start = candidate - distance;
             if (*start == candidate - distance)
@@ -239,6 +362,11 @@ ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
 
     for (std::size_t i = 0; i < roots.size(); ++i) {
         try {
+            if (const auto root = reader.block_header(roots[i]); root.type == BlockType::ArchiveZstd) {
+                if (!allow_solid)
+                    throw FormatError("a solid archive can't contain another");
+                return from_file(reader.unwrap(root), on_warning, false);
+            }
             std::vector<Entry> entries;
             std::set<std::int64_t> seen;
             reader.load_index(roots[i], nullptr, 0, seen, entries);
@@ -430,7 +558,26 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
     file->read_next(header_bytes);
     const auto header = ArchiveHeader::decode(header_bytes);
 
-    // Only an archive whose root index lies before its data can be streamed (§5.4).
+    // A solid archive is a single block, read whole (§5.5).
+    if (header.index_offset != kNoOffset && header.index_offset >= 0) {
+        file->skip_to(header.base_offset + static_cast<std::uint64_t>(header.index_offset));
+        HeaderBytes block_bytes;
+        file->read_next(block_bytes);
+        const auto block = BlockHeader::decode(block_bytes, header.index_offset);
+        if (block.type == BlockType::ArchiveZstd) {
+            Inflater inflater(file->name);
+            Bytes piece(1 << 20);
+            for (std::uint64_t done = 0; done < block.payload_size;) {
+                const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
+                file->read_next({piece.data(), n});
+                inflater.feed({piece.data(), n});
+                done += n;
+            }
+            return from_file(inflater.finish(block.payload_crc), on_warning, false);
+        }
+    }
+
+    // Otherwise, only an archive whose root index lies before its data can be streamed (§5.4).
     if (header.index_offset == kNoOffset || header.index_offset >= 0)
         throw FormatError(file->name + ": the index isn't at the head of this archive, so it "
                                        "can't be read from a pipe (create it with zar --head-index, "
@@ -451,6 +598,20 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
 bool ArchiveReader::streaming() const noexcept
 {
     return file_->stream;
+}
+
+std::unique_ptr<ArchiveReader::File> ArchiveReader::unwrap(const BlockHeader& block) const
+{
+    Inflater inflater(file_->name);
+    Bytes piece(1 << 20);
+    const auto start = base_ + static_cast<std::uint64_t>(block.offset) + kHeaderSize;
+    for (std::uint64_t done = 0; done < block.payload_size;) {
+        const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
+        read_at(start + done, {piece.data(), n});
+        inflater.feed({piece.data(), n});
+        done += n;
+    }
+    return inflater.finish(block.payload_crc);
 }
 
 } // namespace zar

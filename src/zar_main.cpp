@@ -50,6 +50,10 @@ PATH is stored under its own name, so extracting recreates it:
       --compress-all     compress even files that are usually precompressed
       --head-index       also put the index at the front, so the archive can
                          be extracted from a pipe (data is written twice)
+      --solid=SIZE       first try compressing everything as one stream, and
+                         keep that if it's at most SIZE bytes (e.g. 1M);
+                         better for many small files, but without random
+                         access. Otherwise a normal archive is written.
   -v, --verbose          list files as they are added
   -h, --help             show this help
       --version          show version information
@@ -139,6 +143,7 @@ enum LongOnly {
     kNames,
     kCompressAll,
     kHeadIndex,
+    kSolid,
     kVersion,
 };
 
@@ -159,6 +164,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"names", required_argument, nullptr, kNames},
         {"compress-all", no_argument, nullptr, kCompressAll},
         {"head-index", no_argument, nullptr, kHeadIndex},
+        {"solid", required_argument, nullptr, kSolid},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, kVersion},
@@ -215,6 +221,11 @@ std::optional<Command> parse(int argc, char** argv)
             break;
         case kCompressAll: opt.compress_all = true; break;
         case kHeadIndex: opt.head_index = true; break;
+        case kSolid:
+            opt.solid_limit = parse_size(arg, "solid size");
+            if (*opt.solid_limit == 0)
+                throw UsageError("--solid needs a size above zero");
+            break;
         case 'v': cmd.verbose = true; break;
         case 'h':
             std::cout << kUsage;
@@ -275,7 +286,7 @@ int run(Command& cmd)
         std::cerr << stats.files << " files, " << stats.directories << " directories, "
                   << stats.symlinks << " symlinks, " << stats.hardlinks << " hard links: "
                   << human_size(stats.input_bytes) << " -> " << human_size(stats.archive_bytes)
-                  << '\n';
+                  << (stats.solid ? " (solid)" : "") << '\n';
     }
     return stats.warnings ? 1 : 0;
 }

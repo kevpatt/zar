@@ -125,11 +125,13 @@ block records its own offset, a recovery tool scanning a damaged archive at
 | `0x0004` | DATA_ZSTD    | one zstd frame decompressing to file content       |
 | `0x0005` | ZSTD_DICT    | a zstd dictionary (as produced by `ZDICT_*`)       |
 | `0x0006` | TRAILER      | §5                                                 |
+| `0x0007` | ARCHIVE_ZSTD | one zstd frame decompressing to a whole archive (§5.5) |
 | `0x8000`–`0xFFFF` | —   | reserved for private/experimental use              |
 
 Every zstd frame in a zar archive:
 
-- must include the content size in its frame header, and
+- must include the content size in its frame header (except in an
+  ARCHIVE_ZSTD block, whose writer may not know it in advance), and
 - should omit zstd's own content checksum, which `payload_crc` makes redundant.
 
 A reader must ignore blocks that nothing references, including ones with
@@ -195,6 +197,27 @@ Anything a streaming reader needs other than data blocks must lie before the
 base. A writer can only produce a head index once it knows every data
 block's offset, so a streaming writer has to stage the data (for example in
 a temporary file) before emitting the archive.
+
+### 5.5 Solid archives
+
+The root block may be an ARCHIVE_ZSTD block instead of an index. Its payload
+is a single zstd frame that decompresses to a complete zar archive (the
+*inner* archive), with its own zar header, blocks, index, and trailer. A
+reader decompresses it and then reads the inner archive in the usual way.
+
+Compressing everything as one stream lets zstd exploit redundancy *between*
+files, which matters most for many small, similar files. The price is random
+access: nothing can be read without decompressing everything before it. A
+writer should therefore store the inner archive's data and index
+uncompressed, and use this form only for archives small enough that the
+price doesn't matter.
+
+- The inner archive must not itself be solid.
+- The outer archive's `index_offset` should point to the ARCHIVE_ZSTD block,
+  and it should directly follow the zar header, so the archive can be read
+  from a stream (§5.4) with no further structure.
+- The frame may omit its content size, so readers must be prepared to
+  decompress without knowing the final size in advance.
 
 ## 6. Index
 

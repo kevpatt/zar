@@ -6,6 +6,7 @@
 #include "zar/index.hpp"
 #include "zar/names.hpp"
 #include "zar/policy.hpp"
+#include "zar/thread_pool.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -121,11 +122,14 @@ std::string resolved_name(const fs::path& path)
 
 class Creator {
 public:
-    Creator(Output& out, const CreateOptions& options, bool check_duplicates)
+    // With `store_raw`, nothing is compressed: the archive is meant to be
+    // compressed as a whole (§5.5).
+    Creator(Output& out, const CreateOptions& options, bool check_duplicates, bool store_raw)
         : check_duplicates_(check_duplicates),
+          store_raw_(store_raw),
           out_(out),
           options_(options),
-          threads_(options.threads ? options.threads : std::max(1u, std::thread::hardware_concurrency())),
+          threads_(options.threads ? options.threads : default_thread_count()),
           writer_(out, options.align_log2, options.head_index),
           compressor_(options.level, threads_)
     {
@@ -170,6 +174,7 @@ private:
     // Several inputs (or Latin-1 conversion) can map two files to one path;
     // remember where each path came from to report that.
     bool check_duplicates_;
+    bool store_raw_;
     std::unordered_map<std::string, std::string> origins_;
 
     Output& out_;
@@ -322,7 +327,7 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     const std::size_t index = entries_.size();
     entries_.push_back(make_entry(EntryType::File, name, st));
 
-    const bool compress = options_.compress_all || !is_precompressed(name.path);
+    const bool compress = !store_raw_ && (options_.compress_all || !is_precompressed(name.path));
     const auto expected = static_cast<std::uint64_t>(st.st_size);
     std::uint64_t total = 0;
     std::uint64_t chunk_count = 0;
@@ -487,8 +492,8 @@ CreateStats Creator::finish()
         if (!dropped_.contains(i))
             encode_entry(index, entries_[i]);
 
-    const auto packed = zstd_compress(index, options_.level);
-    if (packed.size() < index.size())
+    const auto packed = store_raw_ ? Bytes{} : zstd_compress(index, options_.level);
+    if (!packed.empty() && packed.size() < index.size())
         writer_.finish(BlockType::IndexZstd, packed);
     else
         writer_.finish(BlockType::IndexRaw, index);
@@ -537,6 +542,58 @@ fs::path default_archive_path(const InputSpec& input)
     return path + ".zar";
 }
 
+namespace {
+
+CreateStats create(Output& out, std::span<const InputSpec> specs, const CreateOptions& options,
+                   bool store_raw)
+{
+    Creator creator(out, options, specs.size() > 1 || options.names == NameMode::Latin1, store_raw);
+    for (const auto& spec : specs)
+        creator.add_input(spec);
+    return creator.finish();
+}
+
+// Builds the archive with nothing compressed, compressing it whole on the
+// fly, and gives up as soon as that passes the limit. Returns nullopt then,
+// having written nothing to `out` and reported nothing.
+std::optional<CreateStats> try_solid(Output& out, std::span<const InputSpec> specs,
+                                     const CreateOptions& options)
+{
+    // Hold back what the attempt reports; a normal pass would repeat it.
+    std::vector<std::string> warnings, entries;
+    auto inner = options;
+    inner.on_warning = [&](std::string_view m) { warnings.emplace_back(m); };
+    inner.on_entry = [&](std::string_view m) { entries.emplace_back(m); };
+    inner.align_log2 = 0;    // padding would only be compressed away
+    inner.head_index = false;
+
+    auto frame = out.make_spool();
+    CreateStats stats;
+    std::uint32_t frame_crc = 0;
+    try {
+        const auto threads = options.threads ? options.threads : default_thread_count();
+        auto sink = Output::compressing(frame, options.level, threads, *options.solid_limit, out);
+        stats = create(sink, specs, inner, true);
+        sink.commit();
+        frame_crc = sink.compressed_crc();
+    } catch (const SizeLimitExceeded&) {
+        return std::nullopt;
+    }
+
+    write_solid_archive(out, frame, frame_crc);
+    for (const auto& entry : entries)
+        if (options.on_entry)
+            options.on_entry(entry);
+    for (const auto& warning : warnings)
+        if (options.on_warning)
+            options.on_warning(warning);
+    stats.solid = true;
+    stats.archive_bytes = out.position();
+    return stats;
+}
+
+} // namespace
+
 CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
                            const CreateOptions& options)
 {
@@ -544,10 +601,10 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
     for (const auto& input : inputs)
         specs.push_back(parse_input(input));
 
-    Creator creator(out, options, specs.size() > 1 || options.names == NameMode::Latin1);
-    for (const auto& spec : specs)
-        creator.add_input(spec);
-    return creator.finish();
+    if (options.solid_limit)
+        if (auto stats = try_solid(out, specs, options))
+            return *stats;
+    return create(out, specs, options, false);
 }
 
 } // namespace zar

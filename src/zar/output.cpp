@@ -10,6 +10,9 @@
 #include <system_error>
 #include <unistd.h>
 #include <utility>
+#include <zstd.h>
+
+#include "zar/crc32c.hpp"
 
 namespace zar {
 namespace {
@@ -44,6 +47,42 @@ mode_t current_umask()
 
 } // namespace
 
+struct Output::Zstd {
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    Output* dest = nullptr;
+    std::uint64_t start = 0;
+    std::uint64_t limit = 0;
+    std::uint32_t crc = 0;
+    Bytes out = Bytes(ZSTD_CStreamOutSize());
+
+    ~Zstd() { ZSTD_freeCCtx(cctx); }
+
+    void check(std::size_t result) const
+    {
+        if (ZSTD_isError(result))
+            throw std::runtime_error(std::string("zstd: ") + ZSTD_getErrorName(result));
+    }
+
+    void feed(ByteView data, ZSTD_EndDirective mode)
+    {
+        ZSTD_inBuffer in{data.data(), data.size(), 0};
+        for (;;) {
+            ZSTD_outBuffer chunk{out.data(), out.size(), 0};
+            const auto remaining = ZSTD_compressStream2(cctx, &chunk, &in, mode);
+            check(remaining);
+            if (chunk.pos) {
+                const ByteView produced(out.data(), chunk.pos);
+                crc = crc32c(crc, produced);
+                dest->write(produced);
+                if (dest->position() - start > limit)
+                    throw SizeLimitExceeded();
+            }
+            if (mode == ZSTD_e_end ? remaining == 0 : in.pos == in.size)
+                return;
+        }
+    }
+};
+
 Output::Output(int fd, bool owns_fd, std::filesystem::path temp, std::filesystem::path final_path)
     : fd_(fd), owns_fd_(owns_fd), temp_path_(std::move(temp)), final_path_(std::move(final_path))
 {
@@ -77,6 +116,31 @@ Output Output::standard_output()
     if (::isatty(STDOUT_FILENO))
         throw std::runtime_error("refusing to write an archive to a terminal");
     return Output(STDOUT_FILENO, false, {}, "standard output");
+}
+
+Output Output::compressing(Output& dest, int level, unsigned threads, std::uint64_t limit,
+                           const Output& identity)
+{
+    Output out(-1, false, {}, "compressed output");
+    out.device_ = identity.device_;
+    out.inode_ = identity.inode_;
+    out.zstd_ = std::make_unique<Zstd>();
+    auto& z = *out.zstd_;
+    if (!z.cctx)
+        throw std::bad_alloc();
+    z.dest = &dest;
+    z.start = dest.position();
+    z.limit = limit;
+    z.check(ZSTD_CCtx_setParameter(z.cctx, ZSTD_c_compressionLevel, level));
+    z.check(ZSTD_CCtx_setParameter(z.cctx, ZSTD_c_checksumFlag, 0));
+    if (threads > 1)    // fails harmlessly if libzstd lacks threading
+        ZSTD_CCtx_setParameter(z.cctx, ZSTD_c_nbWorkers, static_cast<int>(threads));
+    return out;
+}
+
+std::uint32_t Output::compressed_crc() const noexcept
+{
+    return zstd_ ? zstd_->crc : 0;
 }
 
 Output Output::make_spool() const
@@ -124,7 +188,8 @@ Output::Output(Output&& other) noexcept
       position_(other.position_),
       seekable_(other.seekable_),
       device_(other.device_),
-      inode_(other.inode_)
+      inode_(other.inode_),
+      zstd_(std::move(other.zstd_))
 {
     other.temp_path_.clear();
 }
@@ -142,7 +207,7 @@ void Output::write(ByteView bytes)
     if (buffer_.size() + bytes.size() > kBufferSize)
         flush();
     if (bytes.size() >= kBufferSize)
-        write_all(fd_, bytes.data(), bytes.size(), final_path_.string());
+        emit(bytes);
     else
         buffer_.insert(buffer_.end(), bytes.begin(), bytes.end());
     position_ += bytes.size();
@@ -168,13 +233,23 @@ void Output::write_at(std::uint64_t position, ByteView bytes)
 
 void Output::flush()
 {
-    write_all(fd_, buffer_.data(), buffer_.size(), final_path_.string());
+    emit(buffer_);
     buffer_.clear();
+}
+
+void Output::emit(ByteView bytes)
+{
+    if (zstd_)
+        zstd_->feed(bytes, ZSTD_e_continue);
+    else
+        write_all(fd_, bytes.data(), bytes.size(), final_path_.string());
 }
 
 void Output::commit()
 {
     flush();
+    if (zstd_)
+        zstd_->feed({}, ZSTD_e_end);
     if (temp_path_.empty())
         return;
     if (::fsync(fd_) != 0 || ::close(fd_) != 0) {

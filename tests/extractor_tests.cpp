@@ -471,6 +471,107 @@ TEST(streaming_needs_a_head_index)
     ::close(fds[0]);
 }
 
+TEST(reader_uses_the_trailer_when_the_header_has_no_index)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/f.txt", text("via the trailer"));
+    const auto archive = tmp.path() / "a.zar";
+
+    // Written as if to a pipe: an O_APPEND descriptor can't be patched in place.
+    const int fd = ::open(archive.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    const int saved = ::dup(STDOUT_FILENO);
+    ::dup2(fd, STDOUT_FILENO);
+    ::close(fd);
+    {
+        auto out = Output::standard_output();
+        create_archive(out, std::vector{tmp.path() / "src/."}, {});
+        out.commit();
+    }
+    ::dup2(saved, STDOUT_FILENO);
+    ::close(saved);
+
+    auto reader = ArchiveReader::open(archive);
+    CHECK(reader.header().index_offset == kNoOffset);
+    const auto dest = tmp.path() / "out";
+    CHECK(run(archive, into(dest)).warnings.empty());
+    CHECK(read_file(dest / "f.txt") == text("via the trailer"));
+}
+
+TEST(solid_archives_are_kept_within_the_limit)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    for (int i = 0; i < 30; ++i)    // similar small files: what solid is for
+        write_file(src / ("f" + std::to_string(i) + ".txt"),
+                   text("config entry " + std::to_string(i) + "\nshared boilerplate line\n"));
+    const auto archive = tmp.path() / "a.zar";
+
+    const auto build = [&](std::optional<std::uint64_t> limit, std::uint8_t align = kAlignLog2Default) {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.solid_limit = limit;
+        options.align_log2 = align;
+        const auto stats = create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+        return stats;
+    };
+    const auto root_type = [&] {
+        auto reader_bytes = read_file(archive);
+        const auto header = ArchiveHeader::decode([&] {
+            HeaderBytes h;
+            std::copy_n(reader_bytes.begin(), kHeaderSize, h.begin());
+            return h;
+        }());
+        return static_cast<BlockType>(load_le<std::uint16_t>(&reader_bytes[static_cast<std::size_t>(
+            header.base_offset + static_cast<std::uint64_t>(header.index_offset))]));
+    };
+
+    const auto normal = build(std::nullopt);
+    CHECK(!normal.solid);
+
+    const auto solid = build(std::uint64_t{1} << 20);
+    CHECK(solid.solid);
+    CHECK(solid.archive_bytes < normal.archive_bytes);
+    CHECK(root_type() == BlockType::ArchiveZstd);
+    const auto dest = tmp.path() / "out";
+    CHECK(run(archive, into(dest)).warnings.empty());
+    CHECK(read_file(dest / "f7.txt") == text("config entry 7\nshared boilerplate line\n"));
+    CHECK(run(archive, into(dest, ExtractMode::Scan)).warnings.empty());
+
+    // Over the limit: a normal archive, with the requested alignment.
+    const auto fallback = build(64, 6);
+    CHECK(!fallback.solid);
+    CHECK(root_type() != BlockType::ArchiveZstd);
+    CHECK(ArchiveReader::open(archive).header().align_log2 == 6);
+}
+
+TEST(an_abandoned_solid_attempt_reports_nothing_twice)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    write_file(src / "ok.txt", random_bytes(20'000, 4));
+    write_file(src / "secret.txt", text("unreadable"));
+    ::chmod((src / "secret.txt").c_str(), 0);
+    if (::geteuid() == 0) {
+        std::cout << "  (running as root, so nothing is unreadable; skipping)\n";
+        return;
+    }
+
+    for (const std::uint64_t limit : {std::uint64_t{100}, std::uint64_t{1} << 20}) {
+        std::vector<std::string> warnings;
+        auto out = Output::create_file(tmp.path() / "a.zar", true);
+        CreateOptions options;
+        options.solid_limit = limit;
+        options.on_warning = [&](std::string_view m) { warnings.emplace_back(m); };
+        const auto stats = create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+        CHECK(stats.solid == (limit > 100));
+        CHECK(warnings.size() == 1);
+        CHECK(stats.warnings == 1);
+    }
+    ::chmod((src / "secret.txt").c_str(), 0644);
+}
+
 TEST(reader_finds_an_archive_after_other_data)
 {
     TempDir tmp;

@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -28,6 +29,10 @@ struct CreateOptions {
     bool compress_all = false;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
+    // Try a solid archive (§5.5) first, and keep it if it compresses to at
+    // most this many bytes. Otherwise, write a normal archive.
+    std::optional<std::uint64_t> solid_limit;
+
     std::function<void(std::string_view)> on_warning;
     std::function<void(std::string_view)> on_entry;    // each archive path as it's added
 };
@@ -40,6 +45,7 @@ struct CreateStats {
     std::uint64_t input_bytes = 0;
     std::uint64_t archive_bytes = 0;
     std::uint64_t warnings = 0;
+    bool solid = false;    // the solid form was kept
 };
 
 // How a path given to zar is archived, following POSIX path resolution:

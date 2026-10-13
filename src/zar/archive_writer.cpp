@@ -14,7 +14,52 @@ constexpr std::uint64_t round_up(std::uint64_t value, std::uint64_t alignment) n
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
+constexpr std::uint64_t alignment_of(const ArchiveHeader& header) noexcept
+{
+    return std::uint64_t{1} << header.align_log2;
+}
+
+// Ends an archive with a trailer (§5.1). `base` and `header` are the output
+// positions of the base and of the zar header.
+void write_trailer(Output& out, std::uint64_t base, std::uint64_t header, std::int64_t root,
+                   std::uint64_t alignment)
+{
+    const auto relative = out.position() - base;
+    const auto trailer_at = round_up(relative, std::min<std::uint64_t>(alignment, 8));
+    out.write_zeros(static_cast<std::size_t>(trailer_at - relative));
+
+    std::uint8_t payload[16];
+    store_le(&payload[0], static_cast<std::uint64_t>(root));
+    store_le(&payload[8], base - header + trailer_at);    // distance back to the zar header
+
+    BlockHeader trailer;
+    trailer.type = BlockType::Trailer;
+    trailer.payload_size = sizeof payload;
+    trailer.offset = static_cast<std::int64_t>(trailer_at);
+    trailer.payload_crc = crc32c(payload);
+    out.write(trailer.encode());
+    out.write(payload);
+}
+
 } // namespace
+
+void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc)
+{
+    const auto start = out.position();
+    ArchiveHeader header;
+    header.index_offset = kHeaderSize;    // the block right after the header
+    out.write(header.encode());
+
+    BlockHeader block;
+    block.type = BlockType::ArchiveZstd;
+    block.payload_size = frame.position();
+    block.offset = kHeaderSize;
+    block.payload_crc = frame_crc;
+    out.write(block.encode());
+    frame.copy_to(out);
+
+    write_trailer(out, start, start, header.index_offset, alignment_of(header));
+}
 
 ArchiveWriter::ArchiveWriter(Output& out, std::uint8_t align_log2, bool head_index)
     : out_(out), start_(out.position()), origin_(out.position())
@@ -59,7 +104,7 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index)
 {
     if (!spool_) {
         const auto root = write_block(index_type, index);
-        write_trailer(root);
+        write_trailer(out_, origin_, start_, root, alignment());
         if (out_.seekable()) {
             header_.index_offset = root;
             out_.write_at(start_, header_.encode());
@@ -88,27 +133,8 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index)
     spool_.reset();
     origin_ = start_ + base;
 
-    write_trailer(write_block(index_type, index));    // the second copy (§5.2)
-}
-
-void ArchiveWriter::write_trailer(std::int64_t root_index)
-{
-    const auto relative = out_.position() - origin_;
-    const auto alignment = std::min<std::uint64_t>(this->alignment(), 8);
-    const auto trailer_at = round_up(relative, alignment);
-    out_.write_zeros(static_cast<std::size_t>(trailer_at - relative));
-
-    std::uint8_t payload[16];
-    store_le(&payload[0], static_cast<std::uint64_t>(root_index));
-    store_le(&payload[8], origin_ - start_ + trailer_at);    // distance back to the zar header
-
-    BlockHeader trailer;
-    trailer.type = BlockType::Trailer;
-    trailer.payload_size = sizeof payload;
-    trailer.offset = static_cast<std::int64_t>(trailer_at);
-    trailer.payload_crc = crc32c(payload);
-    out_.write(trailer.encode());
-    out_.write(payload);
+    const auto tail = write_block(index_type, index);    // the second copy (§5.2)
+    write_trailer(out_, origin_, start_, tail, alignment());
 }
 
 } // namespace zar

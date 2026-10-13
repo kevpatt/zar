@@ -84,6 +84,7 @@ archive behind.
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
 | `--head-index` | also put the index at the front, so the archive can be extracted from a pipe; data is staged in a temporary file and written twice |
+| `--solid=SIZE` | first try compressing the whole archive as one stream, and keep that if it's at most SIZE bytes (e.g. `1M`); otherwise write a normal archive. See below. |
 | `-v, --verbose` | list files as they are added |
 
 Files whose extension marks them as already compressed — `.jpg`, `.png`,
@@ -91,6 +92,31 @@ Files whose extension marks them as already compressed — `.jpg`, `.png`,
 (see `src/zar/policy.cpp`) — are stored without compression unless
 `--compress-all` is given. Independently of that, any chunk that zstd fails to
 shrink is stored raw.
+
+### Solid archives
+
+Normally every chunk of every file is compressed separately, so any file can
+be read without the rest. For lots of small, similar files that costs
+compression ratio, because zstd can't exploit what the files have in common.
+
+With `--solid=SIZE`, zar first builds the archive with nothing compressed and
+compresses it whole, as one stream. If the result is at most SIZE bytes, that
+is the archive; if it grows past SIZE, zar stops and writes a normal archive
+instead (so the attempt never costs more than SIZE bytes of output). Options
+like `--align` then apply to the normal archive.
+
+On a few small trees, a solid archive came out 14–41% smaller than a
+normal one:
+
+| Files | Normal | Solid |
+|---|---|---|
+| 13 config files | 5.8K | 5.0K |
+| 38 source files | 72K | 58K |
+| 135 headers | 461K | 270K |
+
+`unzar` reads solid archives transparently, from files or pipes, but has to
+decompress the whole thing first (into memory, or a temporary file when
+it's large). So `--scan` decompresses too.
 
 ### unzar options
 
