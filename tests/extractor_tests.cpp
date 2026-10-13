@@ -213,6 +213,79 @@ TEST(scan_and_test_detect_damage_without_writing)
     CHECK(read_file(dest / "ok.txt") == text("fine"));
 }
 
+TEST(parallel_extraction_is_exact_at_any_thread_count)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    std::vector<std::pair<fs::path, Bytes>> files;
+    for (unsigned i = 0; i < 40; ++i) {
+        // Sizes straddle the chunk size: empty, partial, exact, and many chunks.
+        const std::size_t size = (i % 5 == 0) ? 0 : (i % 5 == 1) ? 4096 : (i * 7919) % 60'000;
+        auto data = (i % 2) ? random_bytes(size, i) : Bytes(size, static_cast<std::uint8_t>('a' + i % 26));
+        files.emplace_back(fs::path("d" + std::to_string(i % 4)) / ("f" + std::to_string(i)), std::move(data));
+        write_file(src / files.back().first, files.back().second);
+    }
+
+    const auto archive = tmp.path() / "a.zar";
+    {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.chunk_size = 4096;
+        create_archive(out, std::vector{src}, options);
+        out.commit();
+    }
+
+    for (const unsigned threads : {1u, 2u, 16u}) {
+        const auto dest = tmp.path() / ("out" + std::to_string(threads));
+        auto options = into(dest);
+        options.threads = threads;
+        const auto result = run(archive, options);
+        CHECK(result.warnings.empty());
+        CHECK(result.stats.files == files.size());
+        for (const auto& [path, data] : files)
+            CHECK(read_file(dest / path) == data);
+
+        auto test = into(dest, ExtractMode::Test);
+        test.threads = threads;
+        CHECK(run(archive, test).warnings.empty());
+    }
+}
+
+TEST(damage_in_one_chunk_fails_only_that_file)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    write_file(src / "big.bin", random_bytes(100'000, 1));
+    write_file(src / "other.bin", random_bytes(100'000, 2));
+    const auto archive = tmp.path() / "a.zar";
+    {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.chunk_size = 8192;
+        create_archive(out, std::vector{src}, options);
+        out.commit();
+    }
+
+    std::int64_t middle = 0;
+    {
+        const auto reader = ArchiveReader::open(archive);
+        for (const auto& e : reader.entries())
+            if (e.path == "big.bin")
+                middle = e.chunks[e.chunks.size() / 2];
+    }
+    auto bytes = read_file(archive);
+    bytes[static_cast<std::size_t>(middle) + kHeaderSize + 100] ^= 0x01;
+    write_file(archive, bytes);
+
+    const auto dest = tmp.path() / "out";
+    auto options = into(dest);
+    options.threads = 8;
+    const auto result = run(archive, options);
+    CHECK(result.warnings.size() == 1);
+    CHECK(!fs::exists(dest / "big.bin"));
+    CHECK(read_file(dest / "other.bin") == random_bytes(100'000, 2));
+}
+
 TEST(archive_symlinks_cannot_redirect_extraction)
 {
     TempDir tmp;

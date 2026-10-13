@@ -29,7 +29,8 @@ struct ExtractOptions {
     std::filesystem::path directory = ".";
     bool overwrite = false;    // required if anything to be extracted already exists
     DirMode dirs = DirMode::Merge;
-    std::function<void(std::string_view)> on_warning;
+    unsigned threads = 0;      // 0: one per CPU core
+    std::function<void(std::string_view)> on_warning;    // may be called from any thread
 };
 
 struct ExtractStats {
@@ -65,12 +66,13 @@ public:
     // DirMode::Replace, deletes existing top-level directories.
     void prepare(std::span<const DirectoryGroup> groups);
 
-    // Then call for each group in order, and for each of its members.
+    // Then call for each group in order, and for each of its members. File
+    // data is extracted in the background, chunks in parallel.
     void enter(const DirectoryGroup& group);
     void extract(const Entry& entry);
 
-    // Creates symlinks and applies directory metadata, which wait until
-    // everything else is in place.
+    // Waits for all file data, then creates symlinks and applies directory
+    // metadata, which wait until everything else is in place.
     ExtractStats finish();
 
 private:

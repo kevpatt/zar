@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <sys/stat.h>
 #include <system_error>
@@ -18,8 +20,13 @@ struct ArchiveReader::File {
     std::uint64_t size = 0;
     std::string name;
 
+    std::mutex dictionaries_mutex;
+    std::map<std::int64_t, ZSTD_DDict*> dictionaries;
+
     ~File()
     {
+        for (const auto& [offset, dict] : dictionaries)
+            ZSTD_freeDDict(dict);
         if (fd >= 0)
             ::close(fd);
     }
@@ -69,7 +76,9 @@ std::uint64_t frame_content_size(ByteView payload, std::int64_t offset)
 Bytes decompress_frame(ByteView payload, std::uint64_t size, const ZSTD_DDict* dict,
                        std::int64_t offset)
 {
-    const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx(ZSTD_createDCtx(), ZSTD_freeDCtx);
+    // One context per thread, reused across frames.
+    thread_local const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx(ZSTD_createDCtx(),
+                                                                                 ZSTD_freeDCtx);
     if (!dctx)
         throw std::bad_alloc();
 
@@ -113,11 +122,7 @@ ArchiveReader::ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, s
 
 ArchiveReader::ArchiveReader(ArchiveReader&&) noexcept = default;
 
-ArchiveReader::~ArchiveReader()
-{
-    for (const auto& [offset, dict] : dictionaries_)
-        ZSTD_freeDDict(dict);
-}
+ArchiveReader::~ArchiveReader() = default;
 
 ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
                                   std::function<void(std::string_view)> on_warning)
@@ -276,7 +281,9 @@ void ArchiveReader::load_index(std::int64_t offset, const Entry* parent, std::si
 
 const ZSTD_DDict* ArchiveReader::dictionary(std::int64_t offset) const
 {
-    if (const auto it = dictionaries_.find(offset); it != dictionaries_.end())
+    std::lock_guard lock(file_->dictionaries_mutex);
+    auto& dictionaries = file_->dictionaries;
+    if (const auto it = dictionaries.find(offset); it != dictionaries.end())
         return it->second;
 
     const auto block = block_header(offset);
@@ -286,7 +293,7 @@ const ZSTD_DDict* ArchiveReader::dictionary(std::int64_t offset) const
     ZSTD_DDict* dict = ZSTD_createDDict(bytes.data(), bytes.size());
     if (!dict)
         throw FormatError(at(offset) + " is not a valid zstd dictionary");
-    dictionaries_.emplace(offset, dict);
+    dictionaries.emplace(offset, dict);
     return dict;
 }
 

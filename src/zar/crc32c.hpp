@@ -15,4 +15,8 @@ inline std::uint32_t crc32c(std::span<const std::uint8_t> data) noexcept
     return crc32c(0, data);
 }
 
+// The CRC of a ++ b, given crc32c(a), crc32c(b), and b's length, without
+// touching the data. Lets chunks be checksummed independently, in any order.
+std::uint32_t crc32c_combine(std::uint32_t crc_a, std::uint32_t crc_b, std::uint64_t length_b) noexcept;
+
 } // namespace zar

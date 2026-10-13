@@ -83,11 +83,49 @@ std::uint32_t update(std::uint32_t crc, const std::uint8_t* p, std::size_t n) no
 
 #endif
 
+// CRC combination works in GF(2): appending n zero bits to a message is a
+// linear operator on its CRC, represented as a 32x32 bit matrix (one column
+// per word). Squaring the operator doubles n, so appending length_b bytes
+// takes O(log length_b) matrix products (the method used by zlib).
+using Gf2Matrix = std::array<std::uint32_t, 32>;
+
+std::uint32_t times(const Gf2Matrix& matrix, std::uint32_t vector) noexcept
+{
+    std::uint32_t sum = 0;
+    for (std::size_t i = 0; vector; ++i, vector >>= 1)
+        if (vector & 1)
+            sum ^= matrix[i];
+    return sum;
+}
+
+Gf2Matrix square(const Gf2Matrix& matrix) noexcept
+{
+    Gf2Matrix result;
+    for (std::size_t i = 0; i < 32; ++i)
+        result[i] = times(matrix, matrix[i]);
+    return result;
+}
+
 } // namespace
 
 std::uint32_t crc32c(std::uint32_t crc, std::span<const std::uint8_t> data) noexcept
 {
     return ~update(~crc, data.data(), data.size());
+}
+
+std::uint32_t crc32c_combine(std::uint32_t crc_a, std::uint32_t crc_b, std::uint64_t length_b) noexcept
+{
+    // The operator for one zero bit, then squared up to one zero byte.
+    Gf2Matrix op;
+    op[0] = kPolyReflected;
+    for (std::size_t i = 1; i < 32; ++i)
+        op[i] = std::uint32_t{1} << (i - 1);
+    op = square(square(square(op)));
+
+    for (; length_b; length_b >>= 1, op = square(op))
+        if (length_b & 1)
+            crc_a = times(op, crc_a);
+    return crc_a ^ crc_b;
 }
 
 } // namespace zar

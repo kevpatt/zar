@@ -53,7 +53,8 @@ add_library(libzar STATIC
     src/zar/index.cpp
     src/zar/names.cpp
     src/zar/output.cpp
-    src/zar/policy.cpp)
+    src/zar/policy.cpp
+    src/zar/thread_pool.cpp)
 set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 target_include_directories(libzar PUBLIC src)
 target_compile_definitions(libzar PUBLIC ZAR_VERSION="${PROJECT_VERSION}")

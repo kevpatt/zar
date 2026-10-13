@@ -82,6 +82,7 @@ shrink is stored raw.
 | `-t, --test` | like `--scan`, but also decompress and verify all data |
 | `-y, --yes` | overwrite files and directories that already exist |
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
+| `-j, --threads[=N]` | worker threads (default: one per CPU core); chunks are verified, decompressed, and written in parallel |
 | `-v, --verbose` | add permissions and owner to the listing; print a summary |
 
 Before extracting anything, `unzar` checks whether any target already exists;

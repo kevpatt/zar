@@ -1,14 +1,18 @@
 #include "zar/extractor.hpp"
 
 #include "zar/crc32c.hpp"
+#include "zar/thread_pool.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <fcntl.h>
 #include <grp.h>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <pwd.h>
+#include <semaphore>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
@@ -67,15 +71,16 @@ struct PathLess {
     }
 };
 
-void write_all(int fd, ByteView data)
+void write_all_at(int fd, ByteView data, std::uint64_t position)
 {
     while (!data.empty()) {
-        const auto n = ::write(fd, data.data(), data.size());
+        const auto n = ::pwrite(fd, data.data(), data.size(), static_cast<off_t>(position));
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0)
             throw ExtractError(std::generic_category().message(errno));
         data = data.subspan(static_cast<std::size_t>(n));
+        position += static_cast<std::uint64_t>(n);
     }
 }
 
@@ -152,10 +157,41 @@ std::vector<DirectoryGroup> group_by_directory(std::span<const Entry> entries)
 }
 
 struct Extractor::Impl {
+    // A file whose chunks are being extracted in parallel. Whichever worker
+    // finishes the last chunk completes the file.
+    struct FileJob {
+        FileJob(const Entry& e, std::vector<std::uint64_t> chunk_lengths)
+            : entry(e), lengths(std::move(chunk_lengths)), crcs(lengths.size()), remaining(lengths.size())
+        {
+        }
+
+        void fail(std::string_view what)
+        {
+            std::lock_guard lock(mutex);
+            if (!failed.exchange(true))
+                error = what;
+        }
+
+        const Entry& entry;
+        std::vector<std::uint64_t> lengths;
+        std::vector<std::uint32_t> crcs;    // per chunk, combined at the end
+        std::atomic<std::size_t> remaining;
+        std::atomic<bool> failed = false;
+        std::mutex mutex;
+        std::string error;
+        std::string name;
+        Fd dir;    // its directory, so a failed file can be removed
+        Fd out;
+    };
+
     const ArchiveReader& reader;
     const ExtractOptions& options;
     const bool writing = options.mode == ExtractMode::Extract;
+    const bool decompress = options.mode != ExtractMode::Scan;
     const bool privileged = ::geteuid() == 0;
+    const unsigned threads = options.threads ? options.threads : default_thread_count();
+
+    std::mutex mutex;    // guards stats and warnings, which workers update too
     ExtractStats stats;
 
     Fd root;
@@ -166,6 +202,10 @@ struct Extractor::Impl {
     std::vector<std::pair<std::string, const Entry*>> symlinks;
     // Metadata applied last, deepest first, so writing contents doesn't disturb it.
     std::vector<const Entry*> directories;
+
+    // Bounds the chunks in memory, and so the open files, at any moment.
+    std::counting_semaphore<> in_flight{static_cast<std::ptrdiff_t>(threads) * 4};
+    ThreadPool pool{threads};    // last: destroyed first, while what its jobs use still exists
 
     Impl(const ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o)
     {
@@ -180,6 +220,7 @@ struct Extractor::Impl {
 
     void warn(const std::string& message)
     {
+        std::lock_guard lock(mutex);
         ++stats.warnings;
         if (options.on_warning)
             options.on_warning(message);
@@ -299,6 +340,7 @@ struct Extractor::Impl {
     {
         current_path = group.path;
         if (group.entry) {
+            std::lock_guard lock(mutex);
             ++stats.directories;
             directories.push_back(group.entry);
         }
@@ -324,7 +366,10 @@ struct Extractor::Impl {
                 if (!entry.link_target || entry.link_target->empty() ||
                     entry.link_target->find('\0') != std::string::npos)
                     throw FormatError("symlink has no valid target");
-                ++stats.symlinks;
+                {
+                    std::lock_guard lock(mutex);
+                    ++stats.symlinks;
+                }
                 if (writing)
                     symlinks.emplace_back(current_path, &entry);
                 break;
@@ -336,46 +381,89 @@ struct Extractor::Impl {
         }
     }
 
+    // Creates the file and queues its chunks; the pool does the rest.
     void extract_file(const Entry& entry)
     {
-        const auto lengths = ArchiveReader::chunk_lengths(entry);
-        const bool decompress = options.mode != ExtractMode::Scan;
+        auto job = std::make_shared<FileJob>(entry, ArchiveReader::chunk_lengths(entry));
 
-        Fd out;
-        const std::string name(base_name(entry.path));
         if (writing) {
             if (!current)
                 throw ExtractError("its directory could not be created");
+            job->name = base_name(entry.path);
             for (;;) {
-                out = Fd(::openat(current.get(), name.c_str(),
-                                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
-                if (out || errno != EEXIST)
+                job->out = Fd(::openat(current.get(), job->name.c_str(),
+                                       O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+                if (job->out || errno != EEXIST)
                     break;
-                remove_existing(current.get(), name);
+                remove_existing(current.get(), job->name);
             }
-            if (!out)
+            if (!job->out)
                 throw_errno("cannot create file");
+            job->dir = Fd(::dup(current.get()));
         }
 
-        try {
-            std::uint32_t crc = 0;
-            for (std::size_t i = 0; i < lengths.size(); ++i) {
-                const auto data = reader.chunk(entry, i, lengths[i], decompress);
-                crc = crc32c(crc, data);
-                if (out)
-                    write_all(out.get(), data);
-            }
-            if (decompress && entry.content_crc && crc != *entry.content_crc)
-                throw FormatError("content checksum mismatch");
-            if (out)
-                apply_metadata(out.get(), entry);
-        } catch (...) {
-            if (out)
-                ::unlinkat(current.get(), name.c_str(), 0);    // don't leave a partial file
-            throw;
+        if (job->lengths.empty()) {
+            complete(*job);
+            return;
         }
+        std::uint64_t position = 0;
+        for (std::size_t i = 0; i < job->lengths.size(); ++i) {
+            in_flight.acquire();
+            pool.submit([this, job, i, position] { extract_chunk(*job, i, position); });
+            position += job->lengths[i];
+        }
+    }
+
+    // Runs on a worker thread.
+    void extract_chunk(FileJob& job, std::size_t index, std::uint64_t position)
+    {
+        if (!job.failed) {
+            try {
+                const auto data = reader.chunk(job.entry, index, job.lengths[index], decompress);
+                job.crcs[index] = crc32c(data);
+                if (job.out)
+                    write_all_at(job.out.get(), data, position);
+            } catch (const std::exception& e) {
+                job.fail(e.what());
+            }
+        }
+        in_flight.release();
+        if (--job.remaining == 0)
+            complete(job);
+    }
+
+    // Runs once all of a file's chunks are done, on whichever thread finished last.
+    void complete(FileJob& job)
+    {
+        try {
+            if (job.failed)
+                throw ExtractError(job.error);
+            if (decompress && job.entry.content_crc) {
+                std::uint32_t crc = 0;
+                for (std::size_t i = 0; i < job.crcs.size(); ++i)
+                    crc = crc32c_combine(crc, job.crcs[i], job.lengths[i]);
+                if (crc != *job.entry.content_crc)
+                    throw FormatError("content checksum mismatch");
+            }
+        } catch (const std::exception& e) {
+            if (job.out)
+                ::unlinkat(job.dir.get(), job.name.c_str(), 0);    // don't leave a partial file
+            warn(job.entry.path + ": " + e.what());
+            return;
+        }
+
+        if (job.out) {
+            try {
+                apply_metadata(job.out.get(), job.entry);
+            } catch (const std::exception& e) {
+                warn(job.entry.path + ": " + e.what());
+            }
+            job.out = Fd();    // close now, not when the last reference goes
+            job.dir = Fd();
+        }
+        std::lock_guard lock(mutex);
         ++stats.files;
-        stats.bytes += entry.size.value_or(0);
+        stats.bytes += job.entry.size.value_or(0);
     }
 
     void create_symlink(const std::string& dir_path, const Entry& entry)
@@ -399,6 +487,7 @@ struct Extractor::Impl {
 
     ExtractStats finish()
     {
+        pool.wait();
         if (!writing)
             return stats;
         current = Fd();

@@ -1,4 +1,5 @@
-// Random access to an archive on disk.
+// Random access to an archive on disk. After open(), every const member is
+// safe to call from several threads at once.
 #pragma once
 
 #include "zar/format.hpp"
@@ -6,7 +7,6 @@
 
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <memory>
 #include <set>
 #include <string_view>
@@ -58,11 +58,10 @@ private:
                     std::set<std::int64_t>& seen, std::vector<Entry>& out) const;
     const ZSTD_DDict_s* dictionary(std::int64_t offset) const;
 
-    std::unique_ptr<File> file_;
+    std::unique_ptr<File> file_;    // also holds the dictionary cache
     ArchiveHeader header_;
     std::uint64_t base_;    // file position of offset 0
     std::vector<Entry> entries_;
-    mutable std::map<std::int64_t, ZSTD_DDict_s*> dictionaries_;
 };
 
 } // namespace zar

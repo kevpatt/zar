@@ -3,6 +3,7 @@
 #include "zar/format.hpp"
 #include "zar/names.hpp"
 
+#include <charconv>
 #include <ctime>
 #include <getopt.h>
 #include <iostream>
@@ -27,6 +28,7 @@ constexpr std::string_view kUsage = R"(usage: unzar [options] ARCHIVE [PATH...]
   -y, --yes              overwrite files and directories that already exist
       --dirs=MODE        existing directories: merge (default) extracts into
                          them; replace deletes them first. Either needs -y.
+  -j, --threads[=N]      worker threads (default: one per CPU core)
   -v, --verbose          with --list, also show permissions and owner;
                          print a summary at the end
   -h, --help             show this help
@@ -61,6 +63,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"test", no_argument, nullptr, 't'},
         {"yes", no_argument, nullptr, 'y'},
         {"dirs", required_argument, nullptr, kDirs},
+        {"threads", optional_argument, nullptr, 'j'},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, kVersion},
@@ -69,13 +72,24 @@ std::optional<Command> parse(int argc, char** argv)
 
     Command cmd;
     int c;
-    while ((c = ::getopt_long(argc, argv, "C:ltyvh", kOptions, nullptr)) != -1) {
+    while ((c = ::getopt_long(argc, argv, "C:ltyj::vh", kOptions, nullptr)) != -1) {
         switch (c) {
         case 'C': cmd.options.directory = optarg; break;
         case 'l': cmd.list = true; break;
         case kScan: cmd.options.mode = zar::ExtractMode::Scan; break;
         case 't': cmd.options.mode = zar::ExtractMode::Test; break;
         case 'y': cmd.options.overwrite = true; break;
+        case 'j':
+            cmd.options.threads = 0;    // one per core
+            if (optarg) {
+                const std::string_view arg = optarg;
+                unsigned threads = 0;
+                const auto [end, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), threads);
+                if (ec != std::errc{} || end != arg.data() + arg.size() || threads == 0 || threads > 1024)
+                    throw UsageError("thread count must be between 1 and 1024");
+                cmd.options.threads = threads;
+            }
+            break;
         case kDirs:
             if (std::string_view(optarg) == "merge")
                 cmd.options.dirs = zar::DirMode::Merge;

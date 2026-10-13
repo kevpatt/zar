@@ -35,6 +35,22 @@ TEST(crc32c_is_incremental)
         CHECK(crc32c(crc32c(text.first(split)), text.subspan(split)) == crc32c(text));
 }
 
+TEST(crc32c_combine_matches_concatenation)
+{
+    const auto text = bytes_of("Chunks may be checksummed separately and in any order.");
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        const auto a = text.first(split), b = text.subspan(split);
+        CHECK(crc32c_combine(crc32c(a), crc32c(b), b.size()) == crc32c(text));
+    }
+
+    // Across a long second part, too.
+    Bytes big(3'000'017);
+    for (std::size_t i = 0; i < big.size(); ++i)
+        big[i] = static_cast<std::uint8_t>(i * 131 + (i >> 9));
+    const ByteView all(big);
+    CHECK(crc32c_combine(crc32c(all.first(5)), crc32c(all.subspan(5)), all.size() - 5) == crc32c(all));
+}
+
 TEST(varint_round_trip)
 {
     for (std::uint64_t v : {0ull, 1ull, 127ull, 128ull, 300ull, 16383ull, 16384ull,
