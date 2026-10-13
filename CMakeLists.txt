@@ -85,6 +85,7 @@ add_executable(unzar src/unzar_main.cpp)
 target_link_libraries(unzar PRIVATE libzar zar_build_info zar_warnings)
 
 install(TARGETS zar unzar RUNTIME DESTINATION bin)
+install(FILES LICENSE.txt README.md FORMAT.md DESTINATION share/doc/zar)
 
 if(ZAR_BUILD_TESTS)
     enable_testing()
