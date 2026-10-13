@@ -1,4 +1,47 @@
-build/
-.cache/
+# Build directories (build/, build-tsan/, build-asan/, ...)
+/build*/
+/cmake-build-*/
+/out/
+
+# In-source CMake builds
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+Testing/
+/compile_commands.json
+*.ninja
+.ninja_deps
+.ninja_log
+
+# Compiler output
+*.o
+*.a
+*.dylib
+*.so
+*.dSYM/
+
+# Archives made while trying things out, and the temporary files zar writes
+# before renaming into place (left behind only if it's killed mid-write).
+# To commit a test fixture, add an exception like: !tests/data/*.zar
 *.zar
+*.zar.??????
+.zar-spool-*
+
+# clangd and other tools
+/.cache/
+.clangd
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.#*
+
+# macOS
 .DS_Store
+._*
