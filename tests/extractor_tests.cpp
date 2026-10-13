@@ -572,6 +572,48 @@ TEST(an_abandoned_solid_attempt_reports_nothing_twice)
     ::chmod((src / "secret.txt").c_str(), 0644);
 }
 
+TEST(size_limit_is_enforced_before_anything_is_written)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/a.bin", Bytes(300'000, 1));
+    write_file(tmp.path() / "src/b.bin", Bytes(300'000, 2));
+    const auto archive = make_archive(tmp.path() / "a.zar", tmp.path() / "src");
+    const auto dest = tmp.path() / "out";
+
+    auto options = into(dest);
+    options.size_limit = 500'000;
+    CHECK_THROWS(run(archive, options));
+    CHECK(!fs::exists(dest / "a.bin"));    // refused up front
+
+    auto test = into(dest, ExtractMode::Test);
+    test.size_limit = 500'000;
+    CHECK_THROWS(run(archive, test));
+
+    auto scan = into(dest, ExtractMode::Scan);    // decompresses nothing
+    scan.size_limit = 500'000;
+    CHECK(run(archive, scan).warnings.empty());
+
+    options.size_limit = 600'000;
+    CHECK(run(archive, options).warnings.empty());
+}
+
+TEST(size_limit_stops_a_solid_archive_expanding)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/zeros", Bytes(5'000'000, 0));    // compresses ~1000:1
+    const auto archive = tmp.path() / "a.zar";
+    {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.solid_limit = 1 << 20;
+        CHECK(create_archive(out, std::vector{tmp.path() / "src/."}, options).solid);
+        out.commit();
+    }
+    CHECK(fs::file_size(archive) < 10'000);
+    CHECK_THROWS(ArchiveReader::open(archive, {}, 1'000'000));
+    CHECK(ArchiveReader::open(archive, {}, 6'000'000).entries().size() == 1);
+}
+
 TEST(reader_finds_an_archive_after_other_data)
 {
     TempDir tmp;

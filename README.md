@@ -129,6 +129,7 @@ it's large). So `--scan` decompresses too.
 | `-y, --yes` | overwrite files and directories that already exist |
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core); chunks are verified, decompressed, and written in parallel |
+| `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`): the selected files' total is checked before anything is written, and a solid archive stops decompressing once it passes SIZE |
 | `-v, --verbose` | add permissions and owner to the listing; print a summary |
 
 `ARCHIVE` may be `-` for standard input. If that's a pipe, the archive must

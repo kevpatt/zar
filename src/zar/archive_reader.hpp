@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <utility>
@@ -21,15 +22,19 @@ public:
     // Opens an archive that starts at the beginning of `path` or, failing
     // that, one located from a trailer at its end (§5.1). Problems that can
     // be worked around, such as a damaged index copy, go to `on_warning`.
+    // A solid archive (§5.5) is decompressed here; it may not expand to more
+    // than `size_limit` bytes.
     static ArchiveReader open(const std::filesystem::path& path,
-                              std::function<void(std::string_view)> on_warning = {});
+                              std::function<void(std::string_view)> on_warning = {},
+                              std::optional<std::uint64_t> size_limit = {});
 
     // Reads an archive from a stream such as a pipe, which works when its
     // index is at the head (§5.4). The header and the index are read now;
     // data blocks must then be fetched in order with next_block(). The
     // caller keeps ownership of `fd`.
     static ArchiveReader open_stream(int fd, std::string name,
-                                     std::function<void(std::string_view)> on_warning = {});
+                                     std::function<void(std::string_view)> on_warning = {},
+                                     std::optional<std::uint64_t> size_limit = {});
 
     bool streaming() const noexcept;
 
@@ -71,8 +76,9 @@ private:
     class Inflater;
 
     static ArchiveReader from_file(std::unique_ptr<File> file,
-                                   std::function<void(std::string_view)> on_warning, bool allow_solid);
-    std::unique_ptr<File> unwrap(const BlockHeader& block) const;
+                                   std::function<void(std::string_view)> on_warning, bool allow_solid,
+                                   std::optional<std::uint64_t> size_limit);
+    std::unique_ptr<File> unwrap(const BlockHeader& block, std::optional<std::uint64_t> size_limit) const;
 
     ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, std::uint64_t base);
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const;

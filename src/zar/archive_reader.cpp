@@ -171,7 +171,7 @@ std::vector<Entry> last_wins(std::vector<Entry> entries)
 // kInMemoryLimit, into an anonymous temporary file.
 class ArchiveReader::Inflater {
 public:
-    explicit Inflater(std::string name) : name_(std::move(name))
+    Inflater(std::string name, std::optional<std::uint64_t> limit) : name_(std::move(name)), limit_(limit)
     {
         if (!dstream_)
             throw std::bad_alloc();
@@ -233,6 +233,10 @@ private:
     {
         if (data.empty())
             return;
+        total_ += data.size();
+        if (limit_ && total_ > *limit_)
+            throw std::runtime_error(name_ + ": the solid archive expands to more than the size limit (" +
+                                     std::to_string(*limit_) + " bytes)");
         if (spill_ < 0 && memory_.size() + data.size() <= kInMemoryLimit) {
             memory_.insert(memory_.end(), data.begin(), data.end());
             return;
@@ -264,6 +268,8 @@ private:
     }
 
     std::string name_;
+    std::optional<std::uint64_t> limit_;
+    std::uint64_t total_ = 0;
     std::unique_ptr<ZSTD_DStream, decltype(&ZSTD_freeDStream)> dstream_{ZSTD_createDStream(), ZSTD_freeDStream};
     Bytes buffer_ = Bytes(ZSTD_DStreamOutSize());
     bool done_ = false;
@@ -283,7 +289,8 @@ ArchiveReader::ArchiveReader(ArchiveReader&&) noexcept = default;
 ArchiveReader::~ArchiveReader() = default;
 
 ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
-                                  std::function<void(std::string_view)> on_warning)
+                                  std::function<void(std::string_view)> on_warning,
+                                  std::optional<std::uint64_t> size_limit)
 {
     auto file = std::make_unique<File>();
     file->name = path.string();
@@ -296,12 +303,12 @@ ArchiveReader ArchiveReader::open(const std::filesystem::path& path,
     if (!S_ISREG(st.st_mode))
         throw std::runtime_error(file->name + ": not a regular file");
     file->size = static_cast<std::uint64_t>(st.st_size);
-    return from_file(std::move(file), on_warning, true);
+    return from_file(std::move(file), on_warning, true, size_limit);
 }
 
 ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
                                        std::function<void(std::string_view)> on_warning,
-                                       bool allow_solid)
+                                       bool allow_solid, std::optional<std::uint64_t> size_limit)
 {
     const auto warn = [&](const std::string& message) {
         if (on_warning)
@@ -365,7 +372,7 @@ ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
             if (const auto root = reader.block_header(roots[i]); root.type == BlockType::ArchiveZstd) {
                 if (!allow_solid)
                     throw FormatError("a solid archive can't contain another");
-                return from_file(reader.unwrap(root), on_warning, false);
+                return from_file(reader.unwrap(root, size_limit), on_warning, false, size_limit);
             }
             std::vector<Entry> entries;
             std::set<std::int64_t> seen;
@@ -544,7 +551,8 @@ std::pair<BlockHeader, Bytes> ArchiveReader::next_block(std::int64_t offset)
 }
 
 ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
-                                         std::function<void(std::string_view)> on_warning)
+                                         std::function<void(std::string_view)> on_warning,
+                                         std::optional<std::uint64_t> size_limit)
 {
     (void)on_warning;    // a stream has no trailer, so no backup index to fall back on
 
@@ -565,7 +573,7 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
         file->read_next(block_bytes);
         const auto block = BlockHeader::decode(block_bytes, header.index_offset);
         if (block.type == BlockType::ArchiveZstd) {
-            Inflater inflater(file->name);
+            Inflater inflater(file->name, size_limit);
             Bytes piece(1 << 20);
             for (std::uint64_t done = 0; done < block.payload_size;) {
                 const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
@@ -573,7 +581,7 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
                 inflater.feed({piece.data(), n});
                 done += n;
             }
-            return from_file(inflater.finish(block.payload_crc), on_warning, false);
+            return from_file(inflater.finish(block.payload_crc), on_warning, false, size_limit);
         }
     }
 
@@ -600,9 +608,10 @@ bool ArchiveReader::streaming() const noexcept
     return file_->stream;
 }
 
-std::unique_ptr<ArchiveReader::File> ArchiveReader::unwrap(const BlockHeader& block) const
+std::unique_ptr<ArchiveReader::File> ArchiveReader::unwrap(const BlockHeader& block,
+                                                           std::optional<std::uint64_t> size_limit) const
 {
-    Inflater inflater(file_->name);
+    Inflater inflater(file_->name, size_limit);
     Bytes piece(1 << 20);
     const auto start = base_ + static_cast<std::uint64_t>(block.offset) + kHeaderSize;
     for (std::uint64_t done = 0; done < block.payload_size;) {

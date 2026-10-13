@@ -1,4 +1,5 @@
 // zar — create an archive.
+#include "cli.hpp"
 #include "zar/creator.hpp"
 #include "zar/format.hpp"
 
@@ -59,38 +60,9 @@ PATH is stored under its own name, so extracting recreates it:
       --version          show version information
 )";
 
-struct UsageError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
-std::uint64_t parse_number(std::string_view text, std::string_view what)
-{
-    std::uint64_t value = 0;
-    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (text.empty() || ec != std::errc{} || end != text.data() + text.size())
-        throw UsageError("invalid " + std::string(what) + ": " + std::string(text));
-    return value;
-}
-
-// "1M", "64K", "512", ... with binary multipliers.
-std::uint64_t parse_size(std::string_view text, std::string_view what)
-{
-    int shift = 0;
-    if (!text.empty()) {
-        switch (text.back()) {
-        case 'k': case 'K': shift = 10; break;
-        case 'm': case 'M': shift = 20; break;
-        case 'g': case 'G': shift = 30; break;
-        default: break;
-        }
-        if (shift)
-            text.remove_suffix(1);
-    }
-    const auto value = parse_number(text, what);
-    if (value > (~std::uint64_t{0} >> shift))
-        throw UsageError(std::string(what) + " is too large");
-    return value << shift;
-}
+using zar::cli::parse_number;
+using zar::cli::parse_size;
+using zar::cli::UsageError;
 
 std::uint64_t cache_line_size()
 {
@@ -181,15 +153,7 @@ std::optional<Command> parse(int argc, char** argv)
         case 'y': cmd.overwrite = true; break;
         case 'm': cmd.many = true; break;
         case 'l': opt.level = parse_level(arg); break;
-        case 'j':
-            opt.threads = 0;    // one per core
-            if (optarg) {
-                const auto threads = parse_number(arg, "thread count");
-                if (threads == 0 || threads > 1024)
-                    throw UsageError("thread count must be between 1 and 1024");
-                opt.threads = static_cast<unsigned>(threads);
-            }
-            break;
+        case 'j': opt.threads = zar::cli::parse_threads(optarg); break;
         case kChunkSize:
             opt.chunk_size = parse_size(arg, "chunk size");
             if (!std::has_single_bit(opt.chunk_size) || opt.chunk_size < (1 << 12) ||

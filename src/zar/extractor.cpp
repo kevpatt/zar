@@ -222,15 +222,20 @@ struct Extractor::Impl {
     std::counting_semaphore<> in_flight{static_cast<std::ptrdiff_t>(threads) * 4};
     ThreadPool pool{threads};    // last: destroyed first, while what its jobs use still exists
 
-    Impl(ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o)
+    Impl(ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o) {}
+
+    // The destination is created only once there's something to put in it,
+    // so a refused extraction leaves no trace.
+    int root_fd()
     {
-        if (!writing)
-            return;
-        std::error_code ec;
-        std::filesystem::create_directories(options.directory, ec);
-        root = Fd(::open(options.directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-        if (!root)
-            throw std::system_error(errno, std::generic_category(), options.directory.string());
+        if (!root) {
+            std::error_code ec;
+            std::filesystem::create_directories(options.directory, ec);
+            root = Fd(::open(options.directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            if (!root)
+                throw std::system_error(errno, std::generic_category(), options.directory.string());
+        }
+        return root.get();
     }
 
     void warn(const std::string& message)
@@ -243,9 +248,9 @@ struct Extractor::Impl {
 
     // Opens a directory below the root, one component at a time, never
     // following symlinks. Missing directories are created if `create`.
-    Fd open_directory(std::string_view path, bool create) const
+    Fd open_directory(std::string_view path, bool create)
     {
-        Fd dir(::dup(root.get()));
+        Fd dir(::dup(root_fd()));
         while (!path.empty()) {
             const auto slash = path.find('/');
             const std::string component(path.substr(0, slash));
@@ -285,6 +290,16 @@ struct Extractor::Impl {
 
     void prepare(std::span<const DirectoryGroup> groups)
     {
+        if (decompress && options.size_limit) {
+            std::uint64_t total = 0;
+            for (const auto& group : groups)
+                for (const auto* member : group.members)
+                    total += std::min(member->size.value_or(0), ~std::uint64_t{0} - total);
+            if (total > *options.size_limit)
+                throw ExtractError("the files total " + std::to_string(total) +
+                                   " bytes, more than the size limit (" +
+                                   std::to_string(*options.size_limit) + " bytes)");
+        }
         if (!writing)
             return;
 

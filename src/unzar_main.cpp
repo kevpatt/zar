@@ -1,9 +1,9 @@
 // unzar — extract, test, scan, or list an archive.
+#include "cli.hpp"
 #include "zar/extractor.hpp"
 #include "zar/format.hpp"
 #include "zar/names.hpp"
 
-#include <charconv>
 #include <ctime>
 #include <functional>
 #include <getopt.h>
@@ -35,6 +35,10 @@ archives created with zar --head-index.
       --dirs=MODE        existing directories: merge (default) extracts into
                          them; replace deletes them first. Either needs -y.
   -j, --threads[=N]      worker threads (default: one per CPU core)
+      --max-size=SIZE    refuse to decompress more than SIZE bytes in all
+                         (e.g. 10G): the selected files' total is checked
+                         before anything is written, and a solid archive
+                         stops decompressing once it passes SIZE
   -v, --verbose          with --list, also show permissions and owner;
                          print a summary at the end
   -h, --help             show this help
@@ -46,9 +50,7 @@ given. --list combines with any mode: `unzar --list --scan` lists an
 archive while checking it, without extracting.
 )";
 
-struct UsageError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
+using zar::cli::UsageError;
 
 struct Command {
     zar::ExtractOptions options;
@@ -58,7 +60,7 @@ struct Command {
     bool verbose = false;
 };
 
-enum LongOnly { kScan = 256, kDirs, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kVersion };
 
 std::optional<Command> parse(int argc, char** argv)
 {
@@ -70,6 +72,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"yes", no_argument, nullptr, 'y'},
         {"dirs", required_argument, nullptr, kDirs},
         {"threads", optional_argument, nullptr, 'j'},
+        {"max-size", required_argument, nullptr, kMaxSize},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, 'h'},
         {"version", no_argument, nullptr, kVersion},
@@ -85,17 +88,8 @@ std::optional<Command> parse(int argc, char** argv)
         case kScan: cmd.options.mode = zar::ExtractMode::Scan; break;
         case 't': cmd.options.mode = zar::ExtractMode::Test; break;
         case 'y': cmd.options.overwrite = true; break;
-        case 'j':
-            cmd.options.threads = 0;    // one per core
-            if (optarg) {
-                const std::string_view arg = optarg;
-                unsigned threads = 0;
-                const auto [end, ec] = std::from_chars(arg.data(), arg.data() + arg.size(), threads);
-                if (ec != std::errc{} || end != arg.data() + arg.size() || threads == 0 || threads > 1024)
-                    throw UsageError("thread count must be between 1 and 1024");
-                cmd.options.threads = threads;
-            }
-            break;
+        case 'j': cmd.options.threads = zar::cli::parse_threads(optarg); break;
+        case kMaxSize: cmd.options.size_limit = zar::cli::parse_size(optarg, "size limit"); break;
         case kDirs:
             if (std::string_view(optarg) == "merge")
                 cmd.options.dirs = zar::DirMode::Merge;
@@ -235,17 +229,18 @@ bool selected(std::string_view path, const std::vector<std::string>& selections,
 
 // "-" reads stdin: at random if it's a file, otherwise as a stream.
 zar::ArchiveReader open_archive(const std::string& archive,
-                                const std::function<void(std::string_view)>& warn)
+                                const std::function<void(std::string_view)>& warn,
+                                std::optional<std::uint64_t> size_limit)
 {
     if (archive != "-")
-        return zar::ArchiveReader::open(archive, warn);
+        return zar::ArchiveReader::open(archive, warn, size_limit);
 
     struct stat st {};
     if (::fstat(STDIN_FILENO, &st) == 0 && S_ISREG(st.st_mode))
-        return zar::ArchiveReader::open("/dev/fd/0", warn);
+        return zar::ArchiveReader::open("/dev/fd/0", warn, size_limit);
     if (::isatty(STDIN_FILENO))
         throw std::runtime_error("refusing to read an archive from a terminal");
-    return zar::ArchiveReader::open_stream(STDIN_FILENO, "standard input", warn);
+    return zar::ArchiveReader::open_stream(STDIN_FILENO, "standard input", warn, size_limit);
 }
 
 int run(Command& cmd)
@@ -257,7 +252,7 @@ int run(Command& cmd)
     };
     cmd.options.on_warning = warn;
 
-    auto reader = open_archive(cmd.archive, warn);
+    auto reader = open_archive(cmd.archive, warn, cmd.options.size_limit);
 
     std::vector<zar::Entry> chosen;
     std::set<std::string_view> matched;

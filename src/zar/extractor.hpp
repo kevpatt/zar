@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,8 @@ struct ExtractOptions {
     bool overwrite = false;    // required if anything to be extracted already exists
     DirMode dirs = DirMode::Merge;
     unsigned threads = 0;      // 0: one per CPU core
+    // The most file data to decompress (Extract and Test), checked up front.
+    std::optional<std::uint64_t> size_limit;
     std::function<void(std::string_view)> on_warning;    // may be called from any thread
 };
 
@@ -62,9 +65,10 @@ public:
     Extractor(ArchiveReader& reader, const ExtractOptions& options);
     ~Extractor();
 
-    // Checks the destination before anything is written. Throws if any path
-    // to be extracted already exists and options.overwrite isn't set; with
-    // DirMode::Replace, deletes existing top-level directories.
+    // Checks before anything is written. Throws if the files' total size
+    // exceeds options.size_limit, or if any path to be extracted already
+    // exists and options.overwrite isn't set. With DirMode::Replace, deletes
+    // existing top-level directories.
     void prepare(std::span<const DirectoryGroup> groups);
 
     // Then call for each group in order, and for each of its members. File
