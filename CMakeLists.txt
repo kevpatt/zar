@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Kevin H. Patterson
+
 cmake_minimum_required(VERSION 3.20)
 
 project(zar

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // Writer-side decisions that aren't part of the format itself.
 #pragma once
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // On-disk structures of the zar format. See FORMAT.md for the specification;
 // section numbers below refer to it.
 #pragma once

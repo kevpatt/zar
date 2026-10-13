@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+
 #include "zar/archive_reader.hpp"
 
 #include "zar/crc32c.hpp"

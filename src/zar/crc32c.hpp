@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // CRC-32C (Castagnoli), hardware-accelerated where available.
 #pragma once
 

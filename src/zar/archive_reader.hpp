@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // Access to an archive on disk or in a stream. After opening, every const
 // member is safe to call from several threads at once.
 #pragma once

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // End-to-end: archives written by create_archive() (or crafted by hand),
 // read back with ArchiveReader and Extractor.
 #include "check.hpp"

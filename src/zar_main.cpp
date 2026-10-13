@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // zar — create an archive.
 #include "cli.hpp"
 #include "zar/creator.hpp"

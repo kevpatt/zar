@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (C) 2026 Kevin H. Patterson
+//
 // Lays blocks out in an archive: alignment, the zar header, the index
 // copies, and the trailer.
 #pragma once

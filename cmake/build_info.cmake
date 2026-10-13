@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Kevin H. Patterson
+#
 # Writes OUTPUT, a C++ file recording the build time and git revision.
 # Run at build time (cmake -P) so both stay current between configures.
 #
