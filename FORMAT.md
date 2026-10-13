@@ -302,6 +302,14 @@ may nest. They exist to keep enormous directories from being loaded or
 rewritten all at once; they are always optional, and a writer may put an
 entire tree in a single index.
 
+The indexes reachable from a root index must form a tree: each index block
+may be referenced by at most one `SUBINDEX` field, and never by an entry
+inside itself or inside any index it leads to. Readers must reject an
+archive that breaks this rule. The rule rules out cycles, and it also rules
+out shared sub-indexes, which would let a small archive expand into an
+exponentially large listing. Readers may also limit how deeply sub-indexes
+nest.
+
 A path may still name a deeper descendant directly (`a/b/c` in the root
 index) even if `a` has a sub-index. If two entries resolve to the same path,
 the one encountered later in a depth-first walk of the indexes wins.

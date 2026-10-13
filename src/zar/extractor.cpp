@@ -1,0 +1,436 @@
+#include "zar/extractor.hpp"
+
+#include "zar/crc32c.hpp"
+
+#include <algorithm>
+#include <cerrno>
+#include <fcntl.h>
+#include <grp.h>
+#include <map>
+#include <optional>
+#include <pwd.h>
+#include <sys/stat.h>
+#include <system_error>
+#include <unistd.h>
+
+namespace zar {
+namespace {
+
+class Fd {
+public:
+    Fd() = default;
+    explicit Fd(int fd) : fd_(fd) {}
+    Fd(Fd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+    Fd& operator=(Fd&& other) noexcept
+    {
+        std::swap(fd_, other.fd_);
+        return *this;
+    }
+    ~Fd()
+    {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
+};
+
+struct ExtractError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] void throw_errno(const std::string& what)
+{
+    if (errno == ELOOP)
+        throw ExtractError(what + ": is a symbolic link; not following it");
+    throw ExtractError(what + ": " + std::generic_category().message(errno));
+}
+
+std::string_view parent_of(std::string_view path)
+{
+    const auto slash = path.rfind('/');
+    return slash == std::string_view::npos ? std::string_view{} : path.substr(0, slash);
+}
+
+// Orders paths component by component, so a directory's contents sort
+// directly after it ("a", "a/b", "a-c" rather than "a", "a-c", "a/b").
+struct PathLess {
+    using is_transparent = void;
+    bool operator()(std::string_view a, std::string_view b) const
+    {
+        const auto key = [](char c) { return c == '/' ? 0 : static_cast<unsigned char>(c) + 1; };
+        return std::ranges::lexicographical_compare(
+            a, b, [&](char x, char y) { return key(x) < key(y); });
+    }
+};
+
+void write_all(int fd, ByteView data)
+{
+    while (!data.empty()) {
+        const auto n = ::write(fd, data.data(), data.size());
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0)
+            throw ExtractError(std::generic_category().message(errno));
+        data = data.subspan(static_cast<std::size_t>(n));
+    }
+}
+
+timespec to_timespec(const std::optional<Timestamp>& t)
+{
+    if (!t)
+        return {0, UTIME_OMIT};
+    return {static_cast<time_t>(t->seconds), static_cast<long>(t->nanoseconds.value_or(0))};
+}
+
+std::optional<uid_t> owner_of(const Entry& e)
+{
+    if (e.uname) {
+        std::vector<char> buffer(4096);
+        struct passwd pw {};
+        struct passwd* result = nullptr;
+        if (::getpwnam_r(e.uname->c_str(), &pw, buffer.data(), buffer.size(), &result) == 0 && result)
+            return result->pw_uid;
+    }
+    if (e.uid)
+        return static_cast<uid_t>(*e.uid);
+    return std::nullopt;
+}
+
+std::optional<gid_t> group_of(const Entry& e)
+{
+    if (e.gname) {
+        std::vector<char> buffer(4096);
+        struct group gr {};
+        struct group* result = nullptr;
+        if (::getgrnam_r(e.gname->c_str(), &gr, buffer.data(), buffer.size(), &result) == 0 && result)
+            return result->gr_gid;
+    }
+    if (e.gid)
+        return static_cast<gid_t>(*e.gid);
+    return std::nullopt;
+}
+
+} // namespace
+
+std::string_view base_name(std::string_view path)
+{
+    const auto slash = path.rfind('/');
+    return slash == std::string_view::npos ? path : path.substr(slash + 1);
+}
+
+std::vector<DirectoryGroup> group_by_directory(std::span<const Entry> entries)
+{
+    std::map<std::string, DirectoryGroup, PathLess> groups;
+    const auto group = [&](std::string_view path) -> DirectoryGroup& {
+        auto [it, inserted] = groups.try_emplace(std::string(path));
+        if (inserted)
+            it->second.path = path;
+        return it->second;
+    };
+
+    group("");
+    for (const auto& entry : entries) {
+        if (entry.type == EntryType::Dir)
+            group(entry.path).entry = &entry;
+        else
+            group(parent_of(entry.path)).members.push_back(&entry);
+        for (auto p = parent_of(entry.path); !p.empty(); p = parent_of(p))
+            group(p);
+    }
+
+    std::vector<DirectoryGroup> out;
+    out.reserve(groups.size());
+    for (auto& [path, g] : groups) {
+        std::ranges::sort(g.members, {}, [](const Entry* e) { return base_name(e->path); });
+        out.push_back(std::move(g));
+    }
+    return out;
+}
+
+struct Extractor::Impl {
+    const ArchiveReader& reader;
+    const ExtractOptions& options;
+    const bool writing = options.mode == ExtractMode::Extract;
+    const bool privileged = ::geteuid() == 0;
+    ExtractStats stats;
+
+    Fd root;
+    Fd current;    // directory of the group being extracted
+    std::string current_path;
+
+    // Created last, so nothing can be written through them (§7).
+    std::vector<std::pair<std::string, const Entry*>> symlinks;
+    // Metadata applied last, deepest first, so writing contents doesn't disturb it.
+    std::vector<const Entry*> directories;
+
+    Impl(const ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o)
+    {
+        if (!writing)
+            return;
+        std::error_code ec;
+        std::filesystem::create_directories(options.directory, ec);
+        root = Fd(::open(options.directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+        if (!root)
+            throw std::system_error(errno, std::generic_category(), options.directory.string());
+    }
+
+    void warn(const std::string& message)
+    {
+        ++stats.warnings;
+        if (options.on_warning)
+            options.on_warning(message);
+    }
+
+    // Opens a directory below the root, one component at a time, never
+    // following symlinks. Missing directories are created if `create`.
+    Fd open_directory(std::string_view path, bool create) const
+    {
+        Fd dir(::dup(root.get()));
+        while (!path.empty()) {
+            const auto slash = path.find('/');
+            const std::string component(path.substr(0, slash));
+            path = slash == std::string_view::npos ? std::string_view{} : path.substr(slash + 1);
+
+            constexpr int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+            int fd = ::openat(dir.get(), component.c_str(), flags);
+            if (fd < 0 && errno == ENOENT && create) {
+                if (::mkdirat(dir.get(), component.c_str(), 0777) != 0 && errno != EEXIST)
+                    throw_errno(component);
+                fd = ::openat(dir.get(), component.c_str(), flags);
+            }
+            if (fd < 0)
+                throw_errno(component);
+            dir = Fd(fd);
+        }
+        return dir;
+    }
+
+    // Clears the way for a new file or symlink.
+    void remove_existing(int dir, const std::string& name)
+    {
+        if (!options.overwrite)
+            throw ExtractError("already exists (use -y to overwrite)");
+        struct stat st {};
+        if (::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode))
+            throw ExtractError("a directory is in the way");
+        if (::unlinkat(dir, name.c_str(), 0) != 0)
+            throw_errno("cannot replace existing file");
+    }
+
+    bool exists(std::string_view path) const
+    {
+        std::error_code ec;
+        return std::filesystem::exists(std::filesystem::symlink_status(options.directory / path, ec));
+    }
+
+    void prepare(std::span<const DirectoryGroup> groups)
+    {
+        if (!writing)
+            return;
+
+        std::vector<std::string> existing;
+        for (const auto& group : groups) {
+            if (!group.path.empty() && exists(group.path))
+                existing.push_back(group.path + '/');
+            for (const auto* member : group.members)
+                if (exists(member->path))
+                    existing.push_back(member->path);
+        }
+        if (existing.empty())
+            return;
+
+        if (!options.overwrite) {
+            std::string message = std::to_string(existing.size()) +
+                                  (existing.size() == 1 ? " path already exists: "
+                                                        : " paths already exist, including ");
+            for (std::size_t i = 0; i < std::min<std::size_t>(existing.size(), 3); ++i)
+                message += (i ? ", " : "") + existing[i];
+            throw ExtractError(message + " (use -y to overwrite)");
+        }
+
+        if (options.dirs == DirMode::Replace) {
+            // Only top-level directories: any deeper existing directory lies
+            // inside one of them. remove_all() never follows symlinks.
+            for (const auto& group : groups) {
+                if (group.path.empty() || group.path.find('/') != std::string::npos ||
+                    !exists(group.path))
+                    continue;
+                std::error_code ec;
+                std::filesystem::remove_all(options.directory / group.path, ec);
+                if (ec)
+                    throw ExtractError(group.path + ": cannot replace: " + ec.message());
+            }
+        }
+    }
+
+    void apply_owner(int dir, const char* name, int fd, const Entry& e) const
+    {
+        if (!privileged)
+            return;
+        const auto uid = owner_of(e);
+        const auto gid = group_of(e);
+        if (!uid && !gid)
+            return;
+        const auto u = uid.value_or(static_cast<uid_t>(-1));
+        const auto g = gid.value_or(static_cast<gid_t>(-1));
+        const int rc = fd >= 0 ? ::fchown(fd, u, g) : ::fchownat(dir, name, u, g, AT_SYMLINK_NOFOLLOW);
+        if (rc != 0)
+            throw_errno("cannot set owner");
+    }
+
+    void apply_metadata(int fd, const Entry& e) const
+    {
+        apply_owner(-1, nullptr, fd, e);    // before chmod: chown clears set-id bits
+        if (e.mode) {
+            const mode_t allowed = privileged ? 07777 : 01777;
+            if (::fchmod(fd, *e.mode & allowed) != 0)
+                throw_errno("cannot set permissions");
+        }
+        const timespec times[2] = {to_timespec(e.atime), to_timespec(e.mtime)};
+        if (::futimens(fd, times) != 0)
+            throw_errno("cannot set times");
+    }
+
+    void enter(const DirectoryGroup& group)
+    {
+        current_path = group.path;
+        if (group.entry) {
+            ++stats.directories;
+            directories.push_back(group.entry);
+        }
+        if (!writing)
+            return;
+        try {
+            current = open_directory(group.path, true);
+        } catch (const std::exception& e) {
+            current = Fd();
+            warn(group.path + ": " + e.what());
+        }
+    }
+
+    void extract(const Entry& entry)
+    {
+        try {
+            switch (entry.type) {
+            case EntryType::File:
+            case EntryType::Hardlink:    // extracted as an independent copy
+                extract_file(entry);
+                break;
+            case EntryType::Symlink:
+                if (!entry.link_target || entry.link_target->empty() ||
+                    entry.link_target->find('\0') != std::string::npos)
+                    throw FormatError("symlink has no valid target");
+                ++stats.symlinks;
+                if (writing)
+                    symlinks.emplace_back(current_path, &entry);
+                break;
+            case EntryType::Dir:
+                break;    // handled by enter()
+            }
+        } catch (const std::exception& e) {
+            warn(entry.path + ": " + e.what());
+        }
+    }
+
+    void extract_file(const Entry& entry)
+    {
+        const auto lengths = ArchiveReader::chunk_lengths(entry);
+        const bool decompress = options.mode != ExtractMode::Scan;
+
+        Fd out;
+        const std::string name(base_name(entry.path));
+        if (writing) {
+            if (!current)
+                throw ExtractError("its directory could not be created");
+            for (;;) {
+                out = Fd(::openat(current.get(), name.c_str(),
+                                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+                if (out || errno != EEXIST)
+                    break;
+                remove_existing(current.get(), name);
+            }
+            if (!out)
+                throw_errno("cannot create file");
+        }
+
+        try {
+            std::uint32_t crc = 0;
+            for (std::size_t i = 0; i < lengths.size(); ++i) {
+                const auto data = reader.chunk(entry, i, lengths[i], decompress);
+                crc = crc32c(crc, data);
+                if (out)
+                    write_all(out.get(), data);
+            }
+            if (decompress && entry.content_crc && crc != *entry.content_crc)
+                throw FormatError("content checksum mismatch");
+            if (out)
+                apply_metadata(out.get(), entry);
+        } catch (...) {
+            if (out)
+                ::unlinkat(current.get(), name.c_str(), 0);    // don't leave a partial file
+            throw;
+        }
+        ++stats.files;
+        stats.bytes += entry.size.value_or(0);
+    }
+
+    void create_symlink(const std::string& dir_path, const Entry& entry)
+    {
+        const auto dir = open_directory(dir_path, true);
+        const std::string name(base_name(entry.path));
+        const auto& target = *entry.link_target;
+
+        if (::symlinkat(target.c_str(), dir.get(), name.c_str()) != 0) {
+            if (errno != EEXIST)
+                throw_errno("cannot create symlink");
+            remove_existing(dir.get(), name);
+            if (::symlinkat(target.c_str(), dir.get(), name.c_str()) != 0)
+                throw_errno("cannot create symlink");
+        }
+        apply_owner(dir.get(), name.c_str(), -1, entry);
+        const timespec times[2] = {to_timespec(entry.atime), to_timespec(entry.mtime)};
+        if (::utimensat(dir.get(), name.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0)
+            throw_errno("cannot set times");
+    }
+
+    ExtractStats finish()
+    {
+        if (!writing)
+            return stats;
+        current = Fd();
+
+        for (const auto& [dir_path, entry] : symlinks) {
+            try {
+                create_symlink(dir_path, *entry);
+            } catch (const std::exception& e) {
+                warn(entry->path + ": " + e.what());
+            }
+        }
+        for (auto it = directories.rbegin(); it != directories.rend(); ++it) {
+            try {
+                apply_metadata(open_directory((*it)->path, false).get(), **it);
+            } catch (const std::exception& e) {
+                warn((*it)->path + ": " + e.what());
+            }
+        }
+        return stats;
+    }
+};
+
+Extractor::Extractor(const ArchiveReader& reader, const ExtractOptions& options)
+    : impl_(std::make_unique<Impl>(reader, options))
+{
+}
+
+Extractor::~Extractor() = default;
+
+void Extractor::prepare(std::span<const DirectoryGroup> groups) { impl_->prepare(groups); }
+void Extractor::enter(const DirectoryGroup& group) { impl_->enter(group); }
+void Extractor::extract(const Entry& entry) { impl_->extract(entry); }
+ExtractStats Extractor::finish() { return impl_->finish(); }
+
+} // namespace zar

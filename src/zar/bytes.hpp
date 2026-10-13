@@ -1,11 +1,12 @@
 // Little-endian integer encoding and LEB128 varints.
 #pragma once
 
+#include "zar/error.hpp"
+
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <span>
-#include <stdexcept>
 #include <vector>
 
 namespace zar {
@@ -55,16 +56,16 @@ inline std::uint64_t read_varint(ByteView& in)
         const std::uint8_t byte = in[i];
         const std::uint64_t group = byte & 0x7f;
         if (i == 9 && group > 1)
-            throw std::runtime_error("varint overflows 64 bits");
+            throw FormatError("varint overflows 64 bits");
         value |= group << (7 * i);
         if (!(byte & 0x80)) {
             if (byte == 0 && i > 0)
-                throw std::runtime_error("non-minimal varint");
+                throw FormatError("non-minimal varint");
             in = in.subspan(i + 1);
             return value;
         }
     }
-    throw std::runtime_error("truncated varint");
+    throw FormatError("truncated varint");
 }
 
 } // namespace zar

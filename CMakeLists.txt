@@ -43,13 +43,22 @@ else()
 endif()
 
 add_library(libzar STATIC
+    src/zar/archive_reader.cpp
+    src/zar/archive_writer.cpp
+    src/zar/compressor.cpp
     src/zar/crc32c.cpp
+    src/zar/creator.cpp
+    src/zar/extractor.cpp
     src/zar/format.cpp
+    src/zar/index.cpp
+    src/zar/names.cpp
+    src/zar/output.cpp
     src/zar/policy.cpp)
 set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 target_include_directories(libzar PUBLIC src)
 target_compile_definitions(libzar PUBLIC ZAR_VERSION="${PROJECT_VERSION}")
-target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} PRIVATE zar_warnings)
+find_package(Threads REQUIRED)
+target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads PRIVATE zar_warnings)
 
 add_executable(zar src/zar_main.cpp)
 target_link_libraries(zar PRIVATE libzar zar_warnings)
@@ -61,7 +70,13 @@ install(TARGETS zar unzar RUNTIME DESTINATION bin)
 
 if(ZAR_BUILD_TESTS)
     enable_testing()
-    add_executable(zar_tests tests/format_tests.cpp tests/policy_tests.cpp tests/main.cpp)
+    add_executable(zar_tests
+        tests/main.cpp
+        tests/format_tests.cpp
+        tests/index_tests.cpp
+        tests/policy_tests.cpp
+        tests/writer_tests.cpp
+        tests/extractor_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)
     add_test(NAME zar_tests COMMAND zar_tests)
 endif()

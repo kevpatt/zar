@@ -10,8 +10,8 @@ or extracted without decompressing anything else.
 
 The on-disk format is specified in [FORMAT.md](FORMAT.md).
 
-> **Status:** early development. The format and library foundations are in
-> place; the `zar` and `unzar` commands don't archive anything yet.
+> **Status:** early development. `zar` and `unzar` work; the format may
+> still change before 1.0.
 
 ## Building
 
@@ -26,34 +26,43 @@ ctest --test-dir build
 
 `build/compile_commands.json` is generated for clangd and other tools.
 
-## Usage (planned)
+## Usage
 
 ```sh
-zar -o project.zar ~/src/project     # archive a directory
+zar ~/src/project                    # writes ~/src/project.zar
+zar -o p.zar a b.txt                 # several inputs need -o
 zar -o - ~/src/project | ssh host 'cat > project.zar'
-unzar -l project.zar                 # list
-unzar -t project.zar                 # verify every checksum
-unzar -C /tmp/out project.zar        # extract everything
+
+unzar project.zar                    # extract into the current directory
+unzar -C /tmp/out project.zar        # extract elsewhere
 unzar project.zar src/main.cpp       # extract one file
+unzar --list --scan project.zar      # list contents while checking the archive
+unzar --test project.zar             # decompress and verify everything
 ```
 
-Archiving a directory stores paths relative to that directory, so
-`zar -o p.zar ~/src/project` stores `src/main.cpp`, not
-`project/src/main.cpp`.
+Archiving a single directory stores paths relative to that directory, so
+`zar ~/src/project` stores `src/main.cpp`, not `project/src/main.cpp`. With
+several inputs, each is stored under its own name (`zar -o p.zar a b.txt`
+stores `a/...` and `b.txt`).
+
+Both commands exit with 0 on success, 1 if some files had problems (each
+reported on stderr), and 2 on a fatal error. A fatal error in `zar` leaves no
+archive behind.
 
 ### zar options
 
 | Option | Meaning |
 |---|---|
-| `-o, --output=FILE` | archive to write (`-` for stdout) |
+| `-o, --output=FILE` | archive to write (`-` for stdout); with a single input, defaults to the input's path plus `.zar` |
+| `-y, --yes` | overwrite an existing archive |
 | `-l, --level=N` | zstd compression level (default 3) |
-| `-j, --threads=N` | worker threads (default: one per CPU) |
+| `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--chunk-size=SIZE` | split files into independently compressed chunks of SIZE bytes (default 1M) |
 | `--align[=N]` | align block payloads to N bytes; with no N, the CPU's cache-line size. The default is 8. N must be a power of two up to 1M; values below 8 pack tighter but leave fields unaligned. |
-| `--owner` | store uid/gid and owner/group names (omitted by default) |
+| `--owner[=WHICH]` | store ownership: `ids`, `names`, or `both` (the default when given); omitted otherwise |
 | `--nsec` | store the sub-second part of timestamps (omitted by default) |
+| `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
-| `--normalize=FORM` | Unicode-normalize names to `nfc` or `nfd` (default: store names as the filesystem returns them) |
 | `--compress-all` | compress files even if they're usually already compressed |
 | `-v, --verbose` | list files as they are added |
 
@@ -68,14 +77,33 @@ shrink is stored raw.
 | Option | Meaning |
 |---|---|
 | `-C, --directory=DIR` | extract into DIR |
-| `-l, --list` | list contents |
-| `-t, --test` | verify all checksums without writing anything |
-| `-k, --keep` | don't overwrite existing files |
-| `-j, --threads=N` | worker threads (default: one per CPU) |
-| `-v, --verbose` | list files as they are extracted |
+| `-l, --list` | print a listing as entries are processed (see below) |
+| `--scan` | check everything except decompression — index and block checksums, sizes, paths — and write nothing |
+| `-t, --test` | like `--scan`, but also decompress and verify all data |
+| `-y, --yes` | overwrite files and directories that already exist |
+| `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
+| `-v, --verbose` | add permissions and owner to the listing; print a summary |
 
-`unzar` refuses paths that are absolute or contain `..`, and never writes
-through a symbolic link.
+Before extracting anything, `unzar` checks whether any target already exists;
+if one does and `-y` wasn't given, it stops without writing anything.
+
+`unzar` rejects archives containing absolute paths or `..` components, never
+writes through a symbolic link (including ones the archive itself creates),
+and removes any file whose data fails verification.
+
+The listing shows each directory as a heading, followed by its files with
+their size and modification time, separated by tabs:
+
+```
+  README	6	2024-01-02 15:30:00
+  link -> src/main.cpp	-	2026-10-13 08:32:53
+
+src/
+  main.cpp	13	2026-10-13 08:32:53
+
+src/sub/
+  blob.bin	3000000	2026-10-13 08:32:53
+```
 
 ## Layout
 

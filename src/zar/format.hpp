@@ -3,18 +3,14 @@
 #pragma once
 
 #include "zar/bytes.hpp"
+#include "zar/error.hpp"
 
 #include <array>
 #include <compare>
 #include <cstdint>
-#include <stdexcept>
 #include <string>
 
 namespace zar {
-
-struct FormatError : std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
 
 struct Version {
     std::uint16_t major = 0;
