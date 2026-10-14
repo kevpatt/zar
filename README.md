@@ -121,6 +121,11 @@ ctest --test-dir build        # run the tests
 cmake --install build         # install zar and unzar (default prefix /usr/local)
 ```
 
+`cmake --install` puts the commands in `bin`, their manual pages
+(`man zar`, `man unzar`) in `share/man/man1`, and the README, format
+specification, and licenses in `share/doc/zar`, under the prefix. Use
+`--prefix DIR` to install elsewhere.
+
 zar is developed on macOS (Apple Silicon). It uses only POSIX APIs and
 should build on Linux and the BSDs, but those aren't regularly tested yet.
 
@@ -131,6 +136,7 @@ Useful CMake options:
 | `CMAKE_BUILD_TYPE` | `RelWithDebInfo` | `Debug`, `Release`, ... |
 | `ZAR_BUILD_TESTS` | `ON` | build the test suite |
 | `ZAR_WARNINGS_AS_ERRORS` | `OFF` | treat compiler warnings as errors |
+| `ZAR_BUILD_FUZZERS` | `OFF` | build the fuzz target instead of an installable build |
 
 The version comes from `project()` in `CMakeLists.txt`. Each build also
 records the git revision (with `-dirty` if there are uncommitted changes)
@@ -452,6 +458,7 @@ FORMAT.md              the archive format specification
 LICENSE.txt            BSD 3-Clause
 TODO.md                planned work
 cmake/build_info.cmake records the git revision and build time
+man/                   manual pages for zar(1) and unzar(1)
 src/
   zar_main.cpp         the zar command
   unzar_main.cpp       the unzar command

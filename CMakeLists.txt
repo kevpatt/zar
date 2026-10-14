@@ -13,6 +13,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(GNUInstallDirs)    # bin, share/man, share/doc/zar, ...
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
@@ -114,9 +116,15 @@ if(ZAR_BUILD_FUZZERS)
         target_compile_definitions(zar_fuzz PRIVATE ZAR_FUZZ_STANDALONE)
     endif()
 else()
-    install(TARGETS zar unzar RUNTIME DESTINATION bin)
-    install(FILES LICENSE.txt README.md FORMAT.md DESTINATION share/doc/zar)
-    install(FILES third_party/xxhash/LICENSE DESTINATION share/doc/zar RENAME LICENSE.xxhash)
+    # Manual pages, with the version filled in.
+    foreach(page zar.1 unzar.1)
+        configure_file(man/${page}.in ${CMAKE_CURRENT_BINARY_DIR}/man/${page} @ONLY)
+        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/man/${page} DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+    endforeach()
+
+    install(TARGETS zar unzar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(FILES LICENSE.txt README.md FORMAT.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
 endif()
 
 if(ZAR_BUILD_TESTS)

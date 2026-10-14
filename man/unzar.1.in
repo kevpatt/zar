@@ -1,0 +1,183 @@
+.\" SPDX-License-Identifier: BSD-3-Clause
+.\" Copyright (C) 2026 Kevin H. Patterson
+.Dd October 14, 2026
+.Dt UNZAR 1
+.Os zar @PROJECT_VERSION@
+.Sh NAME
+.Nm unzar
+.Nd extract, list, test, or scan a zar archive
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Ar archive
+.Op Ar path ...
+.Sh DESCRIPTION
+.Nm
+extracts an archive made by
+.Xr zar 1 ,
+verifying every chunk as it goes.
+If
+.Ar archive
+is
+.Ql - ,
+it is read from standard input: at random if that is a file, otherwise as
+a stream, which works for archives made with
+.Nm zar Fl \-head-index .
+.Pp
+If any
+.Ar path
+is given, only those entries are processed, with everything below the
+ones that are directories.
+.Pp
+.Nm
+runs in one of three modes:
+.Bl -tag -width "--scan" -offset indent
+.It extract
+(the default) writes the files, directories, and links
+.It Fl \-test
+decompresses and verifies everything, and writes nothing
+.It Fl \-scan
+checks the archive's structure, checksums, and sizes without
+decompressing, and writes nothing
+.El
+.Pp
+.Fl \-list
+combines with any of them.
+Note that
+.Nm
+.Fl l
+alone extracts as well as listing; use
+.Fl l Fl \-scan
+just to list.
+.Pp
+Nothing is extracted if anything to be extracted already exists, unless
+.Fl y
+is given.
+A file that fails a checksum or size check is removed rather than left
+half-written, and the rest of the archive is still extracted.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl C , Fl \-directory Ns = Ns Ar dir
+Extract into
+.Ar dir ,
+creating it if need be.
+The default is the current directory.
+.It Fl l , Fl \-list
+Print a listing: each directory on its own line, followed by its files with
+their size and modification time, separated by tabs.
+Control characters, backslashes, and bytes of names that aren't UTF-8 are
+escaped.
+.It Fl \-scan
+Check everything except decompression: block and index checksums, sizes,
+and paths.
+.It Fl t , Fl \-test
+Like
+.Fl \-scan ,
+but also decompress and verify all data.
+.It Fl y , Fl \-yes
+Overwrite files and directories that already exist.
+.It Fl \-dirs Ns = Ns Ar mode
+What to do with directories that already exist:
+.Cm merge
+(the default) extracts into them;
+.Cm replace
+first deletes each one that is extracted whole, but never the parents of a
+selected
+.Ar path .
+Either needs
+.Fl y .
+.It Fl \-hard-links
+Recreate hard links as links, where their targets are extracted too.
+By default each is extracted as an independent copy.
+.It Fl j , Fl \-threads Ns Op = Ns Ar n
+Use
+.Ar n
+worker threads, from 1 to 1024.
+The default, and the value without
+.Ar n ,
+is one per CPU core.
+.It Fl \-max-size Ns = Ns Ar size
+Refuse to decompress more than
+.Ar size
+bytes in all.
+The selected files' total is checked before anything is written, and a
+solid archive stops decompressing once it passes
+.Ar size .
+Without this option, extraction is limited to the free space at the
+destination, and a solid archive to the free space in
+.Ev TMPDIR .
+.It Fl h , Fl \-human-readable
+Show sizes as 512, 1.0K, 31.4M, 2.0G, and so on.
+.It Fl v , Fl \-verbose
+With
+.Fl l ,
+also show each entry's permissions and owner.
+Print a summary at the end.
+.It Fl \-help
+Show a summary of the options.
+.It Fl \-version
+Show the version, the archive format version, and the zstd version.
+.El
+.Pp
+Sizes take an optional
+.Cm K ,
+.Cm M ,
+.Cm G ,
+or
+.Cm T
+suffix, for binary multiples.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev TMPDIR
+Where a large solid archive is decompressed to.
+The default is
+.Pa /tmp .
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+Success.
+.It 1
+Finished, but some entries had problems, each reported on standard error.
+.It 2
+A fatal error: bad usage, an unreadable or invalid archive, existing
+targets without
+.Fl y ,
+and so on.
+.El
+.Sh EXAMPLES
+Extract
+.Pa proj.zar
+into the current directory:
+.Dl $ unzar proj.zar
+.Pp
+Extract one directory from it, elsewhere:
+.Dl $ unzar -C /tmp/out proj.zar proj/src
+.Pp
+List an archive with human-readable sizes, checking it as it goes:
+.Dl $ unzar -l --scan -h proj.zar
+.Pp
+Replace an earlier extraction:
+.Dl $ unzar -y --dirs=replace proj.zar
+.Pp
+Extract an archive as it downloads:
+.Dl $ curl -s https://example.com/proj.zar | unzar -
+.Sh SEE ALSO
+.Xr zar 1 ,
+.Xr zstd 1
+.Sh AUTHORS
+.An Kevin H. Patterson
+.Sh SECURITY CONSIDERATIONS
+.Nm
+is meant to be safe on untrusted archives.
+It rejects absolute paths and paths with
+.Ql \&.. ,
+.Ql \&. ,
+or empty components, and never writes through a symbolic link: files are
+created one path component at a time without following links, and the
+archive's own symbolic links are created last.
+Ownership is restored only when running as root, and set-user-ID and
+set-group-ID bits only along with it.
+Names are escaped whenever they are printed.
+.Pp
+The CRC-32C checksums detect accidental damage, not tampering.

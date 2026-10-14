@@ -1,0 +1,246 @@
+.\" SPDX-License-Identifier: BSD-3-Clause
+.\" Copyright (C) 2026 Kevin H. Patterson
+.Dd October 14, 2026
+.Dt ZAR 1
+.Os zar @PROJECT_VERSION@
+.Sh NAME
+.Nm zar
+.Nd create a random-access, zstd-compressed archive
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Ar path
+.Nm
+.Op Ar options
+.Fl m
+.Fl o Ar archive
+.Ar path ...
+.Sh DESCRIPTION
+.Nm
+archives a file or directory tree.
+Files are compressed with zstd in independently checksummed chunks, so
+.Xr unzar 1
+can list, verify, or extract any file without decompressing the rest.
+Directories, symbolic links, and hard links are stored as such, with
+permissions and modification times.
+Devices, FIFOs, and sockets are skipped with a warning.
+.Pp
+A
+.Ar path
+is stored under its own name, so extracting the archive recreates it:
+.Bl -tag -width "proj/." -offset indent
+.It Pa proj
+the file, directory, or symbolic link (not followed)
+.Pa proj ,
+stored as
+.Pa proj
+.It Pa proj/
+the same, but
+.Pa proj
+must be a directory; a symbolic link to one is followed
+.It Pa proj/.
+the contents of
+.Pa proj ,
+without
+.Pa proj
+itself
+.It Pa \&.
+the contents of the current directory
+.El
+.Pp
+Without
+.Fl o ,
+the archive is written to
+.Ar name Ns Pa .zar
+in the current directory, where
+.Ar name
+is the last component of
+.Ar path
+(for
+.Pa \&. ,
+the current directory's name).
+The archive is written to a temporary file and renamed into place only when
+complete, so a failed run leaves nothing behind.
+An archive being written, or being replaced, is never included in itself.
+.Pp
+Duplicate chunks are stored once, and files whose names suggest they are
+already compressed (JPEG, MP4, ZIP, and so on) are stored without
+compression.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl o , Fl \-output Ns = Ns Ar file
+Write the archive to
+.Ar file ,
+or to standard output if
+.Ar file
+is
+.Ql - .
+.Nm
+refuses to write an archive to a terminal.
+.It Fl m , Fl \-many
+Archive several
+.Ar path
+arguments into one archive.
+Requires
+.Fl o .
+Two paths that would be stored under the same name are an error.
+.It Fl y , Fl \-yes
+Overwrite an existing archive.
+.It Fl l , Fl \-level Ns = Ns Ar n
+The zstd compression level, from the library's minimum (negative, fastest)
+to its maximum (22).
+The default is 3.
+.It Fl j , Fl \-threads Ns Op = Ns Ar n
+Use
+.Ar n
+worker threads, from 1 to 1024.
+The default, and the value without
+.Ar n ,
+is one per CPU core.
+.It Fl \-chunk-size Ns = Ns Ar size
+Split files into independently compressed chunks of
+.Ar size
+bytes: a power of two from 4K to 1G.
+The default is 1M.
+.It Fl \-align Ns Op = Ns Ar n
+Align each block's payload to
+.Ar n
+bytes, a power of two up to 1M.
+The default is 8; without
+.Ar n ,
+the CPU's cache-line size.
+.It Fl \-owner Ns Op = Ns Ar which
+Store file ownership:
+.Cm ids ,
+.Cm names ,
+or
+.Cm both
+(the default without
+.Ar which ) .
+By default ownership isn't stored.
+.It Fl \-nsec
+Store timestamps to the nanosecond, not just the second.
+.It Fl \-all-times
+Store access, change, and (where the system records it) birth times as
+well as modification times.
+.It Fl \-names Ns = Ns Ar mode
+What to do with file names that aren't valid UTF-8:
+.Cm raw
+(the default) stores their bytes as they are,
+.Cm skip
+leaves those files out, and
+.Cm latin1
+converts them from ISO 8859-1.
+Each is reported.
+.It Fl \-compress-all
+Compress every file, even those whose names suggest they are already
+compressed.
+.It Fl \-dedup Ns = Ns Cm on Ns | Ns Cm off
+Store identical chunks only once.
+This is on by default whenever the output can be read back, which excludes
+a pipe unless
+.Fl \-head-index
+is given;
+.Cm on
+makes that an error instead.
+.It Fl \-contiguous Ns Op = Ns Ar size
+Store each file of at most
+.Ar size
+bytes as a single block rather than in chunks (without
+.Ar size ,
+files up to 4G).
+With
+.Fl \-align ,
+this lets a file be read in place.
+.It Fl \-dict Ns Op = Ns Ar size
+Train a zstd dictionary of at most
+.Ar size
+bytes (default 110K) on the files and compress them with it.
+This helps most with many small, similar files.
+.It Fl \-head-index
+Also write the index at the front of the archive, so that
+.Xr unzar 1
+can extract it from a pipe.
+The index is written twice.
+.It Fl \-solid Ns = Ns Ar size
+First try compressing the whole archive as a single zstd stream, and keep
+that if it is at most
+.Ar size
+bytes.
+A solid archive compresses many small files better, but can't be read at
+random: listing or extracting one file decompresses everything before it.
+Otherwise a normal archive is written, and
+.Fl \-align
+applies only then.
+.It Fl \-dict-over-solid Ns = Ns Ar percent
+When the solid archive fits, also try a normal archive compressed with a
+dictionary, and keep it instead if it is at most
+.Ar percent
+of the solid archive's size (and fits too).
+The default is 120; 0 never tries.
+.It Fl v , Fl \-verbose
+List each path on standard error as it is added, and print a summary at the
+end.
+.It Fl \-help
+Show a summary of the options.
+.It Fl \-version
+Show the version, the archive format version, and the zstd version.
+.El
+.Pp
+Sizes take an optional
+.Cm K ,
+.Cm M ,
+.Cm G ,
+or
+.Cm T
+suffix, for binary multiples.
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev TMPDIR
+Where temporary files go when writing to standard output (with
+.Fl \-head-index
+or
+.Fl \-solid ) .
+Otherwise they go beside the archive.
+.El
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+Success.
+.It 1
+The archive was written, but some files had problems, each reported on
+standard error.
+.It 2
+A fatal error: bad usage, a missing input, an existing archive without
+.Fl y ,
+and so on.
+No archive is left behind.
+.El
+.Sh EXAMPLES
+Archive
+.Pa proj
+as
+.Pa proj.zar :
+.Dl $ zar proj
+.Pp
+Archive the current directory's contents, more slowly but smaller:
+.Dl $ zar -l 19 -o ../site.zar .
+.Pp
+Archive two trees into one archive:
+.Dl $ zar -m -o both.zar src docs
+.Pp
+Send an archive through a pipe to another machine and extract it there:
+.Dl $ zar --head-index -o - proj | ssh host unzar -C /srv -
+.Pp
+Package many small files as compactly as possible, if it comes to at most
+1 MiB:
+.Dl $ zar --solid=1M config
+.Sh SEE ALSO
+.Xr unzar 1 ,
+.Xr zstd 1
+.Pp
+The archive format is specified in
+.Pa FORMAT.md ,
+installed with the documentation.
+.Sh AUTHORS
+.An Kevin H. Patterson
