@@ -339,10 +339,13 @@ TEST(default_archive_names)
     CHECK(name("proj") == "proj.zar");
     CHECK(name("proj/") == "proj.zar");
     CHECK(name("proj/.") == "proj.zar");
-    CHECK(name("a/b/proj//") == "a/b/proj.zar");
-    CHECK(name("notes.txt") == "notes.txt.zar");
-    CHECK(name(".") == fs::current_path().filename().native() + ".zar");    // here, not beside
+    CHECK(name("a/b/proj//") == "proj.zar");    // always in the current directory
+    CHECK(name("/a/b/proj/.") == "proj.zar");
+    CHECK(name("a/b/notes.txt") == "notes.txt.zar");
+    CHECK(name(".") == fs::current_path().filename().native() + ".zar");
     CHECK(name("./") == name("."));
+    CHECK(name("..") == fs::current_path().parent_path().filename().native() + ".zar");
+    CHECK(name("../.") == name(".."));
     CHECK_THROWS(name("/."));
 }
 

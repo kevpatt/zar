@@ -1,6 +1,6 @@
 # The zar archive format
 
-Version 0.2.2 (draft)
+Version 0.2.3 (draft)
 
 A zar archive is a sequence of **blocks** behind a fixed **zar header**.
 Every block is self-describing and independently checksummed, and every

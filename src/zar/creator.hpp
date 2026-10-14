@@ -88,9 +88,9 @@ struct InputSpec {
 // Throws std::runtime_error for paths that can't be archived by name, like "/".
 InputSpec parse_input(const std::filesystem::path& input);
 
-// The archive name zar uses when -o isn't given: "proj" or "proj/." become
-// "proj.zar" beside proj; "." becomes "<current directory's name>.zar" in
-// the current directory.
+// The archive name zar uses when -o isn't given, in the current directory:
+// "a/b/proj", "a/b/proj/" and "a/b/proj/." all become "proj.zar", and "."
+// becomes "<current directory's name>.zar".
 std::filesystem::path default_archive_path(const InputSpec& input);
 
 // Writes a complete archive of `inputs` to `out` (without committing it).

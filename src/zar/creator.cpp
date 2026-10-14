@@ -667,19 +667,17 @@ InputSpec parse_input(const fs::path& input)
 
 fs::path default_archive_path(const InputSpec& input)
 {
+    if (!input.contents)
+        return input.name + ".zar";
+
+    // "proj/." is named after proj; "." and ".." after the directories they are.
     auto path = without_trailing_slashes(input.path.native());
-    if (input.contents) {
-        // "proj/." names the archive after proj; "." after the current directory.
-        while (path != "." && last_component(path) == ".")
-            path = without_trailing_slashes(path.substr(0, path.size() - 1));
-        if (path == ".")
-            return resolved_name(".") + ".zar";
-        if (path == "/")
-            throw std::runtime_error("can't name an archive of the root directory; use -o");
-    }
-    if (last_component(path) == "..")
-        return fs::weakly_canonical(path).native() + ".zar";
-    return path + ".zar";
+    while (path != "." && last_component(path) == ".")
+        path = without_trailing_slashes(path.substr(0, path.size() - 1));
+    if (path == "/")
+        throw std::runtime_error("can't name an archive of the root directory; use -o");
+    const auto last = last_component(path);
+    return (last == "." || last == ".." ? resolved_name(path) : last) + ".zar";
 }
 
 namespace {

@@ -43,7 +43,9 @@ PATH is stored under its own name, so extracting recreates it:
   zar .         the contents of the current directory
 
   -o, --output=FILE      archive to write ('-' for stdout); defaults to
-                         PATH.zar beside PATH, or NAME.zar here for '.'
+                         NAME.zar in the current directory, where NAME is
+                         the last component of PATH (for '.', this
+                         directory's name)
   -m, --many             archive several PATHs into one archive (needs -o)
   -y, --yes              overwrite an existing archive
   -l, --level=N          zstd compression level (default 3)

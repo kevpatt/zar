@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** early development (0.2.2). Both tools work and are well
+> **Status:** early development (0.2.3). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -141,7 +141,7 @@ and the build time, shown by `--help` and `--version`. Set
 ## Using zar
 
 ```sh
-zar proj                          # writes proj.zar beside proj
+zar ~/src/proj                    # writes proj.zar here
 zar -o backup.zar ~/Documents     # choose the archive's name
 zar -o - proj | ssh host 'cat > proj.zar'     # write to a pipe
 zar -m -o bundle.zar notes.txt photos         # several inputs need -m and -o
@@ -164,10 +164,11 @@ zar follows POSIX path resolution:
 | `link` (a symlink) | the symlink itself | the symlink |
 | `link/` | the directory it points to, named `link` | `link/` |
 
-Without `-o`, the archive is named after the input and written beside it:
-`proj`, `proj/` and `proj/.` all produce `proj.zar`. For `.`, the archive is
-named after the current directory and written inside it (zar never archives
-the archive it's writing). An existing archive is only replaced with `-y`.
+Without `-o`, the archive is named after the input and written in the
+current directory: `proj`, `proj/`, `proj/.` and `~/src/proj` all produce
+`./proj.zar`. For `.`, the archive is named after the current directory (and
+so is written inside it; zar never archives the archive it's writing). An
+existing archive is only replaced with `-y`.
 
 zar archives one input unless `-m` is given. With `-m`, inputs that would
 store the same path (two directories both named `src`, say) are an error.
