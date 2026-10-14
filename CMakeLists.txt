@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.1.0
+    VERSION 0.2.1
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 
@@ -50,6 +50,7 @@ add_library(libzar STATIC
     src/zar/archive_writer.cpp
     src/zar/compressor.cpp
     src/zar/crc32c.cpp
+    src/zar/dictionary.cpp
     src/zar/creator.cpp
     src/zar/extractor.cpp
     src/zar/format.cpp

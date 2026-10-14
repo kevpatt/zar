@@ -4,6 +4,7 @@
 // zar — create an archive.
 #include "cli.hpp"
 #include "zar/creator.hpp"
+#include "zar/dictionary.hpp"
 #include "zar/format.hpp"
 
 #include <bit>
@@ -57,12 +58,23 @@ PATH is stored under its own name, so extracting recreates it:
       --all-times        store access, change, and birth times too
       --names=MODE       non-UTF-8 file names: raw (default), skip, latin1
       --compress-all     compress even files that are usually precompressed
+      --contiguous[=SIZE]
+                         store each file of at most SIZE bytes as one block
+                         instead of in chunks (with no SIZE, files up to 4G)
+      --dict[=SIZE]      train a zstd dictionary of at most SIZE bytes
+                         (default 110K) on the files and compress them with
+                         it; helps most with many small, similar files
       --head-index       also put the index at the front, so the archive can
                          be extracted from a pipe (index is written twice)
       --solid=SIZE       first try compressing everything as one stream, and
                          keep that if it's at most SIZE bytes (e.g. 1M);
                          better for many small files, but without random
                          access. Otherwise a normal archive is written.
+      --dict-over-solid=PERCENT
+                         when the solid archive fits, also try a normal one
+                         compressed with a dictionary, and keep it instead if
+                         it's at most PERCENT of the solid size and fits too
+                         (default 120; 0 never tries)
   -v, --verbose          list files as they are added
       --help             show this help
       --version          show version information
@@ -71,6 +83,8 @@ PATH is stored under its own name, so extracting recreates it:
 using zar::cli::parse_number;
 using zar::cli::parse_size;
 using zar::cli::UsageError;
+
+constexpr std::uint64_t kMaxContiguous = std::uint64_t{1} << 32;
 
 std::uint64_t cache_line_size()
 {
@@ -125,6 +139,9 @@ enum LongOnly {
     kCompressAll,
     kHeadIndex,
     kSolid,
+    kContiguous,
+    kDict,
+    kDictOverSolid,
     kVersion,
 };
 
@@ -153,6 +170,9 @@ std::optional<Command> parse(int argc, char** argv)
         {"compress-all", no_argument, nullptr, kCompressAll},
         {"head-index", no_argument, nullptr, kHeadIndex},
         {"solid", required_argument, nullptr, kSolid},
+        {"contiguous", optional_argument, nullptr, kContiguous},
+        {"dict", optional_argument, nullptr, kDict},
+        {"dict-over-solid", required_argument, nullptr, kDictOverSolid},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, kHelp},
         {"version", no_argument, nullptr, kVersion},
@@ -206,6 +226,22 @@ std::optional<Command> parse(int argc, char** argv)
             if (*opt.solid_limit == 0)
                 throw UsageError("--solid needs a size above zero");
             break;
+        case kContiguous:
+            // unzar reads blocks of up to 4G.
+            opt.contiguous_limit = optarg ? parse_size(arg, "contiguous size") : kMaxContiguous;
+            if (*opt.contiguous_limit > kMaxContiguous)
+                throw UsageError("--contiguous size can be at most 4G");
+            break;
+        case kDict:
+            opt.dict_size = optarg ? parse_size(arg, "dictionary size") : zar::kDefaultDictSize;
+            if (*opt.dict_size < (1 << 10) || *opt.dict_size > (1 << 30))
+                throw UsageError("dictionary size must be from 1K to 1G");
+            break;
+        case kDictOverSolid:
+            opt.dict_over_solid = static_cast<unsigned>(parse_number(arg, "percentage"));
+            if (opt.dict_over_solid > 1000)
+                throw UsageError("--dict-over-solid must be from 0 to 1000");
+            break;
         case 'v': cmd.verbose = true; break;
         case kHelp:
             print_help();
@@ -252,7 +288,7 @@ int run(Command& cmd)
                   << stats.symlinks << " symlinks, " << stats.hardlinks << " hard links: "
                   << zar::cli::human_size(stats.input_bytes) << " -> "
                   << zar::cli::human_size(stats.archive_bytes)
-                  << (stats.solid ? " (solid)" : "") << '\n';
+                  << (stats.solid ? " (solid)" : stats.dictionary ? " (dictionary)" : "") << '\n';
     }
     return stats.warnings ? 1 : 0;
 }

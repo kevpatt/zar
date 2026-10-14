@@ -16,6 +16,7 @@
 #include <optional>
 #include <pwd.h>
 #include <semaphore>
+#include <set>
 #include <sys/stat.h>
 #include <system_error>
 #include <unistd.h>
@@ -218,6 +219,10 @@ struct Extractor::Impl {
 
     // Created last, so nothing can be written through them (§7).
     std::vector<std::pair<std::string, const Entry*>> symlinks;
+    // Linked once their targets are complete.
+    std::vector<std::pair<std::string, const Entry*>> hardlinks;
+    std::set<std::string_view> selected_files;    // what hard links may link to
+    std::set<std::string_view> extracted;         // files extracted intact
     // Metadata applied last, deepest first, so writing contents doesn't disturb it.
     std::vector<const Entry*> directories;
 
@@ -293,6 +298,11 @@ struct Extractor::Impl {
 
     void prepare(std::span<const DirectoryGroup> groups)
     {
+        for (const auto& group : groups)
+            for (const auto* member : group.members)
+                if (member->type == EntryType::File)
+                    selected_files.insert(member->path);
+
         if (decompress && options.size_limit) {
             std::uint64_t total = 0;
             for (const auto& group : groups)
@@ -391,8 +401,15 @@ struct Extractor::Impl {
     {
         try {
             switch (entry.type) {
+            case EntryType::Hardlink:
+                if (writing && options.hard_links && entry.link_target &&
+                    *entry.link_target != entry.path && selected_files.contains(*entry.link_target)) {
+                    hardlinks.emplace_back(current_path, &entry);
+                    break;
+                }
+                extract_file(entry);    // as an independent copy
+                break;
             case EntryType::File:
-            case EntryType::Hardlink:    // extracted as an independent copy
                 extract_file(entry);
                 break;
             case EntryType::Symlink:
@@ -553,7 +570,8 @@ struct Extractor::Impl {
             return;
         }
 
-        if (job.out) {
+        const bool written = static_cast<bool>(job.out);
+        if (written) {
             try {
                 apply_metadata(job.out.get(), job.entry);
             } catch (const std::exception& e) {
@@ -565,6 +583,57 @@ struct Extractor::Impl {
         std::lock_guard lock(mutex);
         ++stats.files;
         stats.bytes += job.entry.size.value_or(0);
+        if (written)
+            extracted.insert(job.entry.path);
+    }
+
+    // Links `entry` to its already-extracted target.
+    void create_hardlink(const std::string& dir_path, const Entry& entry)
+    {
+        const auto& target = *entry.link_target;
+        if (!extracted.contains(target))
+            throw ExtractError("its target was not extracted");
+        const auto from = open_directory(parent_of(target), false);
+        const auto to = open_directory(dir_path, true);
+        const std::string from_name(base_name(target));
+        const std::string name(base_name(entry.path));
+
+        // Without AT_SYMLINK_FOLLOW, linkat() never follows a symlink.
+        if (::linkat(from.get(), from_name.c_str(), to.get(), name.c_str(), 0) != 0) {
+            if (errno != EEXIST)
+                throw_errno("cannot create hard link");
+            remove_existing(to.get(), name);
+            if (::linkat(from.get(), from_name.c_str(), to.get(), name.c_str(), 0) != 0)
+                throw_errno("cannot create hard link");
+        }
+    }
+
+    // Hard links whose targets are now complete. One that can't be made is
+    // extracted as a copy instead, unless the stream has moved past its data.
+    void link_hardlinks()
+    {
+        std::vector<std::pair<std::string, const Entry*>> copies;
+        for (const auto& [dir_path, entry] : hardlinks) {
+            try {
+                create_hardlink(dir_path, *entry);
+                ++stats.hardlinks;
+            } catch (const std::exception& e) {
+                if (reader.streaming())
+                    warn(entry->path + ": " + e.what());
+                else
+                    copies.emplace_back(dir_path, entry);
+            }
+        }
+        for (const auto& [dir_path, entry] : copies) {
+            try {
+                current_path = dir_path;
+                current = open_directory(dir_path, true);
+                extract_file(*entry);
+            } catch (const std::exception& e) {
+                warn(entry->path + ": " + e.what());
+            }
+        }
+        pool.wait();
     }
 
     void create_symlink(const std::string& dir_path, const Entry& entry)
@@ -596,6 +665,7 @@ struct Extractor::Impl {
                  (lost_to_stream == 1 ? " file was" : " files were") + " not extracted");
         if (!writing)
             return stats;
+        link_hardlinks();
         current = Fd();
 
         for (const auto& [dir_path, entry] : symlinks) {

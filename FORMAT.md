@@ -1,6 +1,6 @@
 # The zar archive format
 
-Version 0.1.0 (draft)
+Version 0.2.1 (draft)
 
 A zar archive is a sequence of **blocks** behind a fixed **zar header**.
 Every block is self-describing and independently checksummed, and every
@@ -311,7 +311,8 @@ Each tag may appear at most once per entry.
   `ceil(SIZE / CHUNK_SIZE)`, and each chunk's decompressed length must match
   what that implies. `CHUNK_SIZE` may be omitted when there is exactly one chunk.
 - **DICT** — offset of the ZSTD_DICT block needed to decompress this entry's
-  DATA_ZSTD chunks.
+  DATA_ZSTD chunks. Since this identifies the dictionary, writers may omit
+  the dictionary ID from those frames' headers.
 - **CONTENT_CRC** — CRC of the file's entire uncompressed content, for
   end-to-end verification.
 - **LINK_TARGET** — for SYMLINK, the link text exactly as `readlink(2)`

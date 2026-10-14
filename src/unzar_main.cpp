@@ -42,6 +42,8 @@ archives created with zar --head-index.
   -y, --yes              overwrite files and directories that already exist
       --dirs=MODE        existing directories: merge (default) extracts into
                          them; replace deletes them first. Either needs -y.
+      --hard-links       recreate hard links as links, where their targets
+                         are extracted too (default: independent copies)
   -j, --threads[=N]      worker threads (default: one per CPU core)
       --max-size=SIZE    refuse to decompress more than SIZE bytes in all
                          (e.g. 10G): the selected files' total is checked
@@ -70,7 +72,7 @@ struct Command {
     bool human = false;
 };
 
-enum LongOnly { kScan = 256, kDirs, kMaxSize, kHelp, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kHelp, kVersion };
 
 void print_help()
 {
@@ -90,6 +92,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"dirs", required_argument, nullptr, kDirs},
         {"threads", optional_argument, nullptr, 'j'},
         {"max-size", required_argument, nullptr, kMaxSize},
+        {"hard-links", no_argument, nullptr, kHardLinks},
         {"verbose", no_argument, nullptr, 'v'},
         {"human-readable", no_argument, nullptr, 'h'},
         {"help", no_argument, nullptr, kHelp},
@@ -116,6 +119,7 @@ std::optional<Command> parse(int argc, char** argv)
             else
                 throw UsageError("--dirs must be merge or replace");
             break;
+        case kHardLinks: cmd.options.hard_links = true; break;
         case 'v': cmd.verbose = true; break;
         case 'h': cmd.human = true; break;
         case kHelp:
@@ -310,7 +314,8 @@ int run(Command& cmd)
         const auto bytes = cmd.human ? zar::cli::human_size(stats.bytes)
                                      : std::to_string(stats.bytes) + " bytes";
         std::cerr << verb << ' ' << stats.files << " files, " << stats.directories
-                  << " directories, " << stats.symlinks << " symlinks (" << bytes << ")"
+                  << " directories, " << stats.symlinks << " symlinks, " << stats.hardlinks
+                  << " hard links (" << bytes << ")"
                   << (warnings ? "" : "; no problems found") << '\n';
     }
     return warnings ? 1 : 0;

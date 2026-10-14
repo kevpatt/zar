@@ -34,6 +34,9 @@ struct ExtractOptions {
     bool overwrite = false;    // required if anything to be extracted already exists
     DirMode dirs = DirMode::Merge;
     unsigned threads = 0;      // 0: one per CPU core
+    // Recreate hard links with link(2) where the target is extracted too and
+    // the filesystem allows it, rather than extracting independent copies.
+    bool hard_links = false;
     // The most file data to decompress (Extract and Test), checked up front.
     std::optional<std::uint64_t> size_limit;
     std::function<void(std::string_view)> on_warning;    // may be called from any thread
@@ -43,6 +46,7 @@ struct ExtractStats {
     std::uint64_t files = 0;
     std::uint64_t directories = 0;
     std::uint64_t symlinks = 0;
+    std::uint64_t hardlinks = 0;    // created with link(2); copies count as files
     std::uint64_t bytes = 0;
     std::uint64_t warnings = 0;
 };

@@ -32,9 +32,22 @@ struct CreateOptions {
     bool compress_all = false;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
+    // Store each file of at most this many bytes as a single block, whatever
+    // the chunk size.
+    std::optional<std::uint64_t> contiguous_limit;
+
+    // Train a zstd dictionary of at most this many bytes on the files, and
+    // compress them with it.
+    std::optional<std::uint64_t> dict_size;
+
     // Try a solid archive (§5.5) first, and keep it if it compresses to at
     // most this many bytes. Otherwise, write a normal archive.
     std::optional<std::uint64_t> solid_limit;
+
+    // When the solid archive fits, also build a normal archive compressed
+    // with a trained dictionary, and keep that instead if it is at most this
+    // percentage of the solid archive's size (and also fits). 0: don't try.
+    unsigned dict_over_solid = 120;
 
     std::function<void(std::string_view)> on_warning;
     std::function<void(std::string_view)> on_entry;    // each archive path as it's added
@@ -48,7 +61,8 @@ struct CreateStats {
     std::uint64_t input_bytes = 0;
     std::uint64_t archive_bytes = 0;
     std::uint64_t warnings = 0;
-    bool solid = false;    // the solid form was kept
+    bool solid = false;         // the solid form was kept
+    bool dictionary = false;    // files were compressed with a trained dictionary
 };
 
 // How a path given to zar is archived, following POSIX path resolution:

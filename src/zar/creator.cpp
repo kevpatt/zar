@@ -6,6 +6,7 @@
 #include "zar/archive_writer.hpp"
 #include "zar/compressor.hpp"
 #include "zar/crc32c.hpp"
+#include "zar/dictionary.hpp"
 #include "zar/index.hpp"
 #include "zar/names.hpp"
 #include "zar/policy.hpp"
@@ -123,19 +124,35 @@ std::string resolved_name(const fs::path& path)
 
 // ---- the creator ------------------------------------------------------------
 
+// What a pass over the inputs produces.
+enum class Pass {
+    Normal,    // an archive
+    Raw,       // an archive with nothing compressed, to compress whole (§5.5)
+    Sample,    // nothing: just training samples
+};
+
 class Creator {
 public:
-    // With `store_raw`, nothing is compressed: the archive is meant to be
-    // compressed as a whole (§5.5).
-    Creator(Output& out, const CreateOptions& options, bool check_duplicates, bool store_raw)
+    // `identity` is the archive being made, which is skipped if found among
+    // the inputs; `out` may be a temporary file. Chunks that would be
+    // compressed are offered to `samples`, and compressed with `dict`.
+    Creator(Output& out, const Output& identity, const CreateOptions& options,
+            bool check_duplicates, Pass pass, SampleCollector* samples, const Bytes* dict)
         : check_duplicates_(check_duplicates),
-          store_raw_(store_raw),
+          pass_(pass),
+          samples_(samples),
           out_(out),
+          identity_(identity),
           options_(options),
           threads_(options.threads ? options.threads : default_thread_count()),
-          writer_(out, options.align_log2, options.head_index),
           compressor_(options.level, threads_)
     {
+        if (pass_ != Pass::Sample)
+            writer_.emplace(out, options.align_log2, options.head_index);
+        if (dict) {
+            dict_offset_ = writer_->write_dictionary(*dict);
+            compressor_.use_dictionary(*dict);
+        }
     }
 
     void add_input(const InputSpec& input);
@@ -151,6 +168,7 @@ private:
     struct PendingChunk {
         std::future<CompressedChunk> chunk;
         std::size_t entry;
+        std::size_t size;    // uncompressed
     };
 
     struct FileId {
@@ -177,18 +195,22 @@ private:
     // Several inputs (or Latin-1 conversion) can map two files to one path;
     // remember where each path came from to report that.
     bool check_duplicates_;
-    bool store_raw_;
+    Pass pass_;
+    SampleCollector* samples_;
     std::unordered_map<std::string, std::string> origins_;
 
     Output& out_;
+    const Output& identity_;
     const CreateOptions& options_;
     unsigned threads_;
-    ArchiveWriter writer_;
+    std::optional<ArchiveWriter> writer_;    // not for Pass::Sample
     Compressor compressor_;
+    std::optional<std::int64_t> dict_offset_;
 
     std::vector<Entry> entries_;
     std::set<std::size_t> dropped_;              // entries abandoned after a read error
     std::deque<PendingChunk> pending_;           // chunks being compressed, in file order
+    std::uint64_t pending_bytes_ = 0;
     std::map<FileId, std::size_t> first_link_;   // first entry for each multiply-linked file
     std::vector<std::pair<std::size_t, std::size_t>> hardlinks_;    // (link, target)
     std::map<uid_t, std::optional<std::string>> users_;
@@ -246,7 +268,7 @@ void Creator::add_input(const InputSpec& input)
 
 void Creator::add(const fs::path& path, const Name& name, const struct stat& st)
 {
-    if (st.st_dev == out_.device() && st.st_ino == out_.inode())
+    if (st.st_dev == identity_.device() && st.st_ino == identity_.inode())
         return;    // the archive being written
 
     if (check_duplicates_) {
@@ -330,8 +352,11 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     const std::size_t index = entries_.size();
     entries_.push_back(make_entry(EntryType::File, name, st));
 
-    const bool compress = !store_raw_ && (options_.compress_all || !is_precompressed(name.path));
+    const bool compressible = options_.compress_all || !is_precompressed(name.path);
+    const bool compress = compressible && pass_ == Pass::Normal;
     const auto expected = static_cast<std::uint64_t>(st.st_size);
+    const bool contiguous = options_.contiguous_limit && expected <= *options_.contiguous_limit;
+    const auto chunk_size = contiguous ? std::max<std::uint64_t>(expected, 1) : options_.chunk_size;
     std::uint64_t total = 0;
     std::uint64_t chunk_count = 0;
     std::uint32_t crc = 0;
@@ -339,7 +364,7 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     // Archive exactly the size stat() reported, so every chunk but the last is
     // full (§6.5) even if the file changes while we read it.
     while (total < expected) {
-        const auto want = static_cast<std::size_t>(std::min(options_.chunk_size, expected - total));
+        const auto want = static_cast<std::size_t>(std::min(chunk_size, expected - total));
         Bytes chunk(want);
         const auto n = read_fully(fd.get(), chunk);
         if (!n) {
@@ -352,8 +377,14 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
             crc = crc32c(crc, chunk);
             total += chunk.size();
             ++chunk_count;
-            pending_.push_back({compressor_.submit(std::move(chunk), compress), index});
-            drain(threads_ * 4);
+            if (samples_ && compressible)
+                samples_->add(chunk);
+            if (pass_ != Pass::Sample) {
+                const auto size = chunk.size();
+                pending_.push_back({compressor_.submit(std::move(chunk), compress), index, size});
+                pending_bytes_ += size;
+                drain(threads_ * 4);
+            }
         }
         if (*n < want) {
             warn(path.string() + ": file shrank while being read; archived " +
@@ -370,7 +401,7 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
         entry.size = total;
         entry.content_crc = crc;
         if (chunk_count > 1)
-            entry.chunk_size = options_.chunk_size;
+            entry.chunk_size = chunk_size;
     }
     ++stats_.files;
     stats_.input_bytes += total;
@@ -464,19 +495,30 @@ Entry Creator::make_entry(EntryType type, const Name& name, const struct stat& s
     return entry;
 }
 
-// Writes finished chunks, in order, until at most `keep` remain in flight.
+// Writes finished chunks, in order, until at most `keep` remain in flight,
+// holding no more than `keep` full chunks' worth of data (contiguous files
+// can be much larger than a chunk).
 void Creator::drain(std::size_t keep)
 {
-    while (pending_.size() > keep) {
+    const auto budget = keep * options_.chunk_size;
+    while (!pending_.empty() && (pending_.size() > keep || pending_bytes_ > budget)) {
         auto pending = std::move(pending_.front());
         pending_.pop_front();
+        pending_bytes_ -= pending.size;
         const auto chunk = pending.chunk.get();
-        entries_[pending.entry].chunks.push_back(writer_.write_block(chunk.type, chunk.payload));
+        auto& entry = entries_[pending.entry];
+        entry.chunks.push_back(writer_->write_block(chunk.type, chunk.payload));
+        if (chunk.type == BlockType::DataZstd && dict_offset_) {
+            entry.dict = dict_offset_;
+            stats_.dictionary = true;
+        }
     }
 }
 
 CreateStats Creator::finish()
 {
+    if (pass_ == Pass::Sample)
+        return stats_;
     drain(0);
 
     // Hard links share their target's data blocks (§6.5).
@@ -495,11 +537,11 @@ CreateStats Creator::finish()
         if (!dropped_.contains(i))
             encode_entry(index, entries_[i]);
 
-    const auto packed = store_raw_ ? Bytes{} : zstd_compress(index, options_.level);
+    const auto packed = pass_ == Pass::Raw ? Bytes{} : zstd_compress(index, options_.level);
     if (!packed.empty() && packed.size() < index.size())
-        writer_.finish(BlockType::IndexZstd, packed);
+        writer_->finish(BlockType::IndexZstd, packed);
     else
-        writer_.finish(BlockType::IndexRaw, index);
+        writer_->finish(BlockType::IndexRaw, index);
 
     stats_.archive_bytes = out_.position();
     return stats_;
@@ -547,52 +589,123 @@ fs::path default_archive_path(const InputSpec& input)
 
 namespace {
 
-CreateStats create(Output& out, std::span<const InputSpec> specs, const CreateOptions& options,
-                   bool store_raw)
+CreateStats create(Output& out, const Output& identity, std::span<const InputSpec> specs,
+                   const CreateOptions& options, Pass pass, SampleCollector* samples = nullptr,
+                   const Bytes* dict = nullptr)
 {
-    Creator creator(out, options, specs.size() > 1 || options.names == NameMode::Latin1, store_raw);
+    const bool check_duplicates = specs.size() > 1 || options.names == NameMode::Latin1;
+    Creator creator(out, identity, options, check_duplicates, pass, samples, dict);
     for (const auto& spec : specs)
         creator.add_input(spec);
     return creator.finish();
 }
 
-// Builds the archive with nothing compressed, compressing it whole on the
-// fly, and gives up as soon as that passes the limit. Returns nullopt then,
-// having written nothing to `out` and reported nothing.
-std::optional<CreateStats> try_solid(Output& out, std::span<const InputSpec> specs,
-                                     const CreateOptions& options)
+// What a trial pass reports, held back until it's known whether the result
+// is kept: whichever pass is kept reports for real.
+class HeldReports {
+public:
+    CreateOptions quiet(const CreateOptions& options)
+    {
+        auto quiet = options;
+        quiet.on_warning = [this](std::string_view m) { warnings_.emplace_back(m); };
+        quiet.on_entry = [this](std::string_view m) { entries_.emplace_back(m); };
+        return quiet;
+    }
+
+    void replay(const CreateOptions& options) const
+    {
+        for (const auto& entry : entries_)
+            if (options.on_entry)
+                options.on_entry(entry);
+        for (const auto& warning : warnings_)
+            if (options.on_warning)
+                options.on_warning(warning);
+    }
+
+private:
+    std::vector<std::string> warnings_, entries_;
+};
+
+std::optional<Bytes> train_dictionary(Output& out, std::span<const InputSpec> specs,
+                                      const CreateOptions& options, std::uint64_t dict_size)
 {
-    // Hold back what the attempt reports; a normal pass would repeat it.
-    std::vector<std::string> warnings, entries;
-    auto inner = options;
-    inner.on_warning = [&](std::string_view m) { warnings.emplace_back(m); };
-    inner.on_entry = [&](std::string_view m) { entries.emplace_back(m); };
+    HeldReports ignored;
+    SampleCollector samples;
+    create(out, out, specs, ignored.quiet(options), Pass::Sample, &samples);
+    return samples.train(dict_size);
+}
+
+// A solid archive's compressed frame, in a temporary file.
+struct SolidFrame {
+    Output frame;
+    std::uint32_t crc;
+    CreateStats stats;
+    HeldReports reports;
+};
+
+// Builds the archive with nothing compressed, compressing it whole on the
+// fly, and gives up as soon as that passes the limit. Returns nullopt then.
+// Training samples are collected on the way, though they're incomplete if
+// it gives up.
+std::optional<SolidFrame> try_solid(Output& out, std::span<const InputSpec> specs,
+                                    const CreateOptions& options, SampleCollector* samples)
+{
+    SolidFrame solid{out.make_spool(), 0, {}, {}};
+    auto inner = solid.reports.quiet(options);
     inner.align_log2 = 0;    // padding would only be compressed away
     inner.head_index = false;
-
-    auto frame = out.make_spool();
-    CreateStats stats;
-    std::uint32_t frame_crc = 0;
+    // The limit is on the whole archive: the frame plus its framing.
+    const auto overhead = solid_archive_size(0);
+    const auto limit = *options.solid_limit;
+    if (limit <= overhead)
+        return std::nullopt;
     try {
         const auto threads = options.threads ? options.threads : default_thread_count();
-        auto sink = Output::compressing(frame, options.level, threads, *options.solid_limit, out);
-        stats = create(sink, specs, inner, true);
+        auto sink = Output::compressing(solid.frame, options.level, threads, limit - overhead, out);
+        solid.stats = create(sink, out, specs, inner, Pass::Raw, samples);
         sink.commit();
-        frame_crc = sink.compressed_crc();
+        solid.crc = sink.compressed_crc();
     } catch (const SizeLimitExceeded&) {
         return std::nullopt;
     }
+    if (solid_archive_size(solid.frame.position()) > limit)    // rounding in the framing
+        return std::nullopt;
+    return solid;
+}
 
-    write_solid_archive(out, frame, frame_crc);
-    for (const auto& entry : entries)
-        if (options.on_entry)
-            options.on_entry(entry);
-    for (const auto& warning : warnings)
-        if (options.on_warning)
-            options.on_warning(warning);
-    stats.solid = true;
-    stats.archive_bytes = out.position();
-    return stats;
+// With --solid: the solid archive if it fits, or a dictionary-compressed
+// archive if that's nearly as small. Returns nullopt, having written
+// nothing, if neither is kept.
+std::optional<CreateStats> try_small(Output& out, std::span<const InputSpec> specs,
+                                     const CreateOptions& options)
+{
+    SampleCollector samples;
+    auto solid = try_solid(out, specs, options, options.dict_over_solid ? &samples : nullptr);
+    if (!solid)
+        return std::nullopt;
+
+    const auto solid_size = solid_archive_size(solid->frame.position());
+    const auto dict = options.dict_over_solid
+                          ? samples.train(options.dict_size.value_or(kDefaultDictSize))
+                          : std::nullopt;
+    if (dict) {
+        HeldReports reports;
+        auto spool = out.make_spool();
+        auto stats = create(spool, out, specs, reports.quiet(options), Pass::Normal, nullptr, &*dict);
+        const auto size = spool.position();
+        if (size <= *options.solid_limit && size * 100 <= solid_size * options.dict_over_solid) {
+            spool.copy_to(out);
+            reports.replay(options);
+            stats.archive_bytes = out.position();
+            return stats;
+        }
+    }
+
+    write_solid_archive(out, solid->frame, solid->crc);
+    solid->reports.replay(options);
+    solid->stats.solid = true;
+    solid->stats.archive_bytes = out.position();
+    return solid->stats;
 }
 
 } // namespace
@@ -605,9 +718,13 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
         specs.push_back(parse_input(input));
 
     if (options.solid_limit)
-        if (auto stats = try_solid(out, specs, options))
+        if (auto stats = try_small(out, specs, options))
             return *stats;
-    return create(out, specs, options, false);
+
+    std::optional<Bytes> dict;
+    if (options.dict_size)
+        dict = train_dictionary(out, specs, options, *options.dict_size);
+    return create(out, out, specs, options, Pass::Normal, nullptr, dict ? &*dict : nullptr);
 }
 
 } // namespace zar

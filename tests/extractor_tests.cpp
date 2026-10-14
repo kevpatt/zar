@@ -9,9 +9,11 @@
 #include "zar/archive_reader.hpp"
 #include "zar/archive_writer.hpp"
 #include "zar/creator.hpp"
+#include "zar/dictionary.hpp"
 #include "zar/extractor.hpp"
 
 #include <fcntl.h>
+#include <random>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -657,4 +659,262 @@ TEST(listing_groups_by_directory)
     CHECK(order == expected);
     CHECK(groups[1].entry != nullptr);    // "a" has its own entry
     CHECK(groups[2].entry == nullptr);    // "a/b" is only implied
+}
+
+namespace {
+
+// Many small files that share a vocabulary, as dictionaries are made for.
+std::vector<std::pair<std::string, Bytes>> similar_files(const fs::path& src, unsigned count)
+{
+    std::vector<std::pair<std::string, Bytes>> files;
+    std::mt19937 rng(7);
+    const char* words[] = {"server", "listen", "timeout", "retries", "enabled", "path",
+                           "/var/lib/service", "user", "group", "max_connections"};
+    for (unsigned i = 0; i < count; ++i) {
+        std::string body = "# generated configuration " + std::to_string(i) + "\n";
+        for (int line = 0; line < 40; ++line)
+            body += std::string(words[rng() % 10]) + " = " + words[rng() % 10] + std::to_string(rng() % 100) + ";\n";
+        files.emplace_back("conf/" + std::to_string(i % 4) + "/c" + std::to_string(i) + ".conf", text(body));
+        write_file(src / files.back().first, files.back().second);
+    }
+    return files;
+}
+
+// Extracts everything from `bytes`, fed through a pipe.
+Run run_stream(const Bytes& bytes, ExtractOptions options)
+{
+    int fds[2];
+    CHECK(::pipe(fds) == 0);
+    std::jthread feeder([&, fd = fds[1]] {
+        for (std::size_t done = 0; done < bytes.size();) {
+            const auto n = ::write(fd, bytes.data() + done, std::min<std::size_t>(65'536, bytes.size() - done));
+            if (n <= 0)
+                break;
+            done += static_cast<std::size_t>(n);
+        }
+        ::close(fd);
+    });
+
+    Run result;
+    options.on_warning = [&](std::string_view m) { result.warnings.emplace_back(m); };
+    auto reader = ArchiveReader::open_stream(fds[0], "pipe", options.on_warning);
+    const auto groups = group_by_directory(reader.entries());
+    Extractor extractor(reader, options);
+    extractor.prepare(groups);
+    for (const auto& group : groups) {
+        extractor.enter(group);
+        for (const auto* member : group.members)
+            extractor.extract(*member);
+    }
+    result.stats = extractor.finish();
+    feeder.join();
+    ::close(fds[0]);
+    return result;
+}
+
+} // namespace
+
+TEST(dictionaries_compress_and_round_trip)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    const auto files = similar_files(src, 300);
+    write_file(src / "photo.jpg", random_bytes(10'000, 1));    // stored raw: no dictionary
+
+    const auto build = [&](const fs::path& archive, std::optional<std::uint64_t> dict, std::uint8_t align,
+                           bool head_index) {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.dict_size = dict;
+        options.align_log2 = align;
+        options.head_index = head_index;
+        const auto stats = create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+        return stats;
+    };
+
+    const auto plain = build(tmp.path() / "plain.zar", std::nullopt, kAlignLog2Default, false);
+    CHECK(!plain.dictionary);
+
+    for (const std::uint8_t align : {std::uint8_t{3}, std::uint8_t{12}}) {
+        for (const bool head_index : {false, true}) {
+            const auto archive = tmp.path() / "dict.zar";
+            const auto stats = build(archive, kDefaultDictSize, align, head_index);
+            CHECK(stats.dictionary);
+            if (align == 3)
+                CHECK(stats.archive_bytes < plain.archive_bytes * 9 / 10);
+
+            const auto reader = ArchiveReader::open(archive);
+            std::optional<std::int64_t> dict;
+            for (const auto& e : reader.entries()) {
+                if (e.path == "photo.jpg") {
+                    CHECK(!e.dict);
+                } else if (e.type == EntryType::File) {
+                    CHECK(e.dict);
+                    dict = dict.value_or(*e.dict);
+                    CHECK(e.dict == dict);    // one dictionary, shared
+                }
+            }
+            CHECK(dict && reader.block_header(*dict).type == BlockType::ZstdDict);
+            CHECK((*dict < 0) == head_index);    // in front of the base for streaming
+
+            const auto dest = tmp.path() / ("out" + std::to_string(align) + (head_index ? "h" : ""));
+            CHECK(run(archive, into(dest)).warnings.empty());
+            for (const auto& [path, data] : files)
+                CHECK(read_file(dest / path) == data);
+            CHECK(run(archive, into(dest, ExtractMode::Scan)).warnings.empty());
+            CHECK(run(archive, into(dest, ExtractMode::Test)).warnings.empty());
+
+            if (head_index) {
+                const auto piped = tmp.path() / ("piped" + std::to_string(align));
+                CHECK(run_stream(read_file(archive), into(piped)).warnings.empty());
+                for (const auto& [path, data] : files)
+                    CHECK(read_file(piped / path) == data);
+            }
+        }
+    }
+}
+
+TEST(dictionary_is_kept_over_solid_when_close_enough)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    const auto files = similar_files(src, 300);
+    const auto archive = tmp.path() / "a.zar";
+
+    const auto build = [&](std::uint64_t limit, unsigned percent) {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.solid_limit = limit;
+        options.dict_over_solid = percent;
+        const auto stats = create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+        CHECK(stats.archive_bytes == fs::file_size(archive));
+        return stats;
+    };
+
+    const auto solid = build(4 << 20, 0);    // never tries the dictionary
+    CHECK(solid.solid && !solid.dictionary);
+
+    const auto dict = build(4 << 20, 1000);  // any dictionary archive is close enough
+    CHECK(!dict.solid && dict.dictionary);
+    CHECK(dict.archive_bytes > solid.archive_bytes);
+    const auto dest = tmp.path() / "out";
+    CHECK(run(archive, into(dest)).warnings.empty());
+    CHECK(read_file(dest / files[5].first) == files[5].second);
+
+    // The dictionary archive must fit the limit too.
+    const auto over = build(dict.archive_bytes - 1, 1000);
+    CHECK(over.solid && over.archive_bytes == solid.archive_bytes);
+
+    // Neither fits: a normal archive, without a dictionary unless asked for.
+    const auto neither = build(solid.archive_bytes - 1, 1000);
+    CHECK(!neither.solid && !neither.dictionary);
+}
+
+TEST(contiguous_files_are_stored_as_one_block)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    const auto small = random_bytes(5 * 4096 + 7, 1);
+    const auto large = random_bytes(40 * 4096, 2);
+    write_file(src / "small.bin", small);
+    write_file(src / "large.bin", large);
+    write_file(src / "empty", {});
+    const auto archive = tmp.path() / "a.zar";
+
+    for (const auto limit : {std::uint64_t{100'000}, std::uint64_t{1} << 32}) {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.chunk_size = 4096;
+        options.contiguous_limit = limit;
+        options.align_log2 = 12;
+        options.threads = 2;    // a small in-flight budget, below a contiguous file's size
+        create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+
+        const auto reader = ArchiveReader::open(archive);
+        for (const auto& e : reader.entries()) {
+            if (e.path == "small.bin") {
+                CHECK(e.chunks.size() == 1);
+                CHECK(!e.chunk_size);
+                CHECK(reader.block_header(e.chunks[0]).payload_size == small.size());
+            } else if (e.path == "large.bin") {
+                CHECK(e.chunks.size() == (limit > large.size() ? 1u : 40u));
+            }
+        }
+        const auto dest = tmp.path() / ("out" + std::to_string(limit));
+        CHECK(run(archive, into(dest)).warnings.empty());
+        CHECK(read_file(dest / "small.bin") == small);
+        CHECK(read_file(dest / "large.bin") == large);
+        CHECK(fs::file_size(dest / "empty") == 0);
+    }
+}
+
+TEST(hard_links_are_recreated_when_asked)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    write_file(src / "a/target", text("shared"));
+    fs::create_directories(src / "b");
+    fs::create_hard_link(src / "a/target", src / "b/link");
+    fs::create_hard_link(src / "a/target", src / "a/link2");
+    const auto archive = make_archive(tmp.path() / "a.zar", src);
+
+    const auto inode = [](const fs::path& p) { return stat_of(p).st_ino; };
+
+    const auto copies = tmp.path() / "copies";
+    CHECK(run(archive, into(copies)).warnings.empty());
+    CHECK(inode(copies / "a/target") != inode(copies / "b/link"));
+    CHECK(read_file(copies / "b/link") == text("shared"));
+
+    auto linked_options = into(tmp.path() / "linked");
+    linked_options.hard_links = true;
+    const auto linked = run(archive, linked_options);
+    CHECK(linked.warnings.empty());
+    CHECK(linked.stats.hardlinks == 2);
+    CHECK(linked.stats.files == 1);
+    const auto dest = tmp.path() / "linked";
+    CHECK(inode(dest / "a/target") == inode(dest / "b/link"));
+    CHECK(inode(dest / "a/target") == inode(dest / "a/link2"));
+    CHECK(stat_of(dest / "a/target").st_nlink == 3);
+
+    // Again over the top, with -y.
+    linked_options.overwrite = true;
+    CHECK(run(archive, linked_options).warnings.empty());
+    CHECK(inode(dest / "a/target") == inode(dest / "b/link"));
+
+    // Without its target, a link is extracted as a copy.
+    auto reader = ArchiveReader::open(archive);
+    std::vector<Entry> only_link;
+    for (const auto& e : reader.entries())
+        if (e.path == "b/link")
+            only_link.push_back(e);
+    auto alone_options = into(tmp.path() / "alone");
+    alone_options.hard_links = true;
+    const auto groups = group_by_directory(only_link);
+    Extractor extractor(reader, alone_options);
+    extractor.prepare(groups);
+    for (const auto& group : groups) {
+        extractor.enter(group);
+        for (const auto* member : group.members)
+            extractor.extract(*member);
+    }
+    const auto stats = extractor.finish();
+    CHECK(stats.files == 1 && stats.hardlinks == 0);
+    CHECK(read_file(tmp.path() / "alone/b/link") == text("shared"));
+
+    // From a pipe too.
+    {
+        auto out = Output::create_file(tmp.path() / "h.zar", true);
+        CreateOptions options;
+        options.head_index = true;
+        create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+    }
+    auto piped_options = into(tmp.path() / "piped");
+    piped_options.hard_links = true;
+    const auto piped = run_stream(read_file(tmp.path() / "h.zar"), piped_options);
+    CHECK(piped.warnings.empty());
+    CHECK(inode(tmp.path() / "piped/a/target") == inode(tmp.path() / "piped/b/link"));
 }

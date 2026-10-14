@@ -10,9 +10,12 @@
 #include <condition_variable>
 #include <deque>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+struct ZSTD_CDict_s;
 
 namespace zar {
 
@@ -29,6 +32,10 @@ public:
     Compressor(const Compressor&) = delete;
     Compressor& operator=(const Compressor&) = delete;
 
+    // Compresses every chunk submitted from now on with this dictionary
+    // (its frames omit the dictionary ID; the index records the dictionary).
+    void use_dictionary(ByteView dict);
+
     // With `compress` false the chunk is stored raw without trying zstd.
     std::future<CompressedChunk> submit(Bytes data, bool compress);
 
@@ -36,12 +43,14 @@ private:
     struct Job {
         Bytes data;
         bool compress;
+        std::shared_ptr<ZSTD_CDict_s> dict;
         std::promise<CompressedChunk> result;
     };
 
     void work(std::stop_token stop);
 
     int level_;
+    std::shared_ptr<ZSTD_CDict_s> dict_;
     std::mutex mutex_;
     std::condition_variable_any ready_;
     std::deque<Job> jobs_;

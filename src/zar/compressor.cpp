@@ -31,6 +31,8 @@ CCtxPtr make_context(int level)
     // §4.2: content size in every frame header; payload_crc replaces the checksum.
     check(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_contentSizeFlag, 1), "zstd parameter");
     check(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_checksumFlag, 0), "zstd parameter");
+    // An entry's DICT field says which dictionary its frames need (§6.5).
+    check(ZSTD_CCtx_setParameter(cctx.get(), ZSTD_c_dictIDFlag, 0), "zstd parameter");
     return cctx;
 }
 
@@ -66,13 +68,21 @@ Compressor::~Compressor()
     // jthread destructors join.
 }
 
+void Compressor::use_dictionary(ByteView dict)
+{
+    ZSTD_CDict* cdict = ZSTD_createCDict(dict.data(), dict.size(), level_);
+    if (!cdict)
+        throw std::runtime_error("zstd: invalid dictionary");
+    dict_.reset(cdict, ZSTD_freeCDict);
+}
+
 std::future<CompressedChunk> Compressor::submit(Bytes data, bool compress)
 {
     std::promise<CompressedChunk> promise;
     auto future = promise.get_future();
     {
         std::lock_guard lock(mutex_);
-        jobs_.push_back({std::move(data), compress, std::move(promise)});
+        jobs_.push_back({std::move(data), compress, dict_, std::move(promise)});
     }
     ready_.notify_one();
     return future;
@@ -95,6 +105,7 @@ void Compressor::work(std::stop_token stop)
         try {
             CompressedChunk chunk{BlockType::DataRaw, {}};
             if (job.compress) {
+                check(ZSTD_CCtx_refCDict(cctx.get(), job.dict.get()), "zstd dictionary");
                 auto packed = compress_with(cctx.get(), job.data);
                 if (packed.size() < job.data.size())
                     chunk = {BlockType::DataZstd, std::move(packed)};

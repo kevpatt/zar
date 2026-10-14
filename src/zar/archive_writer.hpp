@@ -23,6 +23,11 @@ public:
     // block's offset (relative to the base, §2.2).
     std::int64_t write_block(BlockType type, ByteView payload);
 
+    // Writes a ZSTD_DICT block and returns its offset. It goes where a
+    // streaming reader finds it before any data (§5.4): first, or with
+    // head_index in front of the base. Call it before write_block().
+    std::int64_t write_dictionary(ByteView dict);
+
     // Writes the root index and the trailer. The zar header points to the
     // index too: to a copy at the front with head_index, otherwise (if the
     // output is seekable) to the same block the trailer references.
@@ -36,6 +41,7 @@ private:
 
     Output& out_;
     std::optional<Output> spool_;
+    Bytes dictionary_;    // head_index: written in front of the base by finish()
     ArchiveHeader header_;
     std::uint64_t start_;     // position of the zar header in out_
     std::uint64_t origin_;    // position of the base in sink()
@@ -45,5 +51,8 @@ private:
 // payload is `frame` (a compressed archive, with the given CRC), and a
 // trailer. The header points at the block, so it can be read from a pipe.
 void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc);
+
+// The size of what write_solid_archive() writes for a frame of this size.
+std::uint64_t solid_archive_size(std::uint64_t frame_size);
 
 } // namespace zar

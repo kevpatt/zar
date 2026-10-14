@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** early development (0.1.0). Both tools work and are well
+> **Status:** early development (0.2.1). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -29,6 +29,7 @@ $ unzar project.zar project/src/main.cpp
 - [Using zar](#using-zar)
 - [Using unzar](#using-unzar)
 - [Solid archives](#solid-archives)
+- [Dictionaries](#dictionaries)
 - [Streaming through pipes](#streaming-through-pipes)
 - [Safety](#safety)
 - [The archive format](#the-archive-format)
@@ -51,8 +52,13 @@ $ unzar project.zar project/src/main.cpp
 - **Solid mode for small archives.** `--solid=SIZE` compresses everything as
   one stream when that's worth it, often 15–40% smaller for many small,
   similar files, and falls back to a normal archive when it isn't.
+- **Trained dictionaries.** `--dict` trains a zstd dictionary on the files
+  and compresses them with it: most of solid mode's gain on small, similar
+  files, while keeping random access. With `--solid`, zar tries both and
+  prefers the dictionary archive if it's nearly as small.
 - **Alignment.** `--align` places payloads on cache-line or page boundaries,
-  so stored data can be `mmap`ed straight from the archive.
+  and `--contiguous` keeps each file in a single block, so stored data can be
+  `mmap`ed straight from the archive.
 - **Safe extraction.** No absolute paths, no `..`, no writing through
   symlinks, nothing overwritten without `-y`, and an optional cap on how
   much will be decompressed.
@@ -69,13 +75,13 @@ $ unzar project.zar project/src/main.cpp
 |---|---|---|---|
 | Extract one file without decompressing others | ✅ | ❌ | ✅ |
 | Random access *within* a large file | ✅ (per chunk) | ❌ | ❌ |
-| Compression across similar small files | ✅ with `--solid` | ✅ | ❌ |
+| Compression across similar small files | ✅ with `--solid` or `--dict` | ✅ | ❌ |
 | Checksums | every block, and every file | whole stream (optional) | every file |
 | Verify without decompressing | ✅ `--scan` | ❌ | ❌ |
 | Write to a pipe | ✅ | ✅ | ⚠️ limited |
 | Extract from a pipe | ✅ with `--head-index` | ✅ | ⚠️ limited |
 | Parallel compression and extraction | ✅ | compression only | ❌ (typically) |
-| Page-aligned stored data (`mmap`) | ✅ `--align` | ❌ | ⚠️ via `zipalign` |
+| Page-aligned stored data (`mmap`) | ✅ `--align`, `--contiguous` | ❌ | ⚠️ via `zipalign` |
 | Ubiquity | new | everywhere | everywhere |
 
 If you're sharing files with people who don't have zar, use tar or zip.
@@ -135,6 +141,8 @@ zar -o backup.zar ~/Documents     # choose the archive's name
 zar -o - proj | ssh host 'cat > proj.zar'     # write to a pipe
 zar -m -o bundle.zar notes.txt photos         # several inputs need -m and -o
 zar -l 19 --solid=4M config/      # small and similar: try one solid stream
+zar --dict headers/               # many small files, still random access
+zar --contiguous --align=4K app/  # one page-aligned block per file
 ```
 
 ### What gets stored
@@ -178,8 +186,11 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
+| `--contiguous[=SIZE]` | store each file of at most SIZE bytes as a single block rather than in chunks; with no SIZE, files up to 4G (the largest block unzar reads) |
+| `--dict[=SIZE]` | train a zstd dictionary of at most SIZE bytes (default 110K) on the files, and compress them with it; see [Dictionaries](#dictionaries) |
 | `--head-index` | also put the index at the front, so the archive can be extracted from a pipe (the index is written twice) |
 | `--solid=SIZE` | first try compressing the whole archive as one stream, and keep that if it's at most SIZE bytes; otherwise write a normal archive |
+| `--dict-over-solid=PERCENT` | when the solid archive fits, also try a dictionary archive, and keep it instead if it's at most PERCENT of the solid size and also fits (default 120; 0 never tries) |
 | `-v, --verbose` | list files as they are added, and print a summary |
 | `--help`, `--version` | |
 
@@ -238,6 +249,7 @@ src/sub/
 | `-t, --test` | like `--scan`, but also decompress and verify all data |
 | `-y, --yes` | overwrite files and directories that already exist |
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
+| `--hard-links` | recreate hard links with `link(2)` where their targets are extracted too; by default each is extracted as an independent copy. Falls back to a copy where the filesystem refuses. |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`) |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
@@ -282,6 +294,33 @@ archive.
 decompress the whole thing first: into memory, or into a temporary file
 once it passes 64 MiB. So solid archives make the most sense when they're
 small, and `--scan` has to decompress them too.
+
+## Dictionaries
+
+A trained zstd dictionary captures what files have in common (keywords,
+boilerplate, structure) so that each chunk, compressed on its own, can
+refer to it. With `--dict`, zar reads the files once to collect samples
+(the start of each chunk, up to 32 MiB in all), trains a dictionary, and
+then builds a normal archive with every compressible chunk compressed
+against it. The dictionary is stored once, in front of the data, and each
+file's index entry points to it, so random access and `--head-index`
+streaming both still work.
+
+On the 31 MiB of C and C++ headers in the macOS SDK:
+
+| Archive | Size |
+|---|---|
+| normal | 7.7M |
+| `--dict` | 5.8M (−25%) |
+| `--solid` | 4.9M (−36%) |
+
+The dictionary block itself is stored uncompressed, so a larger `--dict=SIZE`
+isn't always better. The default, 110K (as with `zstd --train`), is scaled
+down for small inputs.
+
+With `--solid=SIZE`, zar tries a dictionary archive too whenever the solid
+one fits, and keeps the dictionary archive if it's at most 120% of the solid
+size (`--dict-over-solid=PERCENT`), trading a little size for random access.
 
 ## Streaming through pipes
 
@@ -380,6 +419,7 @@ src/
     creator.*          walking a tree and building an archive
     extractor.*        extracting, testing, and scanning
     compressor.*       parallel chunk compression
+    dictionary.*       collecting samples and training dictionaries
     thread_pool.*      worker threads for extraction
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated
@@ -402,9 +442,9 @@ cmake --build build-tsan && build-tsan/zar_tests
 See [TODO.md](TODO.md). The main plans are aimed at using zar as an
 application bundle format, read in place by a loader:
 
-- storing libraries as single, page-aligned blocks that can be `mmap`ed,
+- storing libraries uncompressed, so their single, page-aligned blocks can
+  be `mmap`ed,
 - cryptographic hashes and a signed index,
-- trained zstd dictionaries, for small files without giving up random access,
 - reproducible timestamps.
 
 ## License

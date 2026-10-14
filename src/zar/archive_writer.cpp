@@ -64,6 +64,12 @@ void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc)
     write_trailer(out, start, start, header.index_offset, alignment_of(header));
 }
 
+std::uint64_t solid_archive_size(std::uint64_t frame_size)
+{
+    // As in write_trailer(), with the default alignment.
+    return round_up(2 * kHeaderSize + frame_size, 8) + kTrailerSize;
+}
+
 ArchiveWriter::ArchiveWriter(Output& out, std::uint8_t align_log2, bool head_index)
     : out_(out), start_(out.position()), origin_(out.position())
 {
@@ -103,6 +109,16 @@ std::int64_t ArchiveWriter::write_block(BlockType type, ByteView payload)
     return place(sink(), sink().position() - origin_, 0, type, payload);
 }
 
+std::int64_t ArchiveWriter::write_dictionary(ByteView dict)
+{
+    if (!spool_)
+        return write_block(BlockType::ZstdDict, dict);
+
+    // It will end at the base, after padding that aligns its payload.
+    dictionary_.assign(dict.begin(), dict.end());
+    return -static_cast<std::int64_t>(round_up(dict.size(), alignment()) + kHeaderSize);
+}
+
 void ArchiveWriter::finish(BlockType index_type, ByteView index)
 {
     if (!spool_) {
@@ -115,12 +131,14 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index)
         return;
     }
 
-    // zar header | head index | padding | base: spooled blocks | tail index | trailer
+    // zar header | head index | padding | [dictionary] | base: spooled blocks |
+    // tail index | trailer
     //
     // Everything before the base is known up front, so this works on a pipe.
     const auto head_payload_at = round_up(2 * kHeaderSize, alignment());
     const auto head_end = head_payload_at + index.size();
-    const auto base = round_up(head_end, alignment());
+    const auto dict_span = dictionary_.empty() ? 0 : kHeaderSize + round_up(dictionary_.size(), alignment());
+    const auto base = round_up(head_end + dict_span, alignment());
     if (base > std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("the index is too large to put at the head of the archive");
 
@@ -130,7 +148,14 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index)
         static_cast<std::int64_t>(head_payload_at - kHeaderSize) - static_cast<std::int64_t>(base);
     out_.write(header_.encode());
     place(out_, kHeaderSize, -static_cast<std::int64_t>(base), index_type, index);
-    out_.write_zeros(static_cast<std::size_t>(base - head_end));
+    if (!dictionary_.empty()) {
+        const auto dict_at = base - dict_span;
+        out_.write_zeros(static_cast<std::size_t>(dict_at - head_end));
+        place(out_, dict_at, -static_cast<std::int64_t>(base), BlockType::ZstdDict, dictionary_);
+        out_.write_zeros(static_cast<std::size_t>(base - (dict_at + kHeaderSize + dictionary_.size())));
+    } else {
+        out_.write_zeros(static_cast<std::size_t>(base - head_end));
+    }
 
     spool_->copy_to(out_);
     spool_.reset();

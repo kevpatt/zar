@@ -8,6 +8,7 @@
 
 #include "zar/crc32c.hpp"
 #include "zar/creator.hpp"
+#include "zar/dictionary.hpp"
 #include "zar/index.hpp"
 
 #include <cstdlib>
@@ -343,4 +344,23 @@ TEST(default_archive_names)
     CHECK(name(".") == fs::current_path().filename().native() + ".zar");    // here, not beside
     CHECK(name("./") == name("."));
     CHECK_THROWS(name("/."));
+}
+
+TEST(dictionary_samples_stay_bounded_and_deterministic)
+{
+    const auto collect = [] {
+        SampleCollector samples;
+        for (unsigned i = 0; i < 1000; ++i)
+            samples.add(random_bytes(200'000, i % 50));    // only the first 128K is kept
+        return samples;
+    };
+    const auto a = collect();
+    CHECK(a.total() <= (32 << 20) + (128 << 10));
+    CHECK(a.total() > (8 << 20));
+    CHECK(a.total() == collect().total());
+    CHECK(a.count() == a.total() / (128 << 10));
+
+    SampleCollector few;
+    few.add(text("too little to train on"));
+    CHECK(!few.train(kDefaultDictSize));
 }
