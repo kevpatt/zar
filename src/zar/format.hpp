@@ -24,7 +24,7 @@ struct Version {
     std::string to_string() const;
 };
 
-inline constexpr Version kFormatVersion{0, 2, 3};
+inline constexpr Version kFormatVersion{0, 2, 4};
 
 inline constexpr std::size_t kHeaderSize = 32;        // zar and block headers
 inline constexpr std::size_t kTrailerSize = kHeaderSize + 16;

@@ -948,10 +948,11 @@ TEST(dedup_stores_identical_chunks_once)
 
     CreateOptions options;
     options.chunk_size = 4096;
+    options.dedup = false;
     const auto plain = build_archive(tmp.path() / "plain.zar", src, options);
     CHECK(plain.deduplicated_bytes == 0);
 
-    options.dedup = true;
+    options.dedup = true;    // the default
     for (const bool dict : {false, true}) {
         for (const bool head_index : {false, true}) {
             options.dict_size = dict ? std::optional(kDefaultDictSize) : std::nullopt;
@@ -1018,25 +1019,33 @@ TEST(dedup_compares_contents_when_hashes_collide)
         CHECK(read_file(dest / ("f" + std::to_string(i))) == files[i]);
 }
 
-TEST(dedup_needs_to_read_back_its_output)
+TEST(dedup_is_skipped_when_the_output_cannot_be_read_back)
 {
     TempDir tmp;
-    write_file(tmp.path() / "src/f", text("data"));
+    write_file(tmp.path() / "src/a", random_bytes(10'000, 1));
+    write_file(tmp.path() / "src/b", random_bytes(10'000, 1));
+    const auto archive = tmp.path() / "a.zar";
 
-    int fds[2];
-    CHECK(::pipe(fds) == 0);
+    // Written as if to a pipe: an O_APPEND descriptor can't be read back.
+    const int fd = ::open(archive.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     const int saved = ::dup(STDOUT_FILENO);
-    ::dup2(fds[1], STDOUT_FILENO);
-    ::close(fds[1]);
+    ::dup2(fd, STDOUT_FILENO);
+    ::close(fd);
+    CreateStats stats;
     {
         auto out = Output::standard_output();
-        CreateOptions options;
-        options.dedup = true;
-        CHECK_THROWS(create_archive(out, std::vector{tmp.path() / "src/."}, options));
+        CHECK(!out.readable());
+        stats = create_archive(out, std::vector{tmp.path() / "src/."}, {});    // dedup is the default
+        out.commit();
     }
     ::dup2(saved, STDOUT_FILENO);
     ::close(saved);
-    char byte;
-    CHECK(::read(fds[0], &byte, 1) == 0);    // nothing was written
-    ::close(fds[0]);
+
+    CHECK(stats.deduplicated_bytes == 0);
+    const auto dest = tmp.path() / "out";
+    CHECK(run(archive, into(dest)).warnings.empty());
+    CHECK(read_file(dest / "b") == random_bytes(10'000, 1));
+
+    // With a file to write to, the same inputs are deduplicated.
+    CHECK(build_archive(tmp.path() / "file.zar", tmp.path() / "src", {}).deduplicated_bytes == 10'000);
 }

@@ -134,6 +134,7 @@ TEST(writer_round_trips_a_tree)
     CreateOptions options;
     options.chunk_size = 4096;
     options.threads = 3;
+    options.dedup = false;    // photo.jpg and notes.txt would share a block
     CreateStats stats;
     const auto archive = build(tmp.path() / "out.zar", {src / "."}, options, &stats);
 

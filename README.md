@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** early development (0.2.3). Both tools work and are well
+> **Status:** early development (0.2.4). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -57,9 +57,9 @@ $ unzar project.zar project/src/main.cpp
   and compresses them with it: most of solid mode's gain on small, similar
   files, while keeping random access. With `--solid`, zar tries both and
   prefers the dictionary archive if it's nearly as small.
-- **Deduplication.** `--dedup` stores identical chunks once, so duplicate
-  files (or repeated chunks, like runs of zeros in disk images) cost almost
-  nothing. Candidates are found by an XXH3-128 hash, and confirmed by
+- **Deduplication.** Identical chunks are stored once, by default, so
+  duplicate files (or repeated chunks, like runs of zeros in disk images)
+  cost almost nothing. Candidates are found by an XXH3-128 hash, and confirmed by
   comparing bytes before a block is reused.
 - **Alignment.** `--align` places payloads on cache-line or page boundaries,
   and `--contiguous` keeps each file in a single block, so stored data can be
@@ -81,6 +81,7 @@ $ unzar project.zar project/src/main.cpp
 | Extract one file without decompressing others | ✅ | ❌ | ✅ |
 | Random access *within* a large file | ✅ (per chunk) | ❌ | ❌ |
 | Compression across similar small files | ✅ with `--solid` or `--dict` | ✅ | ❌ |
+| Duplicate files and data stored once | ✅ (by default) | ⚠️ only within zstd's window | ❌ |
 | Checksums | every block, and every file | whole stream (optional) | every file |
 | Verify without decompressing | ✅ `--scan` | ❌ | ❌ |
 | Write to a pipe | ✅ | ✅ | ⚠️ limited |
@@ -192,7 +193,7 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
-| `--dedup` | store identical chunks only once; see [Deduplication](#deduplication). Needs an output zar can read back: a file, or `--head-index` |
+| `--no-dedup` | store identical chunks again, rather than once; see [Deduplication](#deduplication) |
 | `--contiguous[=SIZE]` | store each file of at most SIZE bytes as a single block rather than in chunks; with no SIZE, files up to 4G (the largest block unzar reads) |
 | `--dict[=SIZE]` | train a zstd dictionary of at most SIZE bytes (default 110K) on the files, and compress them with it; see [Dictionaries](#dictionaries) |
 | `--head-index` | also put the index at the front, so the archive can be extracted from a pipe (the index is written twice) |
@@ -331,8 +332,8 @@ size (`--dict-over-solid=PERCENT`), trading a little size for random access.
 
 ## Deduplication
 
-With `--dedup`, zar hashes each chunk's uncompressed data with XXH3-128 as
-it's read. If the hash matches a chunk already in the archive, zar reads
+By default, zar hashes each chunk's uncompressed data with XXH3-128 as it's
+read. If the hash matches a chunk already in the archive, zar reads
 that block back, decompresses it if need be, and compares the bytes; only
 if they're identical does the new chunk reuse the existing block, skipping
 compression too. A hash collision can't corrupt an archive, it just stores
@@ -344,10 +345,11 @@ disk images. It doesn't find data that has merely shifted (a copy with a
 byte inserted at the start).
 
 Reading back needs an output zar can read: a file, or with `--head-index`,
-the temporary file the data is staged in. It works within `--solid`'s
-fallback and dictionary archives but not inside a solid archive itself,
-where zstd finds repeats on its own. Memory use is about 40 bytes per
-distinct chunk.
+the temporary file the data is staged in. So when writing to a pipe without
+`--head-index`, zar doesn't deduplicate. Nor does it inside a solid archive,
+where zstd finds repeats on its own; it does in `--solid`'s fallback and
+dictionary archives. Memory use is about 40 bytes per distinct chunk, and
+hashing costs little next to compression. `--no-dedup` turns it off.
 
 ## Streaming through pipes
 
@@ -447,7 +449,7 @@ src/
     extractor.*        extracting, testing, and scanning
     compressor.*       parallel chunk compression
     dictionary.*       collecting samples and training dictionaries
-    dedup.*            chunk hashes for --dedup
+    dedup.*            chunk hashes for deduplication
     thread_pool.*      worker threads for extraction
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated

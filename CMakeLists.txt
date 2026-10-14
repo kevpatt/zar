@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.2.3
+    VERSION 0.2.4
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 

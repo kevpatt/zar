@@ -32,8 +32,9 @@ struct CreateOptions {
     bool compress_all = false;
     // Store each distinct chunk once: a chunk identical to one already
     // written reuses that block. Found by hash, confirmed by reading the
-    // block back, so the output must be readable (a file) unless head_index.
-    bool dedup = false;
+    // block back, so it's skipped when the output can't be read back (a
+    // pipe, without head_index).
+    bool dedup = true;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
     // Store each file of at most this many bytes as a single block, whatever
