@@ -9,10 +9,13 @@
 #include "zar/archive_reader.hpp"
 #include "zar/archive_writer.hpp"
 #include "zar/creator.hpp"
+#include "zar/dedup.hpp"
 #include "zar/dictionary.hpp"
 #include "zar/extractor.hpp"
 
+#include <algorithm>
 #include <fcntl.h>
+#include <map>
 #include <random>
 #include <sys/stat.h>
 #include <thread>
@@ -917,4 +920,123 @@ TEST(hard_links_are_recreated_when_asked)
     const auto piped = run_stream(read_file(tmp.path() / "h.zar"), piped_options);
     CHECK(piped.warnings.empty());
     CHECK(inode(tmp.path() / "piped/a/target") == inode(tmp.path() / "piped/b/link"));
+}
+
+namespace {
+
+CreateStats build_archive(const fs::path& archive, const fs::path& source, CreateOptions options)
+{
+    auto out = Output::create_file(archive, true);
+    const auto stats = create_archive(out, std::vector{source / "."}, options);
+    out.commit();
+    return stats;
+}
+
+} // namespace
+
+TEST(dedup_stores_identical_chunks_once)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    const auto original = random_bytes(3 * 4096 + 100, 1);
+    write_file(src / "a.bin", original);
+    write_file(src / "copy.bin", original);
+    write_file(src / "copy.jpg", original);    // stored raw, but the data matches
+    write_file(src / "middle.bin", Bytes(original.begin() + 4096, original.begin() + 8192));
+    write_file(src / "zeros.img", Bytes(10 * 4096, 0));
+    const auto texts = similar_files(src, 40);
+
+    CreateOptions options;
+    options.chunk_size = 4096;
+    const auto plain = build_archive(tmp.path() / "plain.zar", src, options);
+    CHECK(plain.deduplicated_bytes == 0);
+
+    options.dedup = true;
+    for (const bool dict : {false, true}) {
+        for (const bool head_index : {false, true}) {
+            options.dict_size = dict ? std::optional(kDefaultDictSize) : std::nullopt;
+            options.head_index = head_index;
+            const auto archive = tmp.path() / "dedup.zar";
+            const auto stats = build_archive(archive, src, options);
+            CHECK(stats.deduplicated_bytes == 2 * original.size() + 4096 + 9 * 4096);
+            if (!dict)
+                CHECK(stats.archive_bytes < plain.archive_bytes);
+
+            const auto reader = ArchiveReader::open(archive);
+            std::map<std::string, const Entry*> by_path;
+            for (const auto& e : reader.entries())
+                by_path[e.path] = &e;
+            CHECK(by_path["copy.bin"]->chunks == by_path["a.bin"]->chunks);
+            CHECK(by_path["copy.jpg"]->chunks == by_path["a.bin"]->chunks);
+            CHECK(by_path["copy.jpg"]->dict == by_path["a.bin"]->dict);
+            CHECK(by_path["middle.bin"]->chunks[0] == by_path["a.bin"]->chunks[1]);
+            const auto& zeros = by_path["zeros.img"]->chunks;
+            CHECK(std::ranges::all_of(zeros, [&](auto offset) { return offset == zeros[0]; }));
+
+            const auto dest = tmp.path() / ("out" + std::to_string(dict) + std::to_string(head_index));
+            CHECK(run(archive, into(dest)).warnings.empty());
+            CHECK(read_file(dest / "copy.jpg") == original);
+            CHECK(read_file(dest / "middle.bin") == Bytes(original.begin() + 4096, original.begin() + 8192));
+            CHECK(read_file(dest / "zeros.img") == Bytes(10 * 4096, 0));
+            for (const auto& [path, data] : texts)
+                CHECK(read_file(dest / path) == data);
+            CHECK(run(archive, into(dest, ExtractMode::Scan)).warnings.empty());
+
+            if (head_index) {
+                const auto piped = tmp.path() / ("piped" + std::to_string(dict));
+                CHECK(run_stream(read_file(archive), into(piped)).warnings.empty());
+                CHECK(read_file(piped / "copy.bin") == original);
+                CHECK(read_file(piped / "zeros.img") == Bytes(10 * 4096, 0));
+            }
+        }
+    }
+}
+
+TEST(dedup_compares_contents_when_hashes_collide)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    std::vector<Bytes> files;
+    for (unsigned i = 0; i < 6; ++i) {
+        files.push_back(i % 3 == 2 ? files[0] : random_bytes(4096, i));
+        write_file(src / ("f" + std::to_string(i)), files.back());
+    }
+
+    // Every chunk "collides": only the true duplicates (f2, f5) may be shared.
+    hash_chunk_override = [](ByteView) noexcept { return ChunkHash{1, 2}; };
+    CreateOptions options;
+    options.dedup = true;
+    options.chunk_size = 4096;
+    const auto archive = tmp.path() / "a.zar";
+    const auto stats = build_archive(archive, src, options);
+    hash_chunk_override = nullptr;
+
+    CHECK(stats.deduplicated_bytes == 2 * 4096);
+    const auto dest = tmp.path() / "out";
+    CHECK(run(archive, into(dest)).warnings.empty());
+    for (unsigned i = 0; i < files.size(); ++i)
+        CHECK(read_file(dest / ("f" + std::to_string(i))) == files[i]);
+}
+
+TEST(dedup_needs_to_read_back_its_output)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/f", text("data"));
+
+    int fds[2];
+    CHECK(::pipe(fds) == 0);
+    const int saved = ::dup(STDOUT_FILENO);
+    ::dup2(fds[1], STDOUT_FILENO);
+    ::close(fds[1]);
+    {
+        auto out = Output::standard_output();
+        CreateOptions options;
+        options.dedup = true;
+        CHECK_THROWS(create_archive(out, std::vector{tmp.path() / "src/."}, options));
+    }
+    ::dup2(saved, STDOUT_FILENO);
+    ::close(saved);
+    char byte;
+    CHECK(::read(fds[0], &byte, 1) == 0);    // nothing was written
+    ::close(fds[0]);
 }

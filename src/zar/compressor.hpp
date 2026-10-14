@@ -12,6 +12,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -59,5 +60,9 @@ private:
 
 // One-shot compression on the calling thread, for index blocks.
 Bytes zstd_compress(ByteView data, int level);
+
+// One-shot decompression of a frame that should hold exactly `size` bytes,
+// for reading back blocks. Returns nullopt if it doesn't.
+std::optional<Bytes> zstd_decompress(ByteView frame, std::size_t size, ByteView dict = {});
 
 } // namespace zar

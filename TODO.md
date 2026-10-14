@@ -40,6 +40,12 @@ maps native libraries straight out of an APK).
   GitHub Actions workflow could build and test on Linux and macOS, with a
   sanitizer job, on every push. That would also cover the non-UTF-8 name
   test, which skips itself on macOS because APFS refuses such names.
+- **Content-defined chunking for `--dedup`.** Dedup only matches whole
+  chunks at fixed boundaries, so a copy with one byte inserted near the
+  start shares nothing. Choosing chunk boundaries from the content (a
+  rolling hash, as restic and borg do) would fix that. It needs a format
+  change: every chunk but the last is `CHUNK_SIZE` bytes, so variable-length
+  chunks need a new field listing each chunk's length.
 - **Parallel file creation.** Extraction decompresses in parallel, but files
   and directories are created one at a time, which dominates for trees of
   many small files.

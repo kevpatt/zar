@@ -119,6 +119,19 @@ std::int64_t ArchiveWriter::write_dictionary(ByteView dict)
     return -static_cast<std::int64_t>(round_up(dict.size(), alignment()) + kHeaderSize);
 }
 
+bool ArchiveWriter::can_read_back() const noexcept
+{
+    return spool_ ? spool_->readable() : out_.readable();
+}
+
+Bytes ArchiveWriter::read_payload(std::int64_t offset, std::size_t size)
+{
+    Bytes payload(size);
+    const auto position = static_cast<std::int64_t>(origin_) + offset + static_cast<std::int64_t>(kHeaderSize);
+    sink().read_at(static_cast<std::uint64_t>(position), payload);
+    return payload;
+}
+
 void ArchiveWriter::finish(BlockType index_type, ByteView index)
 {
     if (!spool_) {

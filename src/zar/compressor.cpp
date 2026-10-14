@@ -52,6 +52,21 @@ Bytes zstd_compress(ByteView data, int level)
     return compress_with(make_context(level).get(), data);
 }
 
+std::optional<Bytes> zstd_decompress(ByteView frame, std::size_t size, ByteView dict)
+{
+    if (ZSTD_getFrameContentSize(frame.data(), frame.size()) != size)
+        return std::nullopt;
+    const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx(ZSTD_createDCtx(), ZSTD_freeDCtx);
+    if (!dctx)
+        throw std::bad_alloc();
+    Bytes out(size);
+    const auto n = ZSTD_decompress_usingDict(dctx.get(), out.data(), out.size(), frame.data(),
+                                             frame.size(), dict.data(), dict.size());
+    if (ZSTD_isError(n) || n != size)
+        return std::nullopt;
+    return out;
+}
+
 Compressor::Compressor(int level, unsigned threads) : level_(level)
 {
     make_context(level);    // validate the level up front, on this thread

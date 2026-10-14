@@ -6,6 +6,7 @@
 #include "zar/archive_writer.hpp"
 #include "zar/compressor.hpp"
 #include "zar/crc32c.hpp"
+#include "zar/dedup.hpp"
 #include "zar/dictionary.hpp"
 #include "zar/index.hpp"
 #include "zar/names.hpp"
@@ -145,10 +146,13 @@ public:
           identity_(identity),
           options_(options),
           threads_(options.threads ? options.threads : default_thread_count()),
-          compressor_(options.level, threads_)
+          compressor_(options.level, threads_),
+          dict_(dict)
     {
         if (pass_ != Pass::Sample)
             writer_.emplace(out, options.align_log2, options.head_index);
+        // A solid archive's frame can't be read back; zstd finds its repeats.
+        dedup_ = options.dedup && pass_ == Pass::Normal && writer_->can_read_back();
         if (dict) {
             dict_offset_ = writer_->write_dictionary(*dict);
             compressor_.use_dictionary(*dict);
@@ -165,10 +169,25 @@ private:
         std::uint8_t flags = 0;
     };
 
+    // A block already written.
+    struct Stored {
+        std::int64_t offset;
+        BlockType type;
+    };
+
     struct PendingChunk {
-        std::future<CompressedChunk> chunk;
+        std::future<CompressedChunk> chunk;    // unless `reuse`
         std::size_t entry;
-        std::size_t size;    // uncompressed
+        std::size_t size;    // uncompressed, if being compressed
+        std::optional<ChunkHash> hash;    // to remember the block by, once written
+        std::optional<Stored> reuse;      // a duplicate of this block
+    };
+
+    // A block that dedup may reuse, by the hash of its uncompressed data.
+    struct Known {
+        std::uint64_t sequence;    // its place among all chunks queued
+        std::optional<Stored> stored;
+        std::uint64_t payload_size = 0;
     };
 
     struct FileId {
@@ -189,7 +208,10 @@ private:
     const std::optional<std::string>& cached_user(uid_t uid);
     const std::optional<std::string>& cached_group(gid_t gid);
 
+    void queue_chunk(Bytes chunk, std::size_t entry, bool compress);
+    std::optional<Stored> find_duplicate(const ChunkHash& hash, ByteView chunk);
     void drain(std::size_t keep);
+    void write_next();
     void warn(const std::string& message);
 
     // Several inputs (or Latin-1 conversion) can map two files to one path;
@@ -205,7 +227,12 @@ private:
     unsigned threads_;
     std::optional<ArchiveWriter> writer_;    // not for Pass::Sample
     Compressor compressor_;
+    const Bytes* dict_;
     std::optional<std::int64_t> dict_offset_;
+    bool dedup_ = false;
+    std::unordered_map<ChunkHash, Known, ChunkHash::Hasher> known_;
+    std::uint64_t queued_ = 0;     // chunks queued so far
+    std::uint64_t written_ = 0;    // chunks written so far, in queue order
 
     std::vector<Entry> entries_;
     std::set<std::size_t> dropped_;              // entries abandoned after a read error
@@ -379,12 +406,8 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
             ++chunk_count;
             if (samples_ && compressible)
                 samples_->add(chunk);
-            if (pass_ != Pass::Sample) {
-                const auto size = chunk.size();
-                pending_.push_back({compressor_.submit(std::move(chunk), compress), index, size});
-                pending_bytes_ += size;
-                drain(threads_ * 4);
-            }
+            if (pass_ != Pass::Sample)
+                queue_chunk(std::move(chunk), index, compress);
         }
         if (*n < want) {
             warn(path.string() + ": file shrank while being read; archived " +
@@ -495,23 +518,95 @@ Entry Creator::make_entry(EntryType type, const Name& name, const struct stat& s
     return entry;
 }
 
+// Hands a chunk to the compressor or, if it duplicates a block already in
+// the archive, queues a reference to that block instead.
+void Creator::queue_chunk(Bytes chunk, std::size_t entry, bool compress)
+{
+    std::optional<ChunkHash> hash;
+    if (dedup_) {
+        hash = hash_chunk(chunk);
+        if (const auto stored = find_duplicate(*hash, chunk)) {
+            stats_.deduplicated_bytes += chunk.size();
+            pending_.push_back({{}, entry, 0, std::nullopt, stored});
+            ++queued_;
+            return;
+        }
+        // Remember it, unless a different chunk with the same hash came first.
+        if (!known_.try_emplace(*hash, Known{queued_, std::nullopt}).second)
+            hash.reset();
+    }
+
+    const auto size = chunk.size();
+    pending_.push_back({compressor_.submit(std::move(chunk), compress), entry, size, hash, std::nullopt});
+    pending_bytes_ += size;
+    ++queued_;
+    drain(threads_ * 4);
+}
+
+// A block already written (or queued) whose contents equal `chunk`.
+std::optional<Creator::Stored> Creator::find_duplicate(const ChunkHash& hash, ByteView chunk)
+{
+    const auto it = known_.find(hash);
+    if (it == known_.end())
+        return std::nullopt;
+    while (written_ <= it->second.sequence)    // it's still being compressed
+        write_next();
+
+    // Equal hashes are very likely equal contents, but compare to be sure.
+    const auto& known = it->second;
+    if (!known.stored)
+        return std::nullopt;
+    const auto [offset, type] = *known.stored;
+    if (type == BlockType::DataRaw && known.payload_size != chunk.size())
+        return std::nullopt;
+    auto payload = writer_->read_payload(offset, static_cast<std::size_t>(known.payload_size));
+    if (type == BlockType::DataZstd) {
+        auto data = zstd_decompress(payload, chunk.size(), dict_ ? ByteView(*dict_) : ByteView{});
+        if (!data)
+            return std::nullopt;
+        payload = std::move(*data);
+    }
+    if (!std::ranges::equal(payload, chunk))
+        return std::nullopt;
+    return known.stored;
+}
+
 // Writes finished chunks, in order, until at most `keep` remain in flight,
 // holding no more than `keep` full chunks' worth of data (contiguous files
 // can be much larger than a chunk).
 void Creator::drain(std::size_t keep)
 {
     const auto budget = keep * options_.chunk_size;
-    while (!pending_.empty() && (pending_.size() > keep || pending_bytes_ > budget)) {
-        auto pending = std::move(pending_.front());
-        pending_.pop_front();
-        pending_bytes_ -= pending.size;
+    while (!pending_.empty() && (pending_.size() > keep || pending_bytes_ > budget))
+        write_next();
+}
+
+// Writes the oldest queued chunk, waiting for its compression if need be.
+void Creator::write_next()
+{
+    auto pending = std::move(pending_.front());
+    pending_.pop_front();
+    pending_bytes_ -= pending.size;
+    ++written_;
+
+    Stored stored{};
+    if (pending.reuse) {
+        stored = *pending.reuse;
+    } else {
         const auto chunk = pending.chunk.get();
-        auto& entry = entries_[pending.entry];
-        entry.chunks.push_back(writer_->write_block(chunk.type, chunk.payload));
-        if (chunk.type == BlockType::DataZstd && dict_offset_) {
-            entry.dict = dict_offset_;
-            stats_.dictionary = true;
+        stored = {writer_->write_block(chunk.type, chunk.payload), chunk.type};
+        if (pending.hash) {
+            auto& known = known_.at(*pending.hash);
+            known.stored = stored;
+            known.payload_size = chunk.payload.size();
         }
+    }
+
+    auto& entry = entries_[pending.entry];
+    entry.chunks.push_back(stored.offset);
+    if (stored.type == BlockType::DataZstd && dict_offset_) {
+        entry.dict = dict_offset_;
+        stats_.dictionary = true;
     }
 }
 
@@ -716,6 +811,11 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
     std::vector<InputSpec> specs;    // check every name before writing anything
     for (const auto& input : inputs)
         specs.push_back(parse_input(input));
+
+    // Checked first, so nothing is written.
+    if (options.dedup && !options.head_index && !out.readable())
+        throw std::runtime_error("--dedup reads back what it has written, so it can't write "
+                                 "to a pipe (unless with --head-index)");
 
     if (options.solid_limit)
         if (auto stats = try_small(out, specs, options))

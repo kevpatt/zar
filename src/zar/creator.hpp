@@ -30,6 +30,10 @@ struct CreateOptions {
     bool all_times = false;    // atime, ctime, and btime as well as mtime
     NameMode names = NameMode::Raw;
     bool compress_all = false;
+    // Store each distinct chunk once: a chunk identical to one already
+    // written reuses that block. Found by hash, confirmed by reading the
+    // block back, so the output must be readable (a file) unless head_index.
+    bool dedup = false;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
     // Store each file of at most this many bytes as a single block, whatever
@@ -60,6 +64,7 @@ struct CreateStats {
     std::uint64_t hardlinks = 0;
     std::uint64_t input_bytes = 0;
     std::uint64_t archive_bytes = 0;
+    std::uint64_t deduplicated_bytes = 0;    // uncompressed data not stored again
     std::uint64_t warnings = 0;
     bool solid = false;         // the solid form was kept
     bool dictionary = false;    // files were compressed with a trained dictionary

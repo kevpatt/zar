@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.2.1
+    VERSION 0.2.2
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 
@@ -50,6 +50,7 @@ add_library(libzar STATIC
     src/zar/archive_writer.cpp
     src/zar/compressor.cpp
     src/zar/crc32c.cpp
+    src/zar/dedup.cpp
     src/zar/dictionary.cpp
     src/zar/creator.cpp
     src/zar/extractor.cpp
@@ -64,6 +65,7 @@ set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 set(ZAR_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 configure_file(src/zar/version.hpp.in ${ZAR_GENERATED_DIR}/zar/version.hpp @ONLY)
 target_include_directories(libzar PUBLIC src ${ZAR_GENERATED_DIR})
+target_include_directories(libzar SYSTEM PRIVATE third_party/xxhash)
 find_package(Threads REQUIRED)
 target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads PRIVATE zar_warnings)
 
@@ -90,6 +92,7 @@ target_link_libraries(unzar PRIVATE libzar zar_build_info zar_warnings)
 
 install(TARGETS zar unzar RUNTIME DESTINATION bin)
 install(FILES LICENSE.txt README.md FORMAT.md DESTINATION share/doc/zar)
+install(FILES third_party/xxhash/LICENSE DESTINATION share/doc/zar RENAME LICENSE.xxhash)
 
 if(ZAR_BUILD_TESTS)
     enable_testing()

@@ -58,6 +58,8 @@ PATH is stored under its own name, so extracting recreates it:
       --all-times        store access, change, and birth times too
       --names=MODE       non-UTF-8 file names: raw (default), skip, latin1
       --compress-all     compress even files that are usually precompressed
+      --dedup            store identical chunks only once, such as the data
+                         of duplicate files
       --contiguous[=SIZE]
                          store each file of at most SIZE bytes as one block
                          instead of in chunks (with no SIZE, files up to 4G)
@@ -140,6 +142,7 @@ enum LongOnly {
     kHeadIndex,
     kSolid,
     kContiguous,
+    kDedup,
     kDict,
     kDictOverSolid,
     kVersion,
@@ -171,6 +174,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"head-index", no_argument, nullptr, kHeadIndex},
         {"solid", required_argument, nullptr, kSolid},
         {"contiguous", optional_argument, nullptr, kContiguous},
+        {"dedup", no_argument, nullptr, kDedup},
         {"dict", optional_argument, nullptr, kDict},
         {"dict-over-solid", required_argument, nullptr, kDictOverSolid},
         {"verbose", no_argument, nullptr, 'v'},
@@ -232,6 +236,7 @@ std::optional<Command> parse(int argc, char** argv)
             if (*opt.contiguous_limit > kMaxContiguous)
                 throw UsageError("--contiguous size can be at most 4G");
             break;
+        case kDedup: opt.dedup = true; break;
         case kDict:
             opt.dict_size = optarg ? parse_size(arg, "dictionary size") : zar::kDefaultDictSize;
             if (*opt.dict_size < (1 << 10) || *opt.dict_size > (1 << 30))
@@ -288,7 +293,10 @@ int run(Command& cmd)
                   << stats.symlinks << " symlinks, " << stats.hardlinks << " hard links: "
                   << zar::cli::human_size(stats.input_bytes) << " -> "
                   << zar::cli::human_size(stats.archive_bytes)
-                  << (stats.solid ? " (solid)" : stats.dictionary ? " (dictionary)" : "") << '\n';
+                  << (stats.solid ? " (solid)" : stats.dictionary ? " (dictionary)" : "");
+        if (stats.deduplicated_bytes)
+            std::cerr << ", " << zar::cli::human_size(stats.deduplicated_bytes) << " deduplicated";
+        std::cerr << '\n';
     }
     return stats.warnings ? 1 : 0;
 }

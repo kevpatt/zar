@@ -94,8 +94,9 @@ Output::Output(int fd, bool owns_fd, std::filesystem::path temp, std::filesystem
     if (::fstat(fd_, &st) == 0) {
         // pwrite() ignores the offset on O_APPEND descriptors, so treat those
         // (e.g. `zar -o - >> file`) as unseekable.
-        seekable_ = S_ISREG(st.st_mode) && ::lseek(fd_, 0, SEEK_CUR) == 0 &&
-                    !(::fcntl(fd_, F_GETFL) & O_APPEND);
+        const int flags = ::fcntl(fd_, F_GETFL);
+        seekable_ = S_ISREG(st.st_mode) && ::lseek(fd_, 0, SEEK_CUR) == 0 && !(flags & O_APPEND);
+        readable_ = seekable_ && (flags & O_ACCMODE) == O_RDWR;
         device_ = st.st_dev;
         inode_ = st.st_ino;
     }
@@ -190,6 +191,7 @@ Output::Output(Output&& other) noexcept
       buffer_(std::move(other.buffer_)),
       position_(other.position_),
       seekable_(other.seekable_),
+      readable_(other.readable_),
       device_(other.device_),
       inode_(other.inode_),
       zstd_(std::move(other.zstd_))
@@ -232,6 +234,22 @@ void Output::write_at(std::uint64_t position, ByteView bytes)
     if (::pwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(position)) !=
         static_cast<ssize_t>(bytes.size()))
         throw_errno(final_path_.string());
+}
+
+void Output::read_at(std::uint64_t position, std::span<std::uint8_t> out)
+{
+    if (!readable_)
+        throw std::logic_error("read_at() on an output that can't be read");
+    flush();
+    for (std::size_t done = 0; done < out.size();) {
+        const auto n = ::pread(fd_, out.data() + done, out.size() - done,
+                               static_cast<off_t>(position + done));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            throw_errno(final_path_.string());
+        done += static_cast<std::size_t>(n);
+    }
 }
 
 void Output::flush()

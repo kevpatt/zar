@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <sys/types.h>
 
@@ -51,6 +52,12 @@ public:
     // Overwrites already-written bytes; requires seekable().
     void write_at(std::uint64_t position, ByteView bytes);
 
+    // Whether read_at() works: a file opened for reading and writing, such as
+    // an archive's temporary file or a spool, but not a pipe.
+    bool readable() const noexcept { return readable_; }
+    // Reads back already-written bytes; requires readable().
+    void read_at(std::uint64_t position, std::span<std::uint8_t> out);
+
     // Flushes, syncs, and (for files) atomically moves the result into place.
     // A compressing output finishes its frame.
     void commit();
@@ -76,6 +83,7 @@ private:
     Bytes buffer_;
     std::uint64_t position_ = 0;
     bool seekable_ = false;
+    bool readable_ = false;
     dev_t device_ = 0;
     ino_t inode_ = 0;
     std::unique_ptr<Zstd> zstd_;

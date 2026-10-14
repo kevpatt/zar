@@ -28,6 +28,11 @@ public:
     // head_index in front of the base. Call it before write_block().
     std::int64_t write_dictionary(ByteView dict);
 
+    // Reads back the payload of a block written by write_block(), if
+    // can_read_back(): with head_index always, otherwise if the output allows.
+    bool can_read_back() const noexcept;
+    Bytes read_payload(std::int64_t offset, std::size_t size);
+
     // Writes the root index and the trailer. The zar header points to the
     // index too: to a copy at the front with head_index, otherwise (if the
     // output is seekable) to the same block the trailer references.
