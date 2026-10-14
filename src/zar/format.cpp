@@ -19,7 +19,7 @@ void seal(HeaderBytes& bytes)
 
 void check_seal(const HeaderBytes& bytes, const char* what)
 {
-    if (load_le<std::uint32_t>(&bytes[kCrcOffset]) != crc32c(ByteView(bytes).first(kCrcOffset)))
+    if (!crc_matches(load_le<std::uint32_t>(&bytes[kCrcOffset]), crc32c(ByteView(bytes).first(kCrcOffset))))
         throw FormatError(std::string(what) + " checksum mismatch");
 }
 
@@ -68,6 +68,8 @@ ArchiveHeader ArchiveHeader::decode(const HeaderBytes& bytes)
         throw FormatError("invalid alignment in zar header");
     if (header.base_offset % (1u << header.align_log2) != 0)
         throw FormatError("zar header base offset is not aligned");
+    if (header.base_offset != 0 && header.base_offset < kHeaderSize)
+        throw FormatError("zar header base offset falls inside the header");
     return header;
 }
 

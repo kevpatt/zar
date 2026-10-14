@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <sys/types.h>
 #include <vector>
 
 namespace zar {
@@ -25,7 +26,7 @@ enum class ExtractMode {
 // What to do with directories that already exist at the destination.
 enum class DirMode {
     Merge,      // keep them and extract into them
-    Replace,    // delete each existing top-level directory first
+    Replace,    // delete each existing directory being extracted whole first
 };
 
 struct ExtractOptions {
@@ -38,6 +39,7 @@ struct ExtractOptions {
     // the filesystem allows it, rather than extracting independent copies.
     bool hard_links = false;
     // The most file data to decompress (Extract and Test), checked up front.
+    // Without it, extraction is limited to the destination's free space.
     std::optional<std::uint64_t> size_limit;
     std::function<void(std::string_view)> on_warning;    // may be called from any thread
 };
@@ -63,6 +65,12 @@ struct DirectoryGroup {
 // Groups entries by directory: parents before children, everything sorted.
 std::vector<DirectoryGroup> group_by_directory(std::span<const Entry> entries);
 
+// The permission bits to give a file whose archived mode is `mode`.
+// Set-user-ID and set-group-ID bits are kept only if its owner was restored
+// from the archive (which needs root): otherwise they'd apply to whoever
+// is extracting.
+mode_t permitted_mode(std::uint16_t mode, bool owner_restored);
+
 // The last component of an entry's path.
 std::string_view base_name(std::string_view path);
 
@@ -73,9 +81,9 @@ public:
     ~Extractor();
 
     // Checks before anything is written. Throws if the files' total size
-    // exceeds options.size_limit, or if any path to be extracted already
-    // exists and options.overwrite isn't set. With DirMode::Replace, deletes
-    // existing top-level directories.
+    // exceeds options.size_limit (or the free space), or if any path to be
+    // extracted already exists and options.overwrite isn't set. With
+    // DirMode::Replace, deletes existing directories that are extracted whole.
     void prepare(std::span<const DirectoryGroup> groups);
 
     // Then call for each group in order, and for each of its members. File

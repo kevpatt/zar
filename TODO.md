@@ -38,12 +38,14 @@ maps native libraries straight out of an APK).
 
 - **Continuous integration.** Linux has never been built or tested. A
   GitHub Actions workflow could build and test on Linux and macOS, with a
-  sanitizer job, on every push. That would also cover the non-UTF-8 name
-  test, which skips itself on macOS because APFS refuses such names.
+  sanitizer job and a time-limited run of the libFuzzer target (`fuzz/`),
+  on every push. That would also cover the non-UTF-8 name test, which
+  skips itself on macOS because APFS refuses such names, and the runtime
+  check for ARM CRC instructions on Linux.
 - **Content-defined chunking for deduplication.** Deduplication only
   matches whole chunks at fixed boundaries, so a copy with one byte
-  inserted near the start shares nothing. Choosing chunk boundaries from the content (a
-  rolling hash, as restic and borg do) would fix that. It needs a format
+  inserted near the start shares nothing. Choosing chunk boundaries from
+  the content (a rolling hash, as restic and borg do) would fix that. It needs a format
   change: every chunk but the last is `CHUNK_SIZE` bytes, so variable-length
   chunks need a new field listing each chunk's length.
 - **Parallel file creation.** Extraction decompresses in parallel, but files

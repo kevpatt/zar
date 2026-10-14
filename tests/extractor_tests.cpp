@@ -8,6 +8,7 @@
 
 #include "zar/archive_reader.hpp"
 #include "zar/archive_writer.hpp"
+#include "zar/crc32c.hpp"
 #include "zar/creator.hpp"
 #include "zar/dedup.hpp"
 #include "zar/dictionary.hpp"
@@ -15,8 +16,11 @@
 
 #include <algorithm>
 #include <fcntl.h>
+#include <functional>
+#include <limits>
 #include <map>
 #include <random>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -72,12 +76,17 @@ struct Run {
     std::vector<std::string> warnings;
 };
 
-Run run(const fs::path& archive, ExtractOptions options)
+// Extracts the entries `select` accepts (all by default) from `reader`.
+Run run(ArchiveReader& reader, ExtractOptions options,
+        const std::function<bool(const Entry&)>& select = {})
 {
     Run result;
     options.on_warning = [&](std::string_view m) { result.warnings.emplace_back(m); };
-    auto reader = ArchiveReader::open(archive, options.on_warning);
-    const auto groups = group_by_directory(reader.entries());
+    std::vector<Entry> chosen;
+    for (const auto& entry : reader.entries())
+        if (!select || select(entry))
+            chosen.push_back(entry);
+    const auto groups = group_by_directory(chosen);
     Extractor extractor(reader, options);
     extractor.prepare(groups);
     for (const auto& group : groups) {
@@ -87,6 +96,12 @@ Run run(const fs::path& archive, ExtractOptions options)
     }
     result.stats = extractor.finish();
     return result;
+}
+
+Run run(const fs::path& archive, ExtractOptions options)
+{
+    auto reader = ArchiveReader::open(archive);
+    return run(reader, std::move(options));
 }
 
 ExtractOptions into(const fs::path& dir, ExtractMode mode = ExtractMode::Extract)
@@ -1066,4 +1081,312 @@ TEST(dedup_is_skipped_when_the_output_cannot_be_read_back)
     char byte;
     CHECK(::read(fds[0], &byte, 1) == 0);
     ::close(fds[0]);
+}
+
+// ---- hostile archives and races ---------------------------------------------
+
+namespace {
+
+constexpr std::uint64_t kGiB = std::uint64_t{1} << 30;
+
+void append(Bytes& out, ByteView bytes)
+{
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
+HeaderBytes block(BlockType type, std::uint64_t payload_size, std::int64_t offset, std::uint32_t crc = 0)
+{
+    BlockHeader h;
+    h.type = type;
+    h.payload_size = payload_size;
+    h.offset = offset;
+    h.payload_crc = crc;
+    return h.encode();
+}
+
+// The read end of a pipe holding `bytes`, which must fit in its buffer.
+int pipe_with(const Bytes& bytes)
+{
+    int fds[2];
+    if (::pipe(fds) != 0 || bytes.size() > 16'384 ||
+        ::write(fds[1], bytes.data(), bytes.size()) != static_cast<ssize_t>(bytes.size()))
+        throw std::runtime_error("pipe_with");
+    ::close(fds[1]);
+    return fds[0];
+}
+
+// A zstd frame that declares 4 GiB - 1 bytes of content but holds one: a
+// single one-byte RLE block.
+Bytes lying_frame()
+{
+    Bytes frame{0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0xff, 0xff, 0xff, 0xff};    // magic, single segment, size
+    append(frame, Bytes{0x0b, 0x00, 0x00, 0x00});    // last block, RLE, 1 byte: 0
+    return frame;
+}
+
+// The most memory this process has held at once, in bytes.
+std::uint64_t peak_memory()
+{
+    rusage usage{};
+    ::getrusage(RUSAGE_SELF, &usage);
+#ifdef __APPLE__
+    return static_cast<std::uint64_t>(usage.ru_maxrss);
+#else
+    return static_cast<std::uint64_t>(usage.ru_maxrss) * 1024;
+#endif
+}
+
+} // namespace
+
+TEST(stream_rejects_a_base_inside_the_header)
+{
+    // Once overflowed a 32-byte copy into an 8-byte buffer.
+    ArchiveHeader h;
+    h.index_offset = -8;
+    h.base_offset = 8;
+    Bytes bytes;
+    append(bytes, h.encode());
+    bytes.resize(bytes.size() + 64);
+    int fd = pipe_with(bytes);
+    CHECK_THROWS_WITH(ArchiveReader::open_stream(fd, "pipe"), "base offset");
+    ::close(fd);
+
+    // No base at all, but an index before it.
+    h.base_offset = 0;
+    bytes.clear();
+    append(bytes, h.encode());
+    bytes.resize(bytes.size() + 64);
+    fd = pipe_with(bytes);
+    CHECK_THROWS_WITH(ArchiveReader::open_stream(fd, "pipe"), "isn't at the head");
+    ::close(fd);
+}
+
+TEST(stream_blocks_cannot_claim_more_than_the_stream_holds)
+{
+    const auto before = peak_memory();
+
+    // A head index claiming a terabyte: once allocated (and zeroed) up front.
+    {
+        constexpr std::int64_t kBase = 64;
+        ArchiveHeader h;
+        h.index_offset = static_cast<std::int64_t>(kHeaderSize) - kBase;
+        h.base_offset = kBase;
+        Bytes bytes;
+        append(bytes, h.encode());
+        append(bytes, block(BlockType::IndexRaw, std::uint64_t{1} << 40, h.index_offset));
+        bytes.resize(bytes.size() + 64);
+        const int fd = pipe_with(bytes);
+        CHECK_THROWS_WITH(ArchiveReader::open_stream(fd, "pipe"), "extends past the end");
+        ::close(fd);
+    }
+
+    // A data block claiming 3 GiB in a stream that then ends.
+    {
+        auto file = make(EntryType::File, "f");
+        file.size = 3 * kGiB;
+        file.chunks = {0};
+        Bytes index;
+        encode_entry(index, file);
+        const auto base = (2 * kHeaderSize + index.size() + 7) / 8 * 8;
+
+        ArchiveHeader h;
+        h.index_offset = static_cast<std::int64_t>(kHeaderSize) - static_cast<std::int64_t>(base);
+        h.base_offset = static_cast<std::uint32_t>(base);
+        Bytes bytes;
+        append(bytes, h.encode());
+        append(bytes, block(BlockType::IndexRaw, index.size(), h.index_offset, crc32c(index)));
+        append(bytes, index);
+        bytes.resize(base);
+        append(bytes, block(BlockType::DataRaw, 3 * kGiB, 0));
+        bytes.resize(bytes.size() + 100);
+
+        const int fd = pipe_with(bytes);
+        auto reader = ArchiveReader::open_stream(fd, "pipe");
+        auto options = into({}, ExtractMode::Test);
+        options.size_limit = 4 * kGiB;
+        const auto result = run(reader, options);
+        ::close(fd);
+        CHECK(result.warnings.size() == 1 && result.warnings[0].find("truncated") != std::string::npos);
+    }
+    CHECK(peak_memory() < before + kGiB);
+}
+
+TEST(block_offsets_cannot_overflow)
+{
+    TempDir tmp;
+    const auto path = tmp.path() / "a.zar";
+    for (const auto offset : {std::numeric_limits<std::int64_t>::max() - 16,
+                              std::numeric_limits<std::int64_t>::min(), std::int64_t{-64}}) {
+        ArchiveHeader h;
+        h.index_offset = offset;
+        h.base_offset = 4096;
+        Bytes bytes;
+        append(bytes, h.encode());
+        bytes.resize(8192);
+        write_file(path, bytes);
+        CHECK_THROWS(ArchiveReader::open(path));
+    }
+}
+
+TEST(compressed_blocks_cannot_claim_more_than_they_hold)
+{
+    TempDir tmp;
+    const auto before = peak_memory();
+    const auto frame = lying_frame();
+
+    // An index.
+    {
+        ArchiveHeader h;
+        h.index_offset = static_cast<std::int64_t>(kHeaderSize);
+        Bytes bytes;
+        append(bytes, h.encode());
+        append(bytes, block(BlockType::IndexZstd, frame.size(), kHeaderSize, crc32c(frame)));
+        append(bytes, frame);
+        write_file(tmp.path() / "index.zar", bytes);
+        CHECK_THROWS(ArchiveReader::open(tmp.path() / "index.zar"));
+    }
+
+    // A file's chunk, checked (not extracted) with a generous size limit.
+    {
+        const auto path = tmp.path() / "chunk.zar";
+        auto out = Output::create_file(path, true);
+        ArchiveWriter writer(out, kAlignLog2Default);
+        auto file = make(EntryType::File, "f");
+        file.size = 4 * kGiB - 1;
+        file.chunks = {writer.write_block(BlockType::DataZstd, frame)};
+        Bytes index;
+        encode_entry(index, file);
+        writer.finish(BlockType::IndexRaw, index);
+        out.commit();
+
+        auto options = into({}, ExtractMode::Test);
+        options.size_limit = 8 * kGiB;
+        const auto result = run(path, options);
+        CHECK(result.warnings.size() == 1 &&
+              result.warnings[0].find("claims more data than it could hold") != std::string::npos);
+    }
+    CHECK(peak_memory() < before + kGiB);
+
+    // A genuine frame near zstd's limit still reads: zeros compress almost
+    // as far as the check allows.
+    {
+        write_file(tmp.path() / "src/zeros", Bytes(64 << 20));
+        const auto path = tmp.path() / "zeros.zar";
+        auto out = Output::create_file(path, true);
+        CreateOptions create;
+        create.level = 19;
+        create.contiguous_limit = 64 << 20;
+        create_archive(out, std::vector{tmp.path() / "src/."}, create);
+        out.commit();
+        CHECK(fs::file_size(path) < 4096);    // one tiny block
+        const auto dest = tmp.path() / "out";
+        CHECK(run(path, into(dest)).warnings.empty());
+        CHECK(read_file(dest / "zeros") == Bytes(64 << 20));
+    }
+}
+
+TEST(extraction_is_limited_to_the_free_space)
+{
+    TempDir tmp;
+    const auto path = tmp.path() / "big.zar";
+    {
+        // Claims an exabyte, which a small archive can describe.
+        auto out = Output::create_file(path, true);
+        ArchiveWriter writer(out, kAlignLog2Default);
+        auto file = make(EntryType::File, "f");
+        file.size = std::uint64_t{1} << 60;
+        file.chunks = {writer.write_block(BlockType::DataRaw, text("x"))};
+        Bytes index;
+        encode_entry(index, file);
+        writer.finish(BlockType::IndexRaw, index);
+        out.commit();
+    }
+    const auto dest = tmp.path() / "out";
+    CHECK_THROWS_WITH(run(path, into(dest)), "free space");
+    CHECK(!fs::exists(dest));
+
+    // An explicit limit replaces the free-space check; then the file itself fails.
+    auto options = into(dest);
+    options.size_limit = std::uint64_t{1} << 62;
+    CHECK(run(path, options).warnings.size() == 1);
+}
+
+TEST(replacing_directories_spares_what_was_not_selected)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "src/a/b/f", text("f"));
+    write_file(tmp.path() / "src/a/c/g", text("g"));
+    const auto archive = make_archive(tmp.path() / "a.zar", tmp.path() / "src");
+    const auto dest = tmp.path() / "out";
+    write_file(dest / "a/keep/data", text("precious"));
+    write_file(dest / "a/b/stale", text("stale"));
+
+    auto options = into(dest);
+    options.overwrite = true;
+    options.dirs = DirMode::Replace;
+    auto reader = ArchiveReader::open(archive);
+    const auto result = run(reader, options, [](const Entry& e) {
+        return e.path == "a/b" || e.path.starts_with("a/b/");
+    });
+    CHECK(result.warnings.empty());
+    CHECK(read_file(dest / "a/b/f") == text("f"));
+    CHECK(!fs::exists(dest / "a/b/stale"));             // a/b was extracted whole: replaced
+    CHECK(read_file(dest / "a/keep/data") == text("precious"));    // a was not
+    CHECK(!fs::exists(dest / "a/c"));
+}
+
+TEST(a_broken_stream_is_reported_once)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    for (unsigned i = 0; i < 20; ++i)
+        write_file(src / ("f" + std::to_string(i)), random_bytes(3 * 4096, i));
+    const auto archive = tmp.path() / "head.zar";
+    {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.head_index = true;
+        options.chunk_size = 4096;
+        create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+    }
+    const auto bytes = read_file(archive);
+
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        int fds[2];
+        CHECK(::pipe(fds) == 0);
+        std::jthread feeder([&, fd = fds[1]] {
+            // Three fifths of it, then the stream breaks.
+            const auto end = bytes.size() * 3 / 5;
+            for (std::size_t done = 0; done < end;) {
+                const auto n = ::write(fd, bytes.data() + done, std::min<std::size_t>(8192, end - done));
+                if (n <= 0)
+                    break;
+                done += static_cast<std::size_t>(n);
+            }
+            ::close(fd);
+        });
+        auto reader = ArchiveReader::open_stream(fds[0], "pipe");
+        const auto dest = tmp.path() / ("out" + std::to_string(attempt));
+        auto options = into(dest);
+        options.threads = 4;
+        const auto result = run(reader, options);
+        feeder.join();
+        ::close(fds[0]);
+
+        CHECK(result.warnings.size() == 1 &&
+              result.warnings[0].find("not extracted") != std::string::npos);
+        CHECK(result.stats.files > 0 && result.stats.files < 20);
+        for (unsigned i = 0; i < 20; ++i)
+            if (fs::exists(dest / ("f" + std::to_string(i))))
+                CHECK(read_file(dest / ("f" + std::to_string(i))) == random_bytes(3 * 4096, i));
+    }
+}
+
+TEST(set_id_bits_need_a_restored_owner)
+{
+    CHECK(permitted_mode(04755, false) == 0755);
+    CHECK(permitted_mode(02775, false) == 0775);
+    CHECK(permitted_mode(01777, false) == 01777);
+    CHECK(permitted_mode(06755, true) == 06755);
 }

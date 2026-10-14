@@ -11,6 +11,7 @@
 #include "zar/index.hpp"
 #include "zar/names.hpp"
 #include "zar/policy.hpp"
+#include "zar/posix.hpp"
 #include "zar/thread_pool.hpp"
 
 #include <algorithm>
@@ -18,15 +19,14 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
-#include <grp.h>
 #include <map>
 #include <optional>
-#include <pwd.h>
 #include <set>
-#include <unordered_map>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <system_error>
 #include <unistd.h>
+#include <unordered_map>
 
 namespace zar {
 namespace {
@@ -48,57 +48,6 @@ std::optional<timespec> btime_of(const struct stat&) { return std::nullopt; }
 #endif
 
 std::string errno_text() { return std::strerror(errno); }
-
-class FileDescriptor {
-public:
-    explicit FileDescriptor(int fd) : fd_(fd) {}
-    ~FileDescriptor() { if (fd_ >= 0) ::close(fd_); }
-    FileDescriptor(const FileDescriptor&) = delete;
-    FileDescriptor& operator=(const FileDescriptor&) = delete;
-    int get() const { return fd_; }
-    explicit operator bool() const { return fd_ >= 0; }
-
-private:
-    int fd_;
-};
-
-// Reads until `buffer` is full or EOF. Returns the byte count, or nullopt on error.
-std::optional<std::size_t> read_fully(int fd, std::span<std::uint8_t> buffer)
-{
-    std::size_t total = 0;
-    while (total < buffer.size()) {
-        const auto n = ::read(fd, buffer.data() + total, buffer.size() - total);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return std::nullopt;
-        }
-        if (n == 0)
-            break;
-        total += static_cast<std::size_t>(n);
-    }
-    return total;
-}
-
-std::optional<std::string> user_name(uid_t uid)
-{
-    std::vector<char> buffer(4096);
-    struct passwd pw {};
-    struct passwd* result = nullptr;
-    if (::getpwuid_r(uid, &pw, buffer.data(), buffer.size(), &result) != 0 || !result)
-        return std::nullopt;
-    return std::string(result->pw_name);
-}
-
-std::optional<std::string> group_name(gid_t gid)
-{
-    std::vector<char> buffer(4096);
-    struct group gr {};
-    struct group* result = nullptr;
-    if (::getgrgid_r(gid, &gr, buffer.data(), buffer.size(), &result) != 0 || !result)
-        return std::nullopt;
-    return std::string(result->gr_name);
-}
 
 std::string without_trailing_slashes(std::string path)
 {
@@ -149,8 +98,9 @@ public:
           compressor_(options.level, threads_),
           dict_(dict)
     {
-        if (pass_ != Pass::Sample)
-            writer_.emplace(out, options.align_log2, options.head_index);
+        if (pass_ == Pass::Sample)
+            return;    // writes nothing
+        writer_.emplace(out, options.align_log2, options.head_index);
         // Neither a pipe nor a solid archive's frame can be read back; in a
         // solid archive, zstd finds repeats itself.
         dedup_ = options.dedup.value_or(true) && pass_ == Pass::Normal && writer_->can_read_back();
@@ -296,8 +246,8 @@ void Creator::add_input(const InputSpec& input)
 
 void Creator::add(const fs::path& path, const Name& name, const struct stat& st)
 {
-    if (st.st_dev == identity_.device() && st.st_ino == identity_.inode())
-        return;    // the archive being written
+    if (identity_.is_file(st.st_dev, st.st_ino))
+        return;    // the archive being written, or the one it replaces
 
     if (check_duplicates_) {
         const auto [it, inserted] = origins_.try_emplace(name.path, path.string());
@@ -368,9 +318,18 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
         }
     }
 
-    const FileDescriptor fd(::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
+    if (before_open_for_test)
+        before_open_for_test(path);
+    // Without O_NONBLOCK, a FIFO swapped in since lstat() would block forever.
+    const UniqueFd fd(::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
     if (!fd) {
         warn(path.string() + ": " + errno_text());
+        return;
+    }
+    struct stat opened {};
+    if (::fstat(fd.get(), &opened) != 0 || !S_ISREG(opened.st_mode) || opened.st_dev != st.st_dev ||
+        opened.st_ino != st.st_ino) {
+        warn(path.string() + ": skipped; it was replaced while being archived");
         return;
     }
     if (options_.on_entry)
@@ -378,28 +337,34 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
 
     // Chunk block offsets are filled in as the compressed blocks are written.
     const std::size_t index = entries_.size();
-    entries_.push_back(make_entry(EntryType::File, name, st));
+    entries_.push_back(make_entry(EntryType::File, name, opened));
 
     const bool compressible = options_.compress_all || !is_precompressed(name.path);
     const bool compress = compressible && pass_ == Pass::Normal;
-    const auto expected = static_cast<std::uint64_t>(st.st_size);
+    const auto expected = static_cast<std::uint64_t>(opened.st_size);
     const bool contiguous = options_.contiguous_limit && expected <= *options_.contiguous_limit;
     const auto chunk_size = contiguous ? std::max<std::uint64_t>(expected, 1) : options_.chunk_size;
     std::uint64_t total = 0;
     std::uint64_t chunk_count = 0;
     std::uint32_t crc = 0;
+    const auto read = [&](std::span<std::uint8_t> buffer) -> std::optional<std::size_t> {
+        try {
+            return read_full(fd.get(), buffer, path.string());
+        } catch (const std::system_error& e) {
+            warn(std::string(e.what()) + "; skipped");
+            dropped_.insert(index);
+            return std::nullopt;
+        }
+    };
 
     // Archive exactly the size stat() reported, so every chunk but the last is
     // full (§6.5) even if the file changes while we read it.
     while (total < expected) {
         const auto want = static_cast<std::size_t>(std::min(chunk_size, expected - total));
         Bytes chunk(want);
-        const auto n = read_fully(fd.get(), chunk);
-        if (!n) {
-            warn(path.string() + ": " + errno_text() + "; skipped");
-            dropped_.insert(index);
+        const auto n = read(chunk);
+        if (!n)
             return;
-        }
         chunk.resize(*n);
         if (!chunk.empty()) {
             crc = crc32c(crc, chunk);
@@ -416,7 +381,15 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
             break;
         }
     }
-    if (std::uint8_t probe; total == expected && read_fully(fd.get(), {&probe, 1}).value_or(0) > 0)
+    const auto grew = [&] {
+        try {
+            std::uint8_t probe;
+            return read_full(fd.get(), {&probe, 1}, path.string()) > 0;
+        } catch (const std::system_error&) {
+            return false;    // it was read in full; this was only a check
+        }
+    };
+    if (total == expected && grew())
         warn(path.string() + ": file grew while being read; archived the first " +
              std::to_string(total) + " bytes");
 

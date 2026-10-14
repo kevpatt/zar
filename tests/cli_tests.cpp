@@ -33,3 +33,14 @@ TEST(size_arguments)
     CHECK_THROWS(parse_size("M", "x"));
     CHECK_THROWS(parse_size("99999999999T", "x"));
 }
+
+TEST(printable_names_cannot_control_the_terminal)
+{
+    using zar::cli::printable;
+    CHECK(printable("plain/name.txt") == "plain/name.txt");
+    CHECK(printable("caf\xc3\xa9") == "caf\xc3\xa9");                     // valid UTF-8 is kept
+    CHECK(printable("x\x1b[31mred") == "x\\x1b[31mred");                   // escape sequences aren't
+    CHECK(printable("tab\there\nnew") == "tab\\x09here\\x0anew");
+    CHECK(printable("back\\slash") == "back\\\\slash");
+    CHECK(printable("latin\xe9") == "latin\\xe9");                         // not UTF-8: bytes escaped
+}

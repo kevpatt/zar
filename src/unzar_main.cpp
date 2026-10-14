@@ -41,14 +41,17 @@ archives created with zar --head-index.
   -t, --test             like --scan, but also decompress and verify data
   -y, --yes              overwrite files and directories that already exist
       --dirs=MODE        existing directories: merge (default) extracts into
-                         them; replace deletes them first. Either needs -y.
+                         them; replace first deletes each one that is
+                         extracted whole. Either needs -y.
       --hard-links       recreate hard links as links, where their targets
                          are extracted too (default: independent copies)
   -j, --threads[=N]      worker threads (default: one per CPU core)
       --max-size=SIZE    refuse to decompress more than SIZE bytes in all
                          (e.g. 10G): the selected files' total is checked
                          before anything is written, and a solid archive
-                         stops decompressing once it passes SIZE
+                         stops decompressing once it passes SIZE. Without
+                         it, the limit is the free space where the data
+                         would go.
   -h, --human-readable   show sizes as 512, 1.0K, 31.4M, 2.0G, ...
   -v, --verbose          with --list, also show permissions and owner;
                          print a summary at the end
@@ -61,6 +64,7 @@ given. --list combines with any mode: `unzar --list --scan` lists an
 archive while checking it, without extracting.
 )";
 
+using zar::cli::printable;
 using zar::cli::UsageError;
 
 struct Command {
@@ -142,29 +146,6 @@ std::optional<Command> parse(int argc, char** argv)
         cmd.selections.push_back(std::move(selection));
     }
     return cmd;
-}
-
-// Escapes control characters, backslashes, and (in names that aren't valid
-// UTF-8) non-ASCII bytes, so every name prints on one line without
-// disturbing the tab-separated columns.
-std::string printable(std::string_view name)
-{
-    const bool utf8 = zar::is_valid_utf8(name);
-    std::string out;
-    for (const char c : name) {
-        const auto byte = static_cast<unsigned char>(c);
-        if (byte == '\\') {
-            out += "\\\\";
-        } else if (byte < 0x20 || byte == 0x7f || (!utf8 && byte >= 0x80)) {
-            constexpr char kHex[] = "0123456789abcdef";
-            out += "\\x";
-            out += kHex[byte >> 4];
-            out += kHex[byte & 0xf];
-        } else {
-            out += c;
-        }
-    }
-    return out;
 }
 
 std::string format_time(const std::optional<zar::Timestamp>& t)
@@ -271,14 +252,20 @@ zar::ArchiveReader open_archive(const std::string& archive,
     return zar::ArchiveReader::open_stream(STDIN_FILENO, "standard input", warn, size_limit);
 }
 
+// Archive paths are untrusted: escaped, they can't send terminal controls.
+void print_warning(std::string_view message)
+{
+    std::cerr << "unzar: " << printable(message) << '\n';
+}
+
 int run(Command& cmd)
 {
-    std::uint64_t warnings = 0;
+    std::uint64_t warnings = 0;    // besides the extractor's, which it counts
     const auto warn = [&](std::string_view message) {
         ++warnings;
-        std::cerr << "unzar: " << message << '\n';
+        print_warning(message);
     };
-    cmd.options.on_warning = warn;
+    cmd.options.on_warning = print_warning;
 
     auto reader = open_archive(cmd.archive, warn, cmd.options.size_limit);
 
@@ -306,6 +293,7 @@ int run(Command& cmd)
         }
     }
     const auto stats = extractor.finish();
+    warnings += stats.warnings;
 
     if (cmd.verbose) {
         const char* verb = cmd.options.mode == zar::ExtractMode::Extract ? "extracted"
@@ -334,7 +322,7 @@ int main(int argc, char** argv)
         std::cerr << "Try 'unzar --help' for more information.\n";
         return 2;
     } catch (const std::exception& e) {
-        std::cerr << "unzar: " << e.what() << '\n';
+        print_warning(e.what());
         return 2;
     }
 }

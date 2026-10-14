@@ -24,7 +24,9 @@ struct Version {
     std::string to_string() const;
 };
 
-inline constexpr Version kFormatVersion{0, 2, 5};
+// The version of FORMAT.md this implements. It changes only when the format
+// does, independently of the program's version (CMakeLists.txt).
+inline constexpr Version kFormatVersion{0, 3, 6};
 
 inline constexpr std::size_t kHeaderSize = 32;        // zar and block headers
 inline constexpr std::size_t kTrailerSize = kHeaderSize + 16;
@@ -96,7 +98,7 @@ struct ArchiveHeader {
     std::uint32_t base_offset = 0;
 
     HeaderBytes encode() const;
-    // Validates magic, CRC, flags, major version, and alignment.
+    // Validates magic, CRC, flags, major version, alignment, and base offset.
     static ArchiveHeader decode(const HeaderBytes& bytes);
 };
 

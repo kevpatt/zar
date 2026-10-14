@@ -3,9 +3,12 @@
 
 #include "zar/output.hpp"
 
+#include "zar/crc32c.hpp"
+#include "zar/posix.hpp"
+
 #include <algorithm>
 #include <cerrno>
-#include <cstdlib>
+#include <cstdio>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -15,37 +18,37 @@
 #include <utility>
 #include <zstd.h>
 
-#include "zar/crc32c.hpp"
-
 namespace zar {
 namespace {
 
 constexpr std::size_t kBufferSize = 1 << 20;
-
-[[noreturn]] void throw_errno(const std::string& what)
-{
-    throw std::system_error(errno, std::generic_category(), what);
-}
-
-void write_all(int fd, const std::uint8_t* data, std::size_t size, const std::string& name)
-{
-    while (size) {
-        const auto n = ::write(fd, data, size);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            throw_errno(name);
-        }
-        data += n;
-        size -= static_cast<std::size_t>(n);
-    }
-}
 
 mode_t current_umask()
 {
     const mode_t mask = ::umask(0);
     ::umask(mask);
     return mask;
+}
+
+// Renames `from` to `to` unless `to` exists, atomically where the system
+// can; otherwise link() provides the same guarantee.
+int rename_exclusive(const char* from, const char* to)
+{
+#if defined(__APPLE__)
+    if (::renamex_np(from, to, RENAME_EXCL) == 0)
+        return 0;
+    if (errno != ENOTSUP && errno != EINVAL)
+        return -1;
+#elif defined(__linux__) && defined(RENAME_NOREPLACE)
+    if (::renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE) == 0)
+        return 0;
+    if (errno != ENOSYS && errno != EINVAL)
+        return -1;
+#endif
+    if (::link(from, to) != 0)
+        return -1;
+    ::unlink(from);
+    return 0;
 }
 
 } // namespace
@@ -91,20 +94,21 @@ Output::Output(int fd, bool owns_fd, std::filesystem::path temp, std::filesystem
 {
     buffer_.reserve(kBufferSize);
     struct stat st {};
-    if (::fstat(fd_, &st) == 0) {
+    if (fd_ >= 0 && ::fstat(fd_, &st) == 0) {
         // pwrite() ignores the offset on O_APPEND descriptors, so treat those
         // (e.g. `zar -o - >> file`) as unseekable.
         const int flags = ::fcntl(fd_, F_GETFL);
         seekable_ = S_ISREG(st.st_mode) && ::lseek(fd_, 0, SEEK_CUR) == 0 && !(flags & O_APPEND);
         readable_ = seekable_ && (flags & O_ACCMODE) == O_RDWR;
-        device_ = st.st_dev;
-        inode_ = st.st_ino;
+        self_ = FileId{st.st_dev, st.st_ino};
     }
 }
 
 Output Output::create_file(const std::filesystem::path& path, bool overwrite)
 {
-    if (!overwrite && std::filesystem::exists(std::filesystem::symlink_status(path)))
+    struct stat existing {};
+    const bool exists = ::lstat(path.c_str(), &existing) == 0;
+    if (exists && !overwrite)
         throw std::runtime_error(path.string() + " already exists (use -y to overwrite)");
 
     std::string temp = path.string() + ".XXXXXX";
@@ -112,7 +116,11 @@ Output Output::create_file(const std::filesystem::path& path, bool overwrite)
     if (fd < 0)
         throw_errno(path.string());
     ::fchmod(fd, 0666 & ~current_umask());    // mkstemp creates 0600
-    return Output(fd, true, temp, path);
+    Output out(fd, true, temp, path);
+    out.replace_ = overwrite;
+    if (exists)
+        out.replaced_ = FileId{existing.st_dev, existing.st_ino};
+    return out;
 }
 
 Output Output::standard_output()
@@ -126,8 +134,8 @@ Output Output::compressing(Output& dest, int level, unsigned threads, std::uint6
                            const Output& identity)
 {
     Output out(-1, false, {}, "compressed output");
-    out.device_ = identity.device_;
-    out.inode_ = identity.inode_;
+    out.self_ = identity.self_;
+    out.replaced_ = identity.replaced_;
     out.zstd_ = std::make_unique<Zstd>();
     auto& z = *out.zstd_;
     if (!z.cctx)
@@ -142,6 +150,12 @@ Output Output::compressing(Output& dest, int level, unsigned threads, std::uint6
     return out;
 }
 
+bool Output::is_file(dev_t device, ino_t inode) const noexcept
+{
+    const FileId id{device, inode};
+    return id == self_ || id == replaced_;
+}
+
 std::uint32_t Output::compressed_crc() const noexcept
 {
     return zstd_ ? zstd_->crc : 0;
@@ -149,22 +163,10 @@ std::uint32_t Output::compressed_crc() const noexcept
 
 Output Output::make_spool() const
 {
-    std::filesystem::path dir;
-    if (!temp_path_.empty()) {
-        dir = final_path_.parent_path();
-    } else {
-        const char* tmpdir = std::getenv("TMPDIR");
-        dir = tmpdir && *tmpdir ? tmpdir : "/tmp";
-    }
+    auto dir = temp_path_.empty() ? temp_directory() : final_path_.parent_path();
     if (dir.empty())
         dir = ".";
-
-    std::string temp = (dir / ".zar-spool-XXXXXX").string();
-    const int fd = ::mkstemp(temp.data());
-    if (fd < 0)
-        throw_errno(temp);
-    ::unlink(temp.c_str());    // anonymous: gone as soon as it's closed
-    return Output(fd, true, {}, "temporary file");
+    return Output(anonymous_temp_file(dir, ".zar-spool-").release(), true, {}, "temporary file");
 }
 
 void Output::copy_to(Output& dest)
@@ -173,13 +175,10 @@ void Output::copy_to(Output& dest)
     Bytes chunk(kBufferSize);
     for (std::uint64_t done = 0; done < position_;) {
         const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(chunk.size(), position_ - done));
-        const auto n = ::pread(fd_, chunk.data(), want, static_cast<off_t>(done));
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            throw_errno(final_path_.string());
-        dest.write({chunk.data(), static_cast<std::size_t>(n)});
-        done += static_cast<std::uint64_t>(n);
+        if (pread_full(fd_, std::span(chunk).first(want), done, final_path_.string()) != want)
+            throw std::runtime_error(final_path_.string() + ": ended early");
+        dest.write(std::span(chunk).first(want));
+        done += want;
     }
 }
 
@@ -192,8 +191,9 @@ Output::Output(Output&& other) noexcept
       position_(other.position_),
       seekable_(other.seekable_),
       readable_(other.readable_),
-      device_(other.device_),
-      inode_(other.inode_),
+      replace_(other.replace_),
+      self_(other.self_),
+      replaced_(other.replaced_),
       zstd_(std::move(other.zstd_))
 {
     other.temp_path_.clear();
@@ -231,9 +231,7 @@ void Output::write_zeros(std::size_t count)
 void Output::write_at(std::uint64_t position, ByteView bytes)
 {
     flush();
-    if (::pwrite(fd_, bytes.data(), bytes.size(), static_cast<off_t>(position)) !=
-        static_cast<ssize_t>(bytes.size()))
-        throw_errno(final_path_.string());
+    pwrite_all(fd_, bytes, position, final_path_.string());
 }
 
 void Output::read_at(std::uint64_t position, std::span<std::uint8_t> out)
@@ -241,15 +239,8 @@ void Output::read_at(std::uint64_t position, std::span<std::uint8_t> out)
     if (!readable_)
         throw std::logic_error("read_at() on an output that can't be read");
     flush();
-    for (std::size_t done = 0; done < out.size();) {
-        const auto n = ::pread(fd_, out.data() + done, out.size() - done,
-                               static_cast<off_t>(position + done));
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n <= 0)
-            throw_errno(final_path_.string());
-        done += static_cast<std::size_t>(n);
-    }
+    if (pread_full(fd_, out, position, final_path_.string()) != out.size())
+        throw std::runtime_error(final_path_.string() + ": read past the end of what was written");
 }
 
 void Output::flush()
@@ -263,7 +254,7 @@ void Output::emit(ByteView bytes)
     if (zstd_)
         zstd_->feed(bytes, ZSTD_e_continue);
     else
-        write_all(fd_, bytes.data(), bytes.size(), final_path_.string());
+        write_all(fd_, bytes, final_path_.string());
 }
 
 void Output::commit()
@@ -278,7 +269,11 @@ void Output::commit()
         throw_errno(final_path_.string());
     }
     fd_ = -1;
-    if (::rename(temp_path_.c_str(), final_path_.c_str()) != 0)
+    const auto rc = replace_ ? ::rename(temp_path_.c_str(), final_path_.c_str())
+                             : rename_exclusive(temp_path_.c_str(), final_path_.c_str());
+    if (rc != 0 && errno == EEXIST && !replace_)
+        throw std::runtime_error(final_path_.string() + " already exists (use -y to overwrite)");
+    if (rc != 0)
         throw_errno(final_path_.string());
     temp_path_.clear();
 }

@@ -130,6 +130,11 @@ TEST(archive_header_rejects_damage)
     unaligned_base.align_log2 = 6;
     unaligned_base.base_offset = 32;
     CHECK_THROWS(ArchiveHeader::decode(unaligned_base.encode()));
+
+    // The base can't fall inside the zar header itself (§2.2).
+    ArchiveHeader base_in_header;
+    base_in_header.base_offset = 8;
+    CHECK_THROWS(ArchiveHeader::decode(base_in_header.encode()));
 }
 
 TEST(archive_header_accepts_tight_packing)
@@ -137,7 +142,7 @@ TEST(archive_header_accepts_tight_packing)
     for (std::uint8_t log2 = 0; log2 < 3; ++log2) {
         ArchiveHeader h;
         h.align_log2 = log2;
-        h.base_offset = 3u << log2;
+        h.base_offset = kHeaderSize + (3u << log2);
         CHECK(ArchiveHeader::decode(h.encode()).align_log2 == log2);
     }
 }

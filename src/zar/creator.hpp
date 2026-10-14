@@ -103,4 +103,8 @@ std::filesystem::path default_archive_path(const InputSpec& input);
 CreateStats create_archive(Output& out, std::span<const std::filesystem::path> inputs,
                            const CreateOptions& options);
 
+// For tests: called just before each file is opened to be read, so a test
+// can change it at that moment.
+inline void (*before_open_for_test)(const std::filesystem::path&) = nullptr;
+
 } // namespace zar

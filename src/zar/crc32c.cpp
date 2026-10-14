@@ -6,9 +6,14 @@
 #include <array>
 #include <cstring>
 
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
 #include <arm_acle.h>
 #define ZAR_CRC32C_ARM 1
+#if !defined(__ARM_FEATURE_CRC32) && defined(__linux__)
+#include <sys/auxv.h>
+#elif !defined(__ARM_FEATURE_CRC32) && defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #include <nmmintrin.h>
 #define ZAR_CRC32C_X86 1
@@ -40,7 +45,8 @@ constexpr auto kTable = [] {
 
 #if ZAR_CRC32C_ARM
 
-std::uint32_t update(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept
+__attribute__((target("crc")))
+std::uint32_t update_arm(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept
 {
     for (; n >= 8; p += 8, n -= 8) {
         std::uint64_t word;
@@ -50,6 +56,29 @@ std::uint32_t update(std::uint32_t crc, const std::uint8_t* p, std::size_t n) no
     for (; n; ++p, --n)
         crc = __crc32cb(crc, *p);
     return crc;
+}
+
+// The CRC instructions are optional in ARMv8.0, so unless the compiler was
+// told they're there, ask the system.
+bool has_arm_crc() noexcept
+{
+#if defined(__ARM_FEATURE_CRC32)
+    return true;
+#elif defined(__linux__) && defined(HWCAP_CRC32)
+    return (::getauxval(AT_HWCAP) & HWCAP_CRC32) != 0;
+#elif defined(__APPLE__)
+    int value = 0;
+    std::size_t length = sizeof value;
+    return ::sysctlbyname("hw.optional.armv8_crc32", &value, &length, nullptr, 0) == 0 && value;
+#else
+    return false;
+#endif
+}
+
+std::uint32_t update(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept
+{
+    static const bool has_crc = has_arm_crc();
+    return has_crc ? update_arm(crc, p, n) : update_portable(crc, p, n);
 }
 
 #elif ZAR_CRC32C_X86

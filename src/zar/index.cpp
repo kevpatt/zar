@@ -7,6 +7,7 @@
 
 #include <limits>
 #include <set>
+#include <utility>
 
 namespace zar {
 namespace {
@@ -155,17 +156,26 @@ Entry decode_entry(std::uint8_t type, std::uint8_t flags, ByteView body)
 
     bool have_path = false;
     std::optional<std::uint32_t> mtime_ns, atime_ns, ctime_ns, btime_ns;
-    std::set<Tag> seen;
+    // Tags seen so far: every known tag is below 64; others are rare.
+    std::uint64_t seen_low = 0;
+    std::set<std::uint64_t> seen_high;
+    const auto first_sight = [&](std::uint64_t tag) {
+        if (tag >= 64)
+            return seen_high.insert(tag).second;
+        const auto bit = std::uint64_t{1} << tag;
+        return !(std::exchange(seen_low, seen_low | bit) & bit);
+    };
 
     while (!body.empty()) {
-        const auto tag = static_cast<Tag>(read_varint(body));
+        const auto raw_tag = read_varint(body);
+        const auto tag = static_cast<Tag>(raw_tag);
         const auto length = read_varint(body);
         if (length > body.size())
             throw FormatError("index field overruns its entry");
         const auto value = body.first(static_cast<std::size_t>(length));
         body = body.subspan(static_cast<std::size_t>(length));
 
-        if (!seen.insert(tag).second)
+        if (!first_sight(raw_tag))
             throw FormatError("index entry repeats a field");
 
         switch (tag) {

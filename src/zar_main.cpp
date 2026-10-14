@@ -85,6 +85,7 @@ PATH is stored under its own name, so extracting recreates it:
 )";
 
 using zar::cli::parse_number;
+using zar::cli::printable;
 using zar::cli::parse_size;
 using zar::cli::UsageError;
 
@@ -133,8 +134,7 @@ struct Command {
 };
 
 enum LongOnly {
-    kHelp = 255,
-    kChunkSize = 256,
+    kChunkSize = 256,    // past every short option
     kAlign,
     kOwner,
     kNsec,
@@ -147,6 +147,7 @@ enum LongOnly {
     kDedup,
     kDict,
     kDictOverSolid,
+    kHelp,
     kVersion,
 };
 
@@ -286,11 +287,12 @@ std::optional<Command> parse(int argc, char** argv)
 
 int run(Command& cmd)
 {
+    // File names can hold anything, including terminal control sequences.
     cmd.options.on_warning = [](std::string_view message) {
-        std::cerr << "zar: " << message << '\n';
+        std::cerr << "zar: " << printable(message) << '\n';
     };
     if (cmd.verbose)
-        cmd.options.on_entry = [](std::string_view path) { std::cerr << path << '\n'; };
+        cmd.options.on_entry = [](std::string_view path) { std::cerr << printable(path) << '\n'; };
 
     auto out = cmd.output == "-" ? zar::Output::standard_output()
                                  : zar::Output::create_file(cmd.output, cmd.overwrite);
@@ -323,7 +325,7 @@ int main(int argc, char** argv)
         std::cerr << "Try 'zar --help' for more information.\n";
         return 2;
     } catch (const std::exception& e) {
-        std::cerr << "zar: " << e.what() << '\n';
+        std::cerr << "zar: " << printable(e.what()) << '\n';
         return 2;
     }
 }

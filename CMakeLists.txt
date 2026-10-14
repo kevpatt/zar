@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.2.5
+    VERSION 0.3.6
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 
@@ -59,6 +59,7 @@ add_library(libzar STATIC
     src/zar/names.cpp
     src/zar/output.cpp
     src/zar/policy.cpp
+    src/zar/posix.cpp
     src/zar/thread_pool.cpp)
 set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 
@@ -90,9 +91,33 @@ target_link_libraries(zar PRIVATE libzar zar_build_info zar_warnings)
 add_executable(unzar src/unzar_main.cpp)
 target_link_libraries(unzar PRIVATE libzar zar_build_info zar_warnings)
 
-install(TARGETS zar unzar RUNTIME DESTINATION bin)
-install(FILES LICENSE.txt README.md FORMAT.md DESTINATION share/doc/zar)
-install(FILES third_party/xxhash/LICENSE DESTINATION share/doc/zar RENAME LICENSE.xxhash)
+option(ZAR_BUILD_FUZZERS "Build the fuzz target; this disables CRC checks, so such a build is never installed" OFF)
+if(ZAR_BUILD_FUZZERS)
+    target_compile_definitions(libzar PUBLIC FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+    add_executable(zar_fuzz fuzz/fuzz_archive.cpp)
+    target_link_libraries(zar_fuzz PRIVATE libzar zar_warnings)
+
+    # libFuzzer if the compiler has it (Apple's doesn't); otherwise the
+    # target's own driver.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS -fsanitize=fuzzer)
+    check_cxx_source_compiles([[
+        #include <cstddef>
+        #include <cstdint>
+        extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }
+    ]] ZAR_HAVE_LIBFUZZER)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(ZAR_HAVE_LIBFUZZER)
+        target_compile_options(zar_fuzz PRIVATE -fsanitize=fuzzer)
+        target_link_options(zar_fuzz PRIVATE -fsanitize=fuzzer)
+    else()
+        target_compile_definitions(zar_fuzz PRIVATE ZAR_FUZZ_STANDALONE)
+    endif()
+else()
+    install(TARGETS zar unzar RUNTIME DESTINATION bin)
+    install(FILES LICENSE.txt README.md FORMAT.md DESTINATION share/doc/zar)
+    install(FILES third_party/xxhash/LICENSE DESTINATION share/doc/zar RENAME LICENSE.xxhash)
+endif()
 
 if(ZAR_BUILD_TESTS)
     enable_testing()
@@ -102,6 +127,7 @@ if(ZAR_BUILD_TESTS)
         tests/format_tests.cpp
         tests/index_tests.cpp
         tests/policy_tests.cpp
+        tests/posix_tests.cpp
         tests/writer_tests.cpp
         tests/extractor_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)

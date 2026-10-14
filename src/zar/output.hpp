@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <sys/types.h>
@@ -22,7 +23,7 @@ struct SizeLimitExceeded : std::runtime_error {
 class Output {
 public:
     // Writes to a temporary file beside `path`; commit() renames it into place.
-    // Without overwrite, fails if `path` already exists.
+    // Without overwrite, fails if `path` already exists, now or at commit().
     static Output create_file(const std::filesystem::path& path, bool overwrite);
     static Output standard_output();
 
@@ -32,8 +33,8 @@ public:
 
     // An output that compresses everything written to it, as a single zstd
     // frame, into `dest`. Throws SizeLimitExceeded as soon as the compressed
-    // data passes `limit` bytes. It reports `identity`'s device and inode, so
-    // an archive written through it still skips its own file.
+    // data passes `limit` bytes. It takes `identity`'s is_file(), so an
+    // archive written through it still skips its own file.
     static Output compressing(Output& dest, int level, unsigned threads, std::uint64_t limit,
                               const Output& identity);
 
@@ -65,12 +66,18 @@ public:
     // Appends everything written to this output so far to `dest`.
     void copy_to(Output& dest);
 
-    // Identity of the file being written, so the archive can skip itself.
-    dev_t device() const noexcept { return device_; }
-    ino_t inode() const noexcept { return inode_; }
+    // Whether a file (by device and inode) is the one being written, or the
+    // one it will replace, so an archive never contains itself.
+    bool is_file(dev_t device, ino_t inode) const noexcept;
 
 private:
     struct Zstd;
+
+    struct FileId {
+        dev_t device;
+        ino_t inode;
+        bool operator==(const FileId&) const = default;
+    };
 
     Output(int fd, bool owns_fd, std::filesystem::path temp, std::filesystem::path final_path);
     void flush();
@@ -84,8 +91,9 @@ private:
     std::uint64_t position_ = 0;
     bool seekable_ = false;
     bool readable_ = false;
-    dev_t device_ = 0;
-    ino_t inode_ = 0;
+    bool replace_ = true;    // whether commit() may replace an existing file
+    std::optional<FileId> self_;
+    std::optional<FileId> replaced_;
     std::unique_ptr<Zstd> zstd_;
 };
 

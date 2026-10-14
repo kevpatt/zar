@@ -5,6 +5,7 @@
 #pragma once
 
 #include "zar/format.hpp"
+#include "zar/names.hpp"
 #include "zar/version.hpp"
 
 #include <charconv>
@@ -72,6 +73,29 @@ inline std::string human_size(std::uint64_t bytes)
     char text[32];
     std::snprintf(text, sizeof text, "%.1f%c", value, kSuffixes[unit]);
     return text;
+}
+
+// Escapes control characters, backslashes, and (in names that aren't valid
+// UTF-8) non-ASCII bytes, so a name prints on one line, without disturbing
+// tab-separated columns or sending terminal control sequences.
+inline std::string printable(std::string_view name)
+{
+    const bool utf8 = is_valid_utf8(name);
+    std::string out;
+    for (const char c : name) {
+        const auto byte = static_cast<unsigned char>(c);
+        if (byte == '\\') {
+            out += "\\\\";
+        } else if (byte < 0x20 || byte == 0x7f || (!utf8 && byte >= 0x80)) {
+            constexpr char kHex[] = "0123456789abcdef";
+            out += "\\x";
+            out += kHex[byte >> 4];
+            out += kHex[byte & 0xf];
+        } else {
+            out += c;
+        }
+    }
+    return out;
 }
 
 // -j/--threads[=N]: 0 (one per core) without N.

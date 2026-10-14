@@ -368,3 +368,43 @@ TEST(dictionary_samples_stay_bounded_and_deterministic)
     few.add(text("too little to train on"));
     CHECK(!few.train(kDefaultDictSize));
 }
+
+TEST(writer_skips_the_archive_it_replaces)
+{
+    // `cd proj; zar -y .` twice: the old proj.zar is inside the input, but
+    // is about to be replaced, so it must not end up in the new archive.
+    TempDir tmp;
+    const auto src = tmp.path() / "proj";
+    write_file(src / "a.txt", text("a"));
+    const auto archive = src / "proj.zar";
+    CHECK(build(archive, {src / "."}, {}).entries.size() == 1);
+    const auto again = build(archive, {src / "."}, {});
+    CHECK(again.entries.size() == 1);
+    CHECK(again.find("proj.zar") == nullptr);
+}
+
+TEST(writer_skips_files_replaced_while_reading)
+{
+    // A file swapped for a FIFO between listing and opening would block
+    // open() forever; it's skipped instead, with a warning.
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    write_file(src / "keep", text("kept"));
+    write_file(src / "swap", text("swapped out"));
+
+    before_open_for_test = [](const fs::path& path) {
+        if (path.filename() == "swap") {
+            fs::remove(path);
+            ::mkfifo(path.c_str(), 0600);
+        }
+    };
+    CreateOptions options;
+    std::vector<std::string> warnings;
+    options.on_warning = [&](std::string_view m) { warnings.emplace_back(m); };
+    const auto archive = build(tmp.path() / "a.zar", {src / "."}, options);
+    before_open_for_test = nullptr;
+
+    CHECK(archive.find("keep") != nullptr);
+    CHECK(archive.find("swap") == nullptr);
+    CHECK(warnings.size() == 1 && warnings[0].find("replaced while being archived") != std::string::npos);
+}

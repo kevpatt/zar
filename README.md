@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** early development (0.2.5). Both tools work and are well
+> **Status:** development (0.3.6). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -256,10 +256,10 @@ src/sub/
 | `--scan` | check checksums, sizes, and paths without decompressing; write nothing |
 | `-t, --test` | like `--scan`, but also decompress and verify all data |
 | `-y, --yes` | overwrite files and directories that already exist |
-| `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` deletes them first. Either needs `-y`. |
+| `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` first deletes each one that is extracted whole (not the parents of a selected path). Either needs `-y`. |
 | `--hard-links` | recreate hard links with `link(2)` where their targets are extracted too; by default each is extracted as an independent copy. Falls back to a copy where the filesystem refuses. |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
-| `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`) |
+| `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`); without it, the limit is the free space where the data would go |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
 | `-v, --verbose` | add permissions and owner to the listing; print a summary |
 | `--help`, `--version` | |
@@ -389,20 +389,32 @@ them to a file first. If standard input is a redirected file
   last, after all files.
 - **Overwriting.** Before writing anything, `unzar` checks whether any target
   already exists, and stops if one does unless `-y` was given.
+  `--dirs=replace` deletes only directories that are extracted whole.
 - **Damage.** A file whose data fails a checksum or size check is removed
   rather than left half-written, and the rest of the archive is still
   extracted.
-- **Size.** `--max-size` caps how much will be decompressed, both for the
-  files selected (checked up front) and for solid archives (checked as they
-  expand).
+- **Size.** A small archive can describe enormous files, so `--max-size`
+  caps how much will be decompressed, both for the files selected (checked
+  up front) and for solid archives (checked as they expand). Without it,
+  extraction is limited to the free space at the destination, and a solid
+  archive to the free space in `$TMPDIR`.
+- **Memory.** Nothing is allocated at a size the archive merely claims:
+  blocks read from a pipe grow as their data arrives, and a compressed block
+  can't claim more than zstd could produce from it (32,768 times its size).
+  The data in flight during extraction is bounded in bytes as well as in
+  chunks.
 - **Structure.** Sub-indexes must form a tree, so an archive can't loop or
   reuse index blocks to inflate its listing, and lengths and offsets are
-  checked against the archive's bounds.
-- **Permissions.** Set-user-ID and set-group-ID bits and ownership are only
-  restored when running as root.
+  checked against the archive's bounds, including when reading from a pipe.
+- **Permissions.** Ownership is only restored when running as root, and
+  set-user-ID and set-group-ID bits only when the file's owner was restored
+  too; otherwise they would apply to whoever ran `unzar`.
+- **Output.** Names from the archive are escaped when printed, in messages
+  as well as listings, so they can't send control sequences to the
+  terminal.
 
 The test suite includes deliberately malicious archives for each of these
-cases. CRC-32C detects accidental damage, not tampering; cryptographic
+cases, and `fuzz/` has a fuzz target for the reader (see below). CRC-32C detects accidental damage, not tampering; cryptographic
 signatures are [on the roadmap](TODO.md).
 
 ## The archive format
@@ -454,12 +466,14 @@ src/
     compressor.*       parallel chunk compression
     dictionary.*       collecting samples and training dictionaries
     dedup.*            chunk hashes for deduplication
-    thread_pool.*      worker threads for extraction
+    thread_pool.*      worker threads and in-flight limits for extraction
+    posix.*            file descriptors, I/O loops, and user lookups
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated
     names.*            UTF-8 and path rules
     policy.*           which files are already compressed
 tests/                 unit and end-to-end tests (run with ctest)
+fuzz/                  a fuzz target for everything unzar reads
 third_party/xxhash/    xxHash 0.8.3 (BSD 2-Clause), for XXH3-128
 ```
 
@@ -471,6 +485,20 @@ run clean under ThreadSanitizer, AddressSanitizer, and UBSan:
 cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-fsanitize=thread
 cmake --build build-tsan && build-tsan/zar_tests
 ```
+
+The fuzz target covers index decoding, opening archives from files and
+pipes, and scanning and testing them. It uses libFuzzer where the compiler
+has it, and otherwise a built-in driver that mutates seed archives:
+
+```sh
+cmake -S . -B build-fuzz -G Ninja -DZAR_BUILD_FUZZERS=ON \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+cmake --build build-fuzz --target zar_fuzz
+build-fuzz/zar_fuzz -runs=100000 -artifact=crash.zar
+```
+
+A fuzzing build skips CRC checks, so that mutations get past them; it has
+no install rules, and its `zar` and `unzar` must not be used.
 
 ## Roadmap
 

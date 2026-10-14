@@ -79,4 +79,31 @@ void ThreadPool::work(std::stop_token stop)
     }
 }
 
+void Budget::acquire(std::uint64_t bytes)
+{
+    const bool oversized = bytes > max_bytes_;
+    std::unique_lock lock(mutex_);
+    released_.wait(lock, [&] {
+        return items_ < max_items_ && (oversized ? !oversized_ : bytes <= max_bytes_ - bytes_);
+    });
+    ++items_;
+    if (oversized)
+        oversized_ = true;
+    else
+        bytes_ += bytes;
+}
+
+void Budget::release(std::uint64_t bytes)
+{
+    {
+        std::lock_guard lock(mutex_);
+        --items_;
+        if (bytes > max_bytes_)
+            oversized_ = false;
+        else
+            bytes_ -= bytes;
+    }
+    released_.notify_all();
+}
+
 } // namespace zar

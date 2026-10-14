@@ -1,6 +1,6 @@
 # The zar archive format
 
-Version 0.2.5 (draft)
+Version 0.3.6 (draft)
 
 A zar archive is a sequence of **blocks** behind a fixed **zar header**.
 Every block is self-describing and independently checksummed, and every
@@ -72,7 +72,8 @@ the fact: a tool can insert `S` bytes of new blocks right after the zar header,
 shift the rest of the archive forward by `S`, and add `S` to `base_offset`.
 No stored offset changes. The inserted blocks lie before the base, so their
 offsets are negative. `base_offset` must be a multiple of `A`, so inserting
-blocks keeps every existing block aligned.
+blocks keeps every existing block aligned, and must be either 0 or at least
+32: the base can't fall inside the zar header.
 
 ## 3. Zar header
 

@@ -4,18 +4,16 @@
 #include "zar/extractor.hpp"
 
 #include "zar/crc32c.hpp"
+#include "zar/posix.hpp"
 #include "zar/thread_pool.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <fcntl.h>
-#include <grp.h>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <pwd.h>
-#include <semaphore>
 #include <set>
 #include <sys/stat.h>
 #include <system_error>
@@ -24,33 +22,16 @@
 namespace zar {
 namespace {
 
-class Fd {
-public:
-    Fd() = default;
-    explicit Fd(int fd) : fd_(fd) {}
-    Fd(Fd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
-    Fd& operator=(Fd&& other) noexcept
-    {
-        std::swap(fd_, other.fd_);
-        return *this;
-    }
-    ~Fd()
-    {
-        if (fd_ >= 0)
-            ::close(fd_);
-    }
-    int get() const { return fd_; }
-    explicit operator bool() const { return fd_ >= 0; }
-
-private:
-    int fd_ = -1;
-};
-
 struct ExtractError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-[[noreturn]] void throw_errno(const std::string& what)
+// A block that a broken stream will never deliver.
+struct StreamLost : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] void throw_path_error(const std::string& what)
 {
     if (errno == ELOOP)
         throw ExtractError(what + ": is a symbolic link; not following it");
@@ -75,19 +56,6 @@ struct PathLess {
     }
 };
 
-void write_all_at(int fd, ByteView data, std::uint64_t position)
-{
-    while (!data.empty()) {
-        const auto n = ::pwrite(fd, data.data(), data.size(), static_cast<off_t>(position));
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0)
-            throw ExtractError(std::generic_category().message(errno));
-        data = data.subspan(static_cast<std::size_t>(n));
-        position += static_cast<std::uint64_t>(n);
-    }
-}
-
 timespec to_timespec(const std::optional<Timestamp>& t)
 {
     if (!t)
@@ -95,15 +63,12 @@ timespec to_timespec(const std::optional<Timestamp>& t)
     return {static_cast<time_t>(t->seconds), static_cast<long>(t->nanoseconds.value_or(0))};
 }
 
+// Names win over ids, so ownership carries across systems.
 std::optional<uid_t> owner_of(const Entry& e)
 {
-    if (e.uname) {
-        std::vector<char> buffer(4096);
-        struct passwd pw {};
-        struct passwd* result = nullptr;
-        if (::getpwnam_r(e.uname->c_str(), &pw, buffer.data(), buffer.size(), &result) == 0 && result)
-            return result->pw_uid;
-    }
+    if (e.uname)
+        if (const auto uid = user_id(*e.uname))
+            return uid;
     if (e.uid)
         return static_cast<uid_t>(*e.uid);
     return std::nullopt;
@@ -111,19 +76,20 @@ std::optional<uid_t> owner_of(const Entry& e)
 
 std::optional<gid_t> group_of(const Entry& e)
 {
-    if (e.gname) {
-        std::vector<char> buffer(4096);
-        struct group gr {};
-        struct group* result = nullptr;
-        if (::getgrnam_r(e.gname->c_str(), &gr, buffer.data(), buffer.size(), &result) == 0 && result)
-            return result->gr_gid;
-    }
+    if (e.gname)
+        if (const auto gid = group_id(*e.gname))
+            return gid;
     if (e.gid)
         return static_cast<gid_t>(*e.gid);
     return std::nullopt;
 }
 
 } // namespace
+
+mode_t permitted_mode(std::uint16_t mode, bool owner_restored)
+{
+    return mode & (owner_restored ? 07777 : 01777);
+}
 
 std::string_view base_name(std::string_view path)
 {
@@ -169,11 +135,15 @@ struct Extractor::Impl {
         {
         }
 
-        void fail(std::string_view what)
+        // Records the first failure. `lost` marks one caused by a broken
+        // stream, which is reported in a single summary instead.
+        void fail(std::string_view what, bool lost = false)
         {
             std::lock_guard lock(mutex);
-            if (!failed.exchange(true))
+            if (!failed.exchange(true)) {
                 error = what;
+                lost_to_stream = lost;
+            }
         }
 
         const Entry& entry;
@@ -183,11 +153,12 @@ struct Extractor::Impl {
         std::atomic<bool> failed = false;
         std::mutex mutex;
         std::string error;
+        bool lost_to_stream = false;
         std::string dir_path;    // archive path of its directory
         std::string name;
         bool opened = false;     // stream: creation was attempted
-        Fd dir;    // its directory, so a failed file can be removed
-        Fd out;
+        UniqueFd dir;    // its directory, so a failed file can be removed
+        UniqueFd out;
     };
 
     // Stream: a chunk waiting for its block to be read.
@@ -200,7 +171,7 @@ struct Extractor::Impl {
     std::map<std::int64_t, std::vector<StreamedChunk>> streamed;    // by block offset
     // Once a stream breaks (it was truncated, say), every later block is lost
     // too; those files are counted and reported once rather than one by one.
-    std::string stream_error;
+    std::string stream_error;    // main thread only
     std::uint64_t lost_to_stream = 0;
 
     ArchiveReader& reader;
@@ -213,8 +184,8 @@ struct Extractor::Impl {
     std::mutex mutex;    // guards stats and warnings, which workers update too
     ExtractStats stats;
 
-    Fd root;
-    Fd current;    // directory of the group being extracted
+    UniqueFd root;
+    UniqueFd current;    // directory of the group being extracted
     std::string current_path;
 
     // Created last, so nothing can be written through them (§7).
@@ -226,8 +197,10 @@ struct Extractor::Impl {
     // Metadata applied last, deepest first, so writing contents doesn't disturb it.
     std::vector<const Entry*> directories;
 
-    // Bounds the chunks in memory, and so the open files, at any moment.
-    std::counting_semaphore<> in_flight{static_cast<std::ptrdiff_t>(threads) * 4};
+    // Bounds the chunks in memory, by count (and so the open files) and by
+    // size: a chunk can be as large as a whole file (zar --contiguous).
+    static constexpr std::uint64_t kBytesPerThread = 16 << 20;
+    Budget in_flight{std::size_t{threads} * 4, std::uint64_t{threads} * kBytesPerThread};
     ThreadPool pool{threads};    // last: destroyed first, while what its jobs use still exists
 
     Impl(ArchiveReader& r, const ExtractOptions& o) : reader(r), options(o) {}
@@ -239,7 +212,7 @@ struct Extractor::Impl {
         if (!root) {
             std::error_code ec;
             std::filesystem::create_directories(options.directory, ec);
-            root = Fd(::open(options.directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+            root = UniqueFd(::open(options.directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
             if (!root)
                 throw std::system_error(errno, std::generic_category(), options.directory.string());
         }
@@ -256,9 +229,9 @@ struct Extractor::Impl {
 
     // Opens a directory below the root, one component at a time, never
     // following symlinks. Missing directories are created if `create`.
-    Fd open_directory(std::string_view path, bool create)
+    UniqueFd open_directory(std::string_view path, bool create)
     {
-        Fd dir(::dup(root_fd()));
+        UniqueFd dir(::dup(root_fd()));
         while (!path.empty()) {
             const auto slash = path.find('/');
             const std::string component(path.substr(0, slash));
@@ -268,12 +241,12 @@ struct Extractor::Impl {
             int fd = ::openat(dir.get(), component.c_str(), flags);
             if (fd < 0 && errno == ENOENT && create) {
                 if (::mkdirat(dir.get(), component.c_str(), 0777) != 0 && errno != EEXIST)
-                    throw_errno(component);
+                    throw_path_error(component);
                 fd = ::openat(dir.get(), component.c_str(), flags);
             }
             if (fd < 0)
-                throw_errno(component);
-            dir = Fd(fd);
+                throw_path_error(component);
+            dir = UniqueFd(fd);
         }
         return dir;
     }
@@ -287,7 +260,7 @@ struct Extractor::Impl {
         if (::fstatat(dir, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode))
             throw ExtractError("a directory is in the way");
         if (::unlinkat(dir, name.c_str(), 0) != 0)
-            throw_errno("cannot replace existing file");
+            throw_path_error("cannot replace existing file");
     }
 
     bool exists(std::string_view path) const
@@ -303,15 +276,12 @@ struct Extractor::Impl {
                 if (member->type == EntryType::File)
                     selected_files.insert(member->path);
 
-        if (decompress && options.size_limit) {
+        if (decompress) {
             std::uint64_t total = 0;
             for (const auto& group : groups)
                 for (const auto* member : group.members)
                     total += std::min(member->size.value_or(0), ~std::uint64_t{0} - total);
-            if (total > *options.size_limit)
-                throw ExtractError("the files total " + std::to_string(total) +
-                                   " bytes, more than the size limit (" +
-                                   std::to_string(*options.size_limit) + " bytes)");
+            check_size(total);
         }
         if (!writing)
             return;
@@ -337,46 +307,79 @@ struct Extractor::Impl {
         }
 
         if (options.dirs == DirMode::Replace) {
-            // Only top-level directories: any deeper existing directory lies
-            // inside one of them. remove_all() never follows symlinks.
+            // Only directories extracted whole: those with their own entry,
+            // which selection includes only with everything below them. Not
+            // ancestors of a selection, which would take unrelated files
+            // with them. remove_all() never follows symlinks.
+            std::vector<std::string_view> replaced;
             for (const auto& group : groups) {
-                if (group.path.empty() || group.path.find('/') != std::string::npos ||
-                    !exists(group.path))
+                if (!group.entry || !exists(group.path))
                     continue;
+                const auto inside = [&](std::string_view dir) {
+                    return group.path.starts_with(dir) && group.path[dir.size()] == '/';
+                };
+                if (std::ranges::any_of(replaced, inside))
+                    continue;    // already gone with its parent
                 std::error_code ec;
                 std::filesystem::remove_all(options.directory / group.path, ec);
                 if (ec)
                     throw ExtractError(group.path + ": cannot replace: " + ec.message());
+                replaced.push_back(group.path);
             }
         }
     }
 
-    void apply_owner(int dir, const char* name, int fd, const Entry& e) const
+    // Refuses to decompress more than the size limit or, when extracting
+    // without one, more than the destination has room for: a small archive
+    // can describe far more data than that.
+    void check_size(std::uint64_t total) const
+    {
+        const auto describe = [&](std::string_view limit, std::uint64_t bytes) {
+            return "the files total " + std::to_string(total) + " bytes, more than " + std::string(limit) +
+                   " (" + std::to_string(bytes) + " bytes)";
+        };
+        if (options.size_limit) {
+            if (total > *options.size_limit)
+                throw ExtractError(describe("the size limit", *options.size_limit));
+            return;
+        }
+        if (!writing)
+            return;
+        auto dir = std::filesystem::absolute(options.directory);
+        while (!std::filesystem::exists(dir) && dir.has_relative_path())
+            dir = dir.parent_path();    // it will be created inside this
+        if (const auto room = free_space(dir); room && total > *room)
+            throw ExtractError(describe("the free space in " + dir.string(), *room) +
+                               "; set --max-size to try anyway");
+    }
+
+    // Returns whether the archive's owner was applied.
+    bool apply_owner(int dir, const char* name, int fd, const Entry& e) const
     {
         if (!privileged)
-            return;
+            return false;
         const auto uid = owner_of(e);
         const auto gid = group_of(e);
         if (!uid && !gid)
-            return;
+            return false;
         const auto u = uid.value_or(static_cast<uid_t>(-1));
         const auto g = gid.value_or(static_cast<gid_t>(-1));
         const int rc = fd >= 0 ? ::fchown(fd, u, g) : ::fchownat(dir, name, u, g, AT_SYMLINK_NOFOLLOW);
         if (rc != 0)
-            throw_errno("cannot set owner");
+            throw_path_error("cannot set owner");
+        return true;
     }
 
     void apply_metadata(int fd, const Entry& e) const
     {
-        apply_owner(-1, nullptr, fd, e);    // before chmod: chown clears set-id bits
+        const bool owned = apply_owner(-1, nullptr, fd, e);    // before chmod: chown clears set-id bits
         if (e.mode) {
-            const mode_t allowed = privileged ? 07777 : 01777;
-            if (::fchmod(fd, *e.mode & allowed) != 0)
-                throw_errno("cannot set permissions");
+            if (::fchmod(fd, permitted_mode(*e.mode, owned)) != 0)
+                throw_path_error("cannot set permissions");
         }
         const timespec times[2] = {to_timespec(e.atime), to_timespec(e.mtime)};
         if (::futimens(fd, times) != 0)
-            throw_errno("cannot set times");
+            throw_path_error("cannot set times");
     }
 
     void enter(const DirectoryGroup& group)
@@ -392,7 +395,7 @@ struct Extractor::Impl {
         try {
             current = open_directory(group.path, true);
         } catch (const std::exception& e) {
-            current = Fd();
+            current = UniqueFd();
             warn(group.path + ": " + e.what());
         }
     }
@@ -458,7 +461,7 @@ struct Extractor::Impl {
         }
         std::uint64_t position = 0;
         for (std::size_t i = 0; i < job->lengths.size(); ++i) {
-            in_flight.acquire();
+            in_flight.acquire(job->lengths[i]);
             pool.submit([this, job, i, position] {
                 run_chunk(*job, i, position,
                           [&] { return reader.chunk(job->entry, i, job->lengths[i], decompress); });
@@ -471,15 +474,15 @@ struct Extractor::Impl {
     {
         job.name = base_name(job.entry.path);
         for (;;) {
-            job.out = Fd(::openat(dir, job.name.c_str(),
-                                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+            job.out = UniqueFd(::openat(dir, job.name.c_str(),
+                                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
             if (job.out || errno != EEXIST)
                 break;
             remove_existing(dir, job.name);
         }
         if (!job.out)
-            throw_errno("cannot create file");
-        job.dir = Fd(::dup(dir));
+            throw_path_error("cannot create file");
+        job.dir = UniqueFd(::dup(dir));
     }
 
     // Runs on a worker thread: `load` produces the chunk's (decompressed) data.
@@ -491,12 +494,14 @@ struct Extractor::Impl {
                 const auto data = load();
                 job.crcs[index] = crc32c(data);
                 if (job.out)
-                    write_all_at(job.out.get(), data, position);
+                    pwrite_all(job.out.get(), data, position, "cannot write");
+            } catch (const StreamLost& e) {
+                job.fail(e.what(), true);
             } catch (const std::exception& e) {
                 job.fail(e.what());
             }
         }
-        in_flight.release();
+        in_flight.release(job.lengths[index]);
         if (--job.remaining == 0)
             complete(job);
     }
@@ -507,18 +512,21 @@ struct Extractor::Impl {
     {
         for (const auto& [offset, refs] : streamed) {
             std::shared_ptr<const std::pair<BlockHeader, Bytes>> block;
-            std::string error = stream_error;
+            std::string error;    // why `block` is missing
             if (stream_error.empty()) {
                 try {
                     block = std::make_shared<const std::pair<BlockHeader, Bytes>>(reader.next_block(offset));
-                } catch (const TruncatedError& e) {
-                    error = stream_error = e.what();
                 } catch (const FormatError& e) {
                     error = e.what();    // just this block is bad; the next can still be found
+                    if (dynamic_cast<const TruncatedError*>(&e))
+                        stream_error = error;
                 } catch (const std::exception& e) {
-                    error = stream_error = e.what();    // e.g. a read error
+                    stream_error = e.what();    // e.g. a read error
                 }
             }
+            const bool lost = !block && !stream_error.empty();
+            if (lost)
+                error = stream_error;
 
             for (const auto& ref : refs) {
                 auto& job = *ref.job;
@@ -530,10 +538,12 @@ struct Extractor::Impl {
                         job.fail(e.what());
                     }
                 }
-                in_flight.acquire();
-                pool.submit([this, ref, block, error] {
+                in_flight.acquire(job.lengths[ref.index]);
+                pool.submit([this, ref, block, error, lost] {
                     const auto& job = *ref.job;
                     run_chunk(*ref.job, ref.index, ref.position, [&] {
+                        if (lost)
+                            throw StreamLost(error);
                         if (!block)
                             throw FormatError(error);
                         return reader.decode_chunk(job.entry, block->first, block->second,
@@ -555,13 +565,13 @@ struct Extractor::Impl {
                 std::uint32_t crc = 0;
                 for (std::size_t i = 0; i < job.crcs.size(); ++i)
                     crc = crc32c_combine(crc, job.crcs[i], job.lengths[i]);
-                if (crc != *job.entry.content_crc)
+                if (!crc_matches(*job.entry.content_crc, crc))
                     throw FormatError("content checksum mismatch");
             }
         } catch (const std::exception& e) {
             if (job.out)
                 ::unlinkat(job.dir.get(), job.name.c_str(), 0);    // don't leave a partial file
-            if (!stream_error.empty() && job.error == stream_error) {
+            if (job.lost_to_stream) {
                 std::lock_guard lock(mutex);
                 ++lost_to_stream;
             } else {
@@ -577,8 +587,8 @@ struct Extractor::Impl {
             } catch (const std::exception& e) {
                 warn(job.entry.path + ": " + e.what());
             }
-            job.out = Fd();    // close now, not when the last reference goes
-            job.dir = Fd();
+            job.out.reset();    // close now, not when the last reference goes
+            job.dir.reset();
         }
         std::lock_guard lock(mutex);
         ++stats.files;
@@ -601,10 +611,10 @@ struct Extractor::Impl {
         // Without AT_SYMLINK_FOLLOW, linkat() never follows a symlink.
         if (::linkat(from.get(), from_name.c_str(), to.get(), name.c_str(), 0) != 0) {
             if (errno != EEXIST)
-                throw_errno("cannot create hard link");
+                throw_path_error("cannot create hard link");
             remove_existing(to.get(), name);
             if (::linkat(from.get(), from_name.c_str(), to.get(), name.c_str(), 0) != 0)
-                throw_errno("cannot create hard link");
+                throw_path_error("cannot create hard link");
         }
     }
 
@@ -644,15 +654,15 @@ struct Extractor::Impl {
 
         if (::symlinkat(target.c_str(), dir.get(), name.c_str()) != 0) {
             if (errno != EEXIST)
-                throw_errno("cannot create symlink");
+                throw_path_error("cannot create symlink");
             remove_existing(dir.get(), name);
             if (::symlinkat(target.c_str(), dir.get(), name.c_str()) != 0)
-                throw_errno("cannot create symlink");
+                throw_path_error("cannot create symlink");
         }
         apply_owner(dir.get(), name.c_str(), -1, entry);
         const timespec times[2] = {to_timespec(entry.atime), to_timespec(entry.mtime)};
         if (::utimensat(dir.get(), name.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0)
-            throw_errno("cannot set times");
+            throw_path_error("cannot set times");
     }
 
     ExtractStats finish()
@@ -666,7 +676,7 @@ struct Extractor::Impl {
         if (!writing)
             return stats;
         link_hardlinks();
-        current = Fd();
+        current = UniqueFd();
 
         for (const auto& [dir_path, entry] : symlinks) {
             try {

@@ -4,16 +4,15 @@
 #include "zar/archive_reader.hpp"
 
 #include "zar/crc32c.hpp"
+#include "zar/posix.hpp"
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdlib>
 #include <fcntl.h>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <sys/stat.h>
-#include <system_error>
 #include <unistd.h>
 #include <zstd.h>
 
@@ -46,51 +45,46 @@ struct ArchiveReader::File {
             ::close(fd);
     }
 
+    // How many bytes read_at() can reach: for a stream, only its head.
+    std::uint64_t reachable() const noexcept { return stream ? head.size() : size; }
+
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const
     {
-        if (in_memory) {
-            if (position > memory.size() || out.size() > memory.size() - position)
+        if (in_memory || stream) {
+            const auto& bytes = in_memory ? memory : head;
+            if (position > bytes.size() || out.size() > bytes.size() - position) {
+                if (stream)
+                    throw FormatError("data needed out of order; it can't be read from a pipe");
                 throw TruncatedError();
-            std::copy_n(memory.begin() + static_cast<std::ptrdiff_t>(position), out.size(), out.begin());
+            }
+            std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(position), out.size(), out.begin());
             return;
         }
-        if (stream) {
-            if (position > head.size() || out.size() > head.size() - position)
-                throw FormatError("data needed out of order; it can't be read from a pipe");
-            std::copy_n(head.begin() + static_cast<std::ptrdiff_t>(position), out.size(), out.begin());
-            return;
-        }
-        if (position > size || out.size() > size - position)
+        if (position > size || out.size() > size - position ||
+            pread_full(fd, out, position, name) != out.size())
             throw TruncatedError();
-        std::size_t done = 0;
-        while (done < out.size()) {
-            const auto n = ::pread(fd, out.data() + done, out.size() - done,
-                                   static_cast<off_t>(position + done));
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0)
-                throw std::system_error(errno, std::generic_category(), name);
-            if (n == 0)
-                throw TruncatedError();
-            done += static_cast<std::size_t>(n);
-        }
     }
 
     // Stream: the next `out.size()` bytes.
     void read_next(std::span<std::uint8_t> out)
     {
-        std::size_t done = 0;
-        while (done < out.size()) {
-            const auto n = ::read(fd, out.data() + done, out.size() - done);
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0)
-                throw std::system_error(errno, std::generic_category(), name);
-            if (n == 0)
-                throw TruncatedError();
-            done += static_cast<std::size_t>(n);
-        }
+        if (read_full(fd, out, name) != out.size())
+            throw TruncatedError();
         stream_position += out.size();
+    }
+
+    // Stream: appends the next `count` bytes to `out`. Memory grows only as
+    // the data arrives, so a header claiming a huge size costs nothing
+    // unless the stream really is that long.
+    void read_next(Bytes& out, std::uint64_t count)
+    {
+        constexpr std::uint64_t kStep = 1 << 20;
+        for (std::uint64_t done = 0; done < count;) {
+            const auto n = static_cast<std::size_t>(std::min(kStep, count - done));
+            out.resize(out.size() + n);
+            read_next(std::span(out).last(n));
+            done += n;
+        }
     }
 
     void skip_to(std::uint64_t position)
@@ -125,6 +119,12 @@ std::uint64_t frame_content_size(ByteView payload, std::int64_t offset)
     const auto size = ZSTD_getFrameContentSize(payload.data(), payload.size());
     if (size == ZSTD_CONTENTSIZE_UNKNOWN || size == ZSTD_CONTENTSIZE_ERROR)
         throw FormatError(at(offset) + " has no zstd content size");
+    // Each zstd block yields at most 128 KiB and takes at least 4 bytes. A
+    // frame claiming more than that is lying, and asking for memory it
+    // could never fill.
+    constexpr std::uint64_t kMaxRatio = (128 << 10) / 4;
+    if (size / kMaxRatio > payload.size())
+        throw FormatError(at(offset) + " claims more data than it could hold");
     return size;
 }
 
@@ -149,6 +149,17 @@ Bytes decompress_frame(ByteView payload, std::uint64_t size, const ZSTD_DDict* d
     return out;
 }
 
+// The file position of `offset` from `base`, or a FormatError if it's -1 or
+// lies outside the range of positions.
+std::uint64_t position_of(std::uint64_t base, std::int64_t offset)
+{
+    const auto magnitude = offset < 0 ? 0 - static_cast<std::uint64_t>(offset) : static_cast<std::uint64_t>(offset);
+    if (offset == kNoOffset || (offset < 0 && magnitude > base) ||
+        (offset >= 0 && magnitude > std::numeric_limits<std::uint64_t>::max() - base - kHeaderSize))
+        throw FormatError("invalid block offset " + std::to_string(offset));
+    return offset < 0 ? base - magnitude : base + magnitude;
+}
+
 // Keeps the last entry for each path (§6.6), in walk order.
 std::vector<Entry> last_wins(std::vector<Entry> entries)
 {
@@ -171,7 +182,8 @@ std::vector<Entry> last_wins(std::vector<Entry> entries)
 } // namespace
 
 // Decompresses a solid archive's frame (§5.5) into memory or, past
-// kInMemoryLimit, into an anonymous temporary file.
+// kInMemoryLimit, into an anonymous temporary file. Without a size limit,
+// that file may not take more than the free space where it lives.
 class ArchiveReader::Inflater {
 public:
     Inflater(std::string name, std::optional<std::uint64_t> limit) : name_(std::move(name)), limit_(limit)
@@ -179,6 +191,24 @@ public:
         if (!dstream_)
             throw std::bad_alloc();
     }
+
+    // Decompresses a whole ARCHIVE_ZSTD payload, read a piece at a time by
+    // `read(position, piece)`, and checks it's complete and intact.
+    template <typename Read>
+    std::unique_ptr<File> inflate(const BlockHeader& block, Read read)
+    {
+        Bytes piece(1 << 20);
+        for (std::uint64_t done = 0; done < block.payload_size;) {
+            const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
+            read(done, std::span(piece).first(n));
+            feed(std::span(piece).first(n));
+            done += n;
+        }
+        return finish(block.payload_crc);
+    }
+
+private:
+    static constexpr std::size_t kInMemoryLimit = 64 << 20;
 
     void feed(ByteView compressed)
     {
@@ -202,35 +232,25 @@ public:
         }
     }
 
-    // The decompressed archive, after checking it's complete and intact.
     std::unique_ptr<File> finish(std::uint32_t expected_crc)
     {
-        if (crc_ != expected_crc)
+        if (!crc_matches(expected_crc, crc_))
             throw FormatError(name_ + ": the compressed archive fails its checksum");
         if (!done_)
             throw TruncatedError();
 
         auto file = std::make_unique<File>();
         file->name = name_;
-        if (spill_ < 0) {
+        if (!spill_) {
             file->in_memory = true;
             file->size = memory_.size();
             file->memory = std::move(memory_);
         } else {
-            file->fd = std::exchange(spill_, -1);
+            file->fd = spill_.release();
             file->size = spilled_;
         }
         return file;
     }
-
-    ~Inflater()
-    {
-        if (spill_ >= 0)
-            ::close(spill_);
-    }
-
-private:
-    static constexpr std::size_t kInMemoryLimit = 64 << 20;
 
     void store(ByteView data)
     {
@@ -240,17 +260,15 @@ private:
         if (limit_ && total_ > *limit_)
             throw std::runtime_error(name_ + ": the solid archive expands to more than the size limit (" +
                                      std::to_string(*limit_) + " bytes)");
-        if (spill_ < 0 && memory_.size() + data.size() <= kInMemoryLimit) {
+        if (!spill_ && memory_.size() + data.size() <= kInMemoryLimit) {
             memory_.insert(memory_.end(), data.begin(), data.end());
             return;
         }
-        if (spill_ < 0) {
-            const char* tmpdir = std::getenv("TMPDIR");
-            std::string path = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/.unzar-XXXXXX";
-            spill_ = ::mkstemp(path.data());
-            if (spill_ < 0)
-                throw std::system_error(errno, std::generic_category(), path);
-            ::unlink(path.c_str());
+        if (!spill_) {
+            const auto dir = temp_directory();
+            spill_ = anonymous_temp_file(dir, ".unzar-");
+            if (!limit_)
+                spill_limit_ = free_space(dir);
             write(memory_);
             memory_ = Bytes();
         }
@@ -259,15 +277,11 @@ private:
 
     void write(ByteView data)
     {
-        while (!data.empty()) {
-            const auto n = ::write(spill_, data.data(), data.size());
-            if (n < 0 && errno == EINTR)
-                continue;
-            if (n < 0)
-                throw std::system_error(errno, std::generic_category(), "temporary file");
-            data = data.subspan(static_cast<std::size_t>(n));
-            spilled_ += static_cast<std::uint64_t>(n);
-        }
+        spilled_ += data.size();
+        if (spill_limit_ && spilled_ > *spill_limit_)
+            throw std::runtime_error(name_ + ": the solid archive expands to more than the free space in " +
+                                     temp_directory().string() + " (set a limit with --max-size)");
+        write_all(spill_.get(), data, "temporary file");
     }
 
     std::string name_;
@@ -278,8 +292,9 @@ private:
     bool done_ = false;
     std::uint32_t crc_ = 0;
     Bytes memory_;
-    int spill_ = -1;
+    UniqueFd spill_;
     std::uint64_t spilled_ = 0;
+    std::optional<std::uint64_t> spill_limit_;
 };
 
 ArchiveReader::ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, std::uint64_t base)
@@ -393,15 +408,12 @@ ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
 
 BlockHeader ArchiveReader::block_header(std::int64_t offset) const
 {
-    const auto position = static_cast<std::int64_t>(base_) + offset;
-    if (offset == kNoOffset || position < 0)
-        throw FormatError("invalid block offset " + std::to_string(offset));
-
+    const auto position = position_of(base_, offset);
     HeaderBytes bytes;
-    file_->read_at(static_cast<std::uint64_t>(position), bytes);
+    file_->read_at(position, bytes);
     const auto block = BlockHeader::decode(bytes, offset);
-    const auto payload_at = static_cast<std::uint64_t>(position) + kHeaderSize;
-    if (!file_->stream && block.payload_size > file_->size - payload_at)
+    // read_at() just reached past the header, so this can't underflow.
+    if (block.payload_size > file_->reachable() - (position + kHeaderSize))
         throw FormatError(at(offset) + " extends past the end of the archive");
     return block;
 }
@@ -409,8 +421,8 @@ BlockHeader ArchiveReader::block_header(std::int64_t offset) const
 Bytes ArchiveReader::payload(const BlockHeader& block) const
 {
     Bytes bytes(static_cast<std::size_t>(block.payload_size));
-    read_at(base_ + static_cast<std::uint64_t>(block.offset) + kHeaderSize, bytes);
-    if (crc32c(bytes) != block.payload_crc)
+    read_at(position_of(base_, block.offset) + kHeaderSize, bytes);
+    if (!crc_matches(block.payload_crc, crc32c(bytes)))
         throw FormatError(at(block.offset) + " fails its checksum");
     return bytes;
 }
@@ -535,20 +547,16 @@ std::pair<BlockHeader, Bytes> ArchiveReader::next_block(std::int64_t offset)
 {
     if (!file_->stream)
         throw std::logic_error("next_block() is for archives read from a stream");
-    const auto position = static_cast<std::int64_t>(base_) + offset;
-    if (offset == kNoOffset || position < 0)
-        throw FormatError("invalid block offset " + std::to_string(offset));
-
-    file_->skip_to(static_cast<std::uint64_t>(position));
+    file_->skip_to(position_of(base_, offset));
     HeaderBytes header_bytes;
     file_->read_next(header_bytes);
     const auto block = BlockHeader::decode(header_bytes, offset);
-    if (block.payload_size > kMaxChunkSize + kHeaderSize)    // generous: a chunk plus zstd overhead
+    if (block.payload_size > kMaxChunkSize)    // the writer stores a chunk raw rather than expand it
         throw FormatError(at(offset) + " is larger than any chunk");
 
-    Bytes bytes(static_cast<std::size_t>(block.payload_size));
-    file_->read_next(bytes);
-    if (crc32c(bytes) != block.payload_crc)
+    Bytes bytes;
+    file_->read_next(bytes, block.payload_size);
+    if (!crc_matches(block.payload_crc, crc32c(bytes)))
         throw FormatError(at(offset) + " fails its checksum");
     return {block, std::move(bytes)};
 }
@@ -570,33 +578,28 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
     const auto header = ArchiveHeader::decode(header_bytes);
 
     // A solid archive is a single block, read whole (§5.5).
-    if (header.index_offset != kNoOffset && header.index_offset >= 0) {
+    if (header.index_offset >= 0) {
         file->skip_to(header.base_offset + static_cast<std::uint64_t>(header.index_offset));
         HeaderBytes block_bytes;
         file->read_next(block_bytes);
         const auto block = BlockHeader::decode(block_bytes, header.index_offset);
         if (block.type == BlockType::ArchiveZstd) {
             Inflater inflater(file->name, size_limit);
-            Bytes piece(1 << 20);
-            for (std::uint64_t done = 0; done < block.payload_size;) {
-                const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
-                file->read_next({piece.data(), n});
-                inflater.feed({piece.data(), n});
-                done += n;
-            }
-            return from_file(inflater.finish(block.payload_crc), on_warning, false, size_limit);
+            auto inner = inflater.inflate(block, [&](std::uint64_t, std::span<std::uint8_t> piece) {
+                file->read_next(piece);
+            });
+            return from_file(std::move(inner), on_warning, false, size_limit);
         }
     }
 
-    // Otherwise, only an archive whose root index lies before its data can be streamed (§5.4).
-    if (header.index_offset == kNoOffset || header.index_offset >= 0)
+    // Otherwise, only an archive whose root index lies before its data can be
+    // streamed (§5.4). The head -- everything before the base -- is kept.
+    if (header.index_offset == kNoOffset || header.index_offset >= 0 || header.base_offset == 0)
         throw FormatError(file->name + ": the index isn't at the head of this archive, so it "
                                        "can't be read from a pipe (create it with zar --head-index, "
                                        "or save it to a file first)");
-
-    file->head.resize(header.base_offset);
-    std::copy(header_bytes.begin(), header_bytes.end(), file->head.begin());
-    file->read_next(std::span(file->head).subspan(kHeaderSize));
+    file->head.assign(header_bytes.begin(), header_bytes.end());
+    file->read_next(file->head, header.base_offset - kHeaderSize);    // base_offset >= kHeaderSize (§2.2)
 
     ArchiveReader reader(std::move(file), header, header.base_offset);
     std::vector<Entry> entries;
@@ -614,16 +617,11 @@ bool ArchiveReader::streaming() const noexcept
 std::unique_ptr<ArchiveReader::File> ArchiveReader::unwrap(const BlockHeader& block,
                                                            std::optional<std::uint64_t> size_limit) const
 {
+    const auto start = position_of(base_, block.offset) + kHeaderSize;
     Inflater inflater(file_->name, size_limit);
-    Bytes piece(1 << 20);
-    const auto start = base_ + static_cast<std::uint64_t>(block.offset) + kHeaderSize;
-    for (std::uint64_t done = 0; done < block.payload_size;) {
-        const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(piece.size(), block.payload_size - done));
-        read_at(start + done, {piece.data(), n});
-        inflater.feed({piece.data(), n});
-        done += n;
-    }
-    return inflater.finish(block.payload_crc);
+    return inflater.inflate(block, [&](std::uint64_t done, std::span<std::uint8_t> piece) {
+        read_at(start + done, piece);
+    });
 }
 
 } // namespace zar
