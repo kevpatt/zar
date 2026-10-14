@@ -952,7 +952,7 @@ TEST(dedup_stores_identical_chunks_once)
     const auto plain = build_archive(tmp.path() / "plain.zar", src, options);
     CHECK(plain.deduplicated_bytes == 0);
 
-    options.dedup = true;    // the default
+    options.dedup = true;
     for (const bool dict : {false, true}) {
         for (const bool head_index : {false, true}) {
             options.dict_size = dict ? std::optional(kDefaultDictSize) : std::nullopt;
@@ -1048,4 +1048,22 @@ TEST(dedup_is_skipped_when_the_output_cannot_be_read_back)
 
     // With a file to write to, the same inputs are deduplicated.
     CHECK(build_archive(tmp.path() / "file.zar", tmp.path() / "src", {}).deduplicated_bytes == 10'000);
+
+    // Asked for explicitly, it can't be skipped: an error, before writing anything.
+    int fds[2];
+    CHECK(::pipe(fds) == 0);
+    const int saved_again = ::dup(STDOUT_FILENO);
+    ::dup2(fds[1], STDOUT_FILENO);
+    ::close(fds[1]);
+    {
+        auto out = Output::standard_output();
+        CreateOptions options;
+        options.dedup = true;
+        CHECK_THROWS(create_archive(out, std::vector{tmp.path() / "src/."}, options));
+    }
+    ::dup2(saved_again, STDOUT_FILENO);
+    ::close(saved_again);
+    char byte;
+    CHECK(::read(fds[0], &byte, 1) == 0);
+    ::close(fds[0]);
 }

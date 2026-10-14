@@ -60,9 +60,8 @@ PATH is stored under its own name, so extracting recreates it:
       --all-times        store access, change, and birth times too
       --names=MODE       non-UTF-8 file names: raw (default), skip, latin1
       --compress-all     compress even files that are usually precompressed
-      --no-dedup         store identical chunks again rather than once (by
-                         default, duplicate data is stored only once, except
-                         when writing to a pipe without --head-index)
+      --dedup=on|off     store identical chunks only once (default: on,
+                         except when writing to a pipe without --head-index)
       --contiguous[=SIZE]
                          store each file of at most SIZE bytes as one block
                          instead of in chunks (with no SIZE, files up to 4G)
@@ -145,7 +144,7 @@ enum LongOnly {
     kHeadIndex,
     kSolid,
     kContiguous,
-    kNoDedup,
+    kDedup,
     kDict,
     kDictOverSolid,
     kVersion,
@@ -177,7 +176,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"head-index", no_argument, nullptr, kHeadIndex},
         {"solid", required_argument, nullptr, kSolid},
         {"contiguous", optional_argument, nullptr, kContiguous},
-        {"no-dedup", no_argument, nullptr, kNoDedup},
+        {"dedup", required_argument, nullptr, kDedup},
         {"dict", optional_argument, nullptr, kDict},
         {"dict-over-solid", required_argument, nullptr, kDictOverSolid},
         {"verbose", no_argument, nullptr, 'v'},
@@ -239,7 +238,14 @@ std::optional<Command> parse(int argc, char** argv)
             if (*opt.contiguous_limit > kMaxContiguous)
                 throw UsageError("--contiguous size can be at most 4G");
             break;
-        case kNoDedup: opt.dedup = false; break;
+        case kDedup:
+            if (arg == "on")
+                opt.dedup = true;
+            else if (arg == "off")
+                opt.dedup = false;
+            else
+                throw UsageError("--dedup must be on or off");
+            break;
         case kDict:
             opt.dict_size = optarg ? parse_size(arg, "dictionary size") : zar::kDefaultDictSize;
             if (*opt.dict_size < (1 << 10) || *opt.dict_size > (1 << 30))

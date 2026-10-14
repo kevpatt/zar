@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** early development (0.2.4). Both tools work and are well
+> **Status:** early development (0.2.5). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -193,7 +193,7 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `--all-times` | store access, status-change, and birth times as well as modification time |
 | `--names=MODE` | file names that aren't valid UTF-8: `raw` stores the bytes and flags the entry (default), `skip` leaves the file out, `latin1` converts from Latin-1. All three warn. |
 | `--compress-all` | compress files even if they're usually already compressed |
-| `--no-dedup` | store identical chunks again, rather than once; see [Deduplication](#deduplication) |
+| `--dedup=on\|off` | store identical chunks only once (default: on, except when writing to a pipe without `--head-index`); see [Deduplication](#deduplication) |
 | `--contiguous[=SIZE]` | store each file of at most SIZE bytes as a single block rather than in chunks; with no SIZE, files up to 4G (the largest block unzar reads) |
 | `--dict[=SIZE]` | train a zstd dictionary of at most SIZE bytes (default 110K) on the files, and compress them with it; see [Dictionaries](#dictionaries) |
 | `--head-index` | also put the index at the front, so the archive can be extracted from a pipe (the index is written twice) |
@@ -346,10 +346,11 @@ byte inserted at the start).
 
 Reading back needs an output zar can read: a file, or with `--head-index`,
 the temporary file the data is staged in. So when writing to a pipe without
-`--head-index`, zar doesn't deduplicate. Nor does it inside a solid archive,
-where zstd finds repeats on its own; it does in `--solid`'s fallback and
-dictionary archives. Memory use is about 40 bytes per distinct chunk, and
-hashing costs little next to compression. `--no-dedup` turns it off.
+`--head-index`, zar doesn't deduplicate, and `--dedup=on` is an error. Nor
+does it deduplicate inside a solid archive, where zstd finds repeats on its
+own; it does in `--solid`'s fallback and dictionary archives. Memory use is
+about 40 bytes per distinct chunk, and hashing costs little next to
+compression. `--dedup=off` turns it off.
 
 ## Streaming through pipes
 
@@ -367,6 +368,9 @@ archive from a pipe would mean buffering all of it. `--head-index` also
 writes the index at the front, so `unzar -` can read the index first and
 then extract each file, in parallel, as its data arrives. To make that
 possible, zar holds the data in a temporary file until the index is known.
+That temporary file also lets zar deduplicate (see
+[Deduplication](#deduplication)), which it can't do when writing straight
+to a pipe.
 
 Archives without a head index can still be extracted from a pipe if you save
 them to a file first. If standard input is a redirected file

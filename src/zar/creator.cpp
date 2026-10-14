@@ -153,7 +153,7 @@ public:
             writer_.emplace(out, options.align_log2, options.head_index);
         // Neither a pipe nor a solid archive's frame can be read back; in a
         // solid archive, zstd finds repeats itself.
-        dedup_ = options.dedup && pass_ == Pass::Normal && writer_->can_read_back();
+        dedup_ = options.dedup.value_or(true) && pass_ == Pass::Normal && writer_->can_read_back();
         if (dict) {
             dict_offset_ = writer_->write_dictionary(*dict);
             compressor_.use_dictionary(*dict);
@@ -810,6 +810,11 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
     std::vector<InputSpec> specs;    // check every name before writing anything
     for (const auto& input : inputs)
         specs.push_back(parse_input(input));
+
+    // Checked first, so nothing is written.
+    if (options.dedup == true && !options.head_index && !out.readable())
+        throw std::runtime_error("--dedup=on reads back what it has written, so it can't write "
+                                 "to a pipe (unless with --head-index)");
 
     if (options.solid_limit)
         if (auto stats = try_small(out, specs, options))
