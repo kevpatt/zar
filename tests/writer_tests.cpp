@@ -11,6 +11,7 @@
 #include "zar/dictionary.hpp"
 #include "zar/index.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fcntl.h>
 #include <fstream>

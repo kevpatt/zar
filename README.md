@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.3.6). Both tools work and are well
+> **Status:** development (0.3.7). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -126,8 +126,9 @@ cmake --install build         # install zar and unzar (default prefix /usr/local
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
-zar is developed on macOS (Apple Silicon). It uses only POSIX APIs and
-should build on Linux and the BSDs, but those aren't regularly tested yet.
+zar is developed on macOS (Apple Silicon) and also builds and passes its
+tests on Linux with GCC 15. It uses only POSIX APIs and should build on the
+BSDs, but those aren't regularly tested yet.
 
 Useful CMake options:
 

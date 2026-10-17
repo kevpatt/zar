@@ -17,6 +17,7 @@
 #include <set>
 #include <sys/stat.h>
 #include <system_error>
+#include <utility>
 #include <unistd.h>
 
 namespace zar {
@@ -353,26 +354,25 @@ struct Extractor::Impl {
                                "; set --max-size to try anyway");
     }
 
-    // Returns whether the archive's owner was applied.
-    bool apply_owner(int dir, const char* name, int fd, const Entry& e) const
+    // The owner and group to apply, -1 for either to leave unchanged, or
+    // nothing if the archive's owner isn't to be applied at all.
+    std::optional<std::pair<uid_t, gid_t>> owner_to_apply(const Entry& e) const
     {
         if (!privileged)
-            return false;
+            return std::nullopt;
         const auto uid = owner_of(e);
         const auto gid = group_of(e);
         if (!uid && !gid)
-            return false;
-        const auto u = uid.value_or(static_cast<uid_t>(-1));
-        const auto g = gid.value_or(static_cast<gid_t>(-1));
-        const int rc = fd >= 0 ? ::fchown(fd, u, g) : ::fchownat(dir, name, u, g, AT_SYMLINK_NOFOLLOW);
-        if (rc != 0)
-            throw_path_error("cannot set owner");
-        return true;
+            return std::nullopt;
+        return std::pair{uid.value_or(static_cast<uid_t>(-1)), gid.value_or(static_cast<gid_t>(-1))};
     }
 
     void apply_metadata(int fd, const Entry& e) const
     {
-        const bool owned = apply_owner(-1, nullptr, fd, e);    // before chmod: chown clears set-id bits
+        const auto owner = owner_to_apply(e);    // before chmod: chown clears set-id bits
+        if (owner && ::fchown(fd, owner->first, owner->second) != 0)
+            throw_path_error("cannot set owner");
+        const bool owned = owner.has_value();
         if (e.mode) {
             if (::fchmod(fd, permitted_mode(*e.mode, owned)) != 0)
                 throw_path_error("cannot set permissions");
@@ -540,14 +540,13 @@ struct Extractor::Impl {
                 }
                 in_flight.acquire(job.lengths[ref.index]);
                 pool.submit([this, ref, block, error, lost] {
-                    const auto& job = *ref.job;
                     run_chunk(*ref.job, ref.index, ref.position, [&] {
                         if (lost)
                             throw StreamLost(error);
                         if (!block)
                             throw FormatError(error);
-                        return reader.decode_chunk(job.entry, block->first, block->second,
-                                                   job.lengths[ref.index], decompress);
+                        return reader.decode_chunk(ref.job->entry, block->first, block->second,
+                                                   ref.job->lengths[ref.index], decompress);
                     });
                 });
             }
@@ -659,7 +658,9 @@ struct Extractor::Impl {
             if (::symlinkat(target.c_str(), dir.get(), name.c_str()) != 0)
                 throw_path_error("cannot create symlink");
         }
-        apply_owner(dir.get(), name.c_str(), -1, entry);
+        if (const auto owner = owner_to_apply(entry);
+            owner && ::fchownat(dir.get(), name.c_str(), owner->first, owner->second, AT_SYMLINK_NOFOLLOW) != 0)
+            throw_path_error("cannot set owner");
         const timespec times[2] = {to_timespec(entry.atime), to_timespec(entry.mtime)};
         if (::utimensat(dir.get(), name.c_str(), times, AT_SYMLINK_NOFOLLOW) != 0)
             throw_path_error("cannot set times");
