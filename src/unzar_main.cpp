@@ -48,13 +48,16 @@ archives created with zar --head-index.
                          extracted whole. Either needs -y.
       --hard-links       recreate hard links as links, where their targets
                          are extracted too (default: independent copies)
+      --sparse=MODE      sparse files: keep (default) leaves holes where the
+                         archive has them; auto also wherever a whole chunk
+                         is zeros; never writes every byte
   -j, --threads[=N]      worker threads (default: one per CPU core)
       --max-size=SIZE    refuse to decompress more than SIZE bytes in all
                          (e.g. 10G): the selected files' total is checked
                          before anything is written, and a solid archive
                          stops decompressing once it passes SIZE. Without
                          it, the limit is the free space where the data
-                         would go.
+                         would go. Holes left as holes don't count.
   -h, --human-readable   show sizes as 512, 1.0K, 31.4M, 2.0G, ...
   -v, --verbose          with --list, also show permissions and owner;
                          print a summary at the end
@@ -83,7 +86,7 @@ struct Command {
     bool human = false;
 };
 
-enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kHelp, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kSparse, kHelp, kVersion };
 
 void print_help()
 {
@@ -105,6 +108,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"threads", optional_argument, nullptr, 'j'},
         {"max-size", required_argument, nullptr, kMaxSize},
         {"hard-links", no_argument, nullptr, kHardLinks},
+        {"sparse", required_argument, nullptr, kSparse},
         {"verbose", no_argument, nullptr, 'v'},
         {"human-readable", no_argument, nullptr, 'h'},
         {"help", no_argument, nullptr, kHelp},
@@ -139,6 +143,16 @@ std::optional<Command> parse(int argc, char** argv)
                 throw UsageError("--dirs must be merge or replace");
             break;
         case kHardLinks: cmd.options.hard_links = true; break;
+        case kSparse:
+            if (std::string_view(optarg) == "keep")
+                cmd.options.sparse = zar::SparseMode::Keep;
+            else if (std::string_view(optarg) == "auto")
+                cmd.options.sparse = zar::SparseMode::Auto;
+            else if (std::string_view(optarg) == "never")
+                cmd.options.sparse = zar::SparseMode::Never;
+            else
+                throw UsageError("--sparse must be keep, auto, or never");
+            break;
         case 'v': cmd.verbose = true; break;
         case 'h': cmd.human = true; break;
         case kHelp:

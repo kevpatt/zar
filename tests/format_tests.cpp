@@ -54,6 +54,16 @@ TEST(crc32c_combine_matches_concatenation)
     CHECK(crc32c_combine(crc32c(all.first(5)), crc32c(all.subspan(5)), all.size() - 5) == crc32c(all));
 }
 
+TEST(crc32c_zeros_matches_real_zeros)
+{
+    const auto text = bytes_of("before a hole");
+    for (std::size_t n : {0u, 1u, 7u, 32u, 4096u, 1'000'003u}) {
+        const Bytes zeros(n, 0);
+        CHECK(crc32c_zeros(0, n) == crc32c(zeros));
+        CHECK(crc32c_zeros(crc32c(text), n) == crc32c(crc32c(text), zeros));
+    }
+}
+
 TEST(varint_round_trip)
 {
     for (std::uint64_t v : {0ull, 1ull, 127ull, 128ull, 300ull, 16383ull, 16384ull,

@@ -82,6 +82,14 @@ listed "unzar -l --scan"; wrote_nothing "unzar -l --scan"
 expect 0 "unzar -t" "$unzar" -t "$archive"
 not_listed "unzar -t"; wrote_nothing "unzar -t"
 
+# Sparse modes.
+for mode in keep auto never; do
+    expect 0 "unzar --sparse=$mode" "$unzar" --sparse="$mode" "$archive"
+    extracted "unzar --sparse=$mode"
+done
+expect 2 "unzar --sparse=bogus" "$unzar" --sparse=bogus "$archive"
+said "unzar --sparse=bogus" 'keep, auto, or never'
+
 # At most one mode, though repeating one is fine.
 for modes in "-xt" "-x --scan" "-lt --scan" "--extract -t"; do
     # shellcheck disable=SC2086

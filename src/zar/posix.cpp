@@ -109,6 +109,30 @@ void pwrite_all(int fd, std::span<const std::uint8_t> data, std::uint64_t positi
     }
 }
 
+bool HoleFinder::is_hole(std::uint64_t from, std::uint64_t length)
+{
+    if (from >= data_end_) {    // past the data found last time: find the next
+        data_ = from;
+        data_end_ = size_;
+#ifdef SEEK_DATA
+        const auto seek = [&](std::uint64_t at, int whence) -> std::optional<std::uint64_t> {
+            const auto to = ::lseek(fd_, static_cast<off_t>(at), whence);
+            if (to < 0)
+                return std::nullopt;
+            return std::min(static_cast<std::uint64_t>(to), size_);
+        };
+        if (const auto data = seek(from, SEEK_DATA)) {
+            data_ = *data;
+            if (data_ < size_)
+                data_end_ = std::max(seek(data_, SEEK_HOLE).value_or(size_), data_ + 1);
+        } else if (errno == ENXIO) {
+            data_ = size_;    // no data after `from`: a hole to the end
+        }    // otherwise holes aren't supported here: it's all data
+#endif
+    }
+    return from + length <= data_;
+}
+
 std::optional<std::uint64_t> free_space(const std::filesystem::path& path)
 {
     struct statvfs fs {};

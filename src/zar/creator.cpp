@@ -127,11 +127,12 @@ private:
     };
 
     struct PendingChunk {
-        std::future<CompressedChunk> chunk;    // unless `reuse`
+        std::future<CompressedChunk> chunk;    // unless `reuse` or `hole`
         std::size_t entry;
         std::size_t size;    // uncompressed, if being compressed
         std::optional<ChunkHash> hash;    // to remember the block by, once written
         std::optional<Stored> reuse;      // a duplicate of this block
+        bool hole = false;                // zeros, stored as no block at all
     };
 
     // A block that dedup may reuse, by the hash of its uncompressed data.
@@ -160,6 +161,7 @@ private:
     const std::optional<std::string>& cached_group(gid_t gid);
 
     void queue_chunk(Bytes chunk, std::size_t entry, bool compress);
+    void queue_hole(std::size_t entry);
     std::optional<Stored> find_duplicate(const ChunkHash& hash, ByteView chunk);
     void drain(std::size_t keep);
     void write_next();
@@ -347,9 +349,10 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     std::uint64_t total = 0;
     std::uint64_t chunk_count = 0;
     std::uint32_t crc = 0;
+    HoleFinder holes(fd.get(), expected);
     const auto read = [&](std::span<std::uint8_t> buffer) -> std::optional<std::size_t> {
         try {
-            return read_full(fd.get(), buffer, path.string());
+            return pread_full(fd.get(), buffer, total, path.string());
         } catch (const std::system_error& e) {
             warn(std::string(e.what()) + "; skipped");
             dropped_.insert(index);
@@ -361,6 +364,15 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     // full (§6.5) even if the file changes while we read it.
     while (total < expected) {
         const auto want = static_cast<std::size_t>(std::min(chunk_size, expected - total));
+        if (holes.is_hole(total, want)) {    // all zeros, and not worth reading (§6.5)
+            crc = crc32c_zeros(crc, want);
+            total += want;
+            ++chunk_count;
+            stats_.hole_bytes += want;
+            if (pass_ != Pass::Sample)
+                queue_hole(index);
+            continue;
+        }
         Bytes chunk(want);
         const auto n = read(chunk);
         if (!n)
@@ -384,7 +396,7 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     const auto grew = [&] {
         try {
             std::uint8_t probe;
-            return read_full(fd.get(), {&probe, 1}, path.string()) > 0;
+            return pread_full(fd.get(), {&probe, 1}, total, path.string()) > 0;
         } catch (const std::system_error&) {
             return false;    // it was read in full; this was only a check
         }
@@ -517,6 +529,14 @@ void Creator::queue_chunk(Bytes chunk, std::size_t entry, bool compress)
     drain(threads_ * 4);
 }
 
+// Queues a chunk that is all zeros, which is stored as a hole: no block.
+void Creator::queue_hole(std::size_t entry)
+{
+    pending_.push_back({{}, entry, 0, std::nullopt, std::nullopt, true});
+    ++queued_;
+    drain(threads_ * 4);
+}
+
 // A block already written (or queued) whose contents equal `chunk`.
 std::optional<Creator::Stored> Creator::find_duplicate(const ChunkHash& hash, ByteView chunk)
 {
@@ -563,6 +583,10 @@ void Creator::write_next()
     pending_bytes_ -= pending.size;
     ++written_;
 
+    if (pending.hole) {
+        entries_[pending.entry].chunks.push_back(kNoOffset);
+        return;
+    }
     Stored stored{};
     if (pending.reuse) {
         stored = *pending.reuse;

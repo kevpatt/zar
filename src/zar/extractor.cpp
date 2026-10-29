@@ -64,6 +64,25 @@ timespec to_timespec(const std::optional<Timestamp>& t)
     return {static_cast<time_t>(t->seconds), static_cast<long>(t->nanoseconds.value_or(0))};
 }
 
+bool is_hole(std::int64_t chunk) { return chunk == kNoOffset; }
+
+bool all_zeros(ByteView data)
+{
+    return std::ranges::all_of(data, [](std::uint8_t b) { return b == 0; });
+}
+
+// Writes `length` zero bytes at `position`.
+void write_zeros(int fd, std::uint64_t position, std::uint64_t length)
+{
+    static const Bytes zeros(1 << 20);
+    while (length) {
+        const auto n = std::min<std::uint64_t>(length, zeros.size());
+        pwrite_all(fd, ByteView(zeros).first(static_cast<std::size_t>(n)), position, "cannot write");
+        position += n;
+        length -= n;
+    }
+}
+
 // Names win over ids, so ownership carries across systems.
 std::optional<uid_t> owner_of(const Entry& e)
 {
@@ -157,7 +176,8 @@ struct Extractor::Impl {
         bool lost_to_stream = false;
         std::string dir_path;    // archive path of its directory
         std::string name;
-        bool opened = false;     // stream: creation was attempted
+        bool opened = false;     // stream: its first block has come by
+        std::atomic<bool> skipped = false;    // some zeros were left as holes
         UniqueFd dir;    // its directory, so a failed file can be removed
         UniqueFd out;
     };
@@ -281,7 +301,7 @@ struct Extractor::Impl {
             std::uint64_t total = 0;
             for (const auto& group : groups)
                 for (const auto* member : group.members)
-                    total += std::min(member->size.value_or(0), ~std::uint64_t{0} - total);
+                    total += std::min(bytes_to_produce(*member), ~std::uint64_t{0} - total);
             check_size(total);
         }
         if (!writing)
@@ -328,6 +348,25 @@ struct Extractor::Impl {
                 replaced.push_back(group.path);
             }
         }
+    }
+
+    // The bytes of a file that will be decompressed or written: holes count
+    // only if they'll be written out as zeros.
+    std::uint64_t bytes_to_produce(const Entry& e) const
+    {
+        auto size = e.size.value_or(0);
+        if (writing && options.sparse == SparseMode::Never)
+            return size;
+        std::vector<std::uint64_t> lengths;
+        try {
+            lengths = ArchiveReader::chunk_lengths(e);
+        } catch (const FormatError&) {
+            return size;    // reported when it's extracted
+        }
+        for (std::size_t i = 0; i < lengths.size(); ++i)
+            if (is_hole(e.chunks[i]))
+                size -= lengths[i];
+        return size;
     }
 
     // Refuses to decompress more than the size limit or, when extracting
@@ -444,10 +483,13 @@ struct Extractor::Impl {
         if (writing && !current)
             throw ExtractError("its directory could not be created");
 
-        if (reader.streaming() && !job->lengths.empty()) {
+        // Holes are filled in once the file exists: for a stream, when its
+        // first block comes by.
+        if (reader.streaming() && !std::ranges::all_of(entry.chunks, is_hole)) {
             std::uint64_t position = 0;
             for (std::size_t i = 0; i < job->lengths.size(); ++i) {
-                streamed[entry.chunks[i]].push_back({job, i, position});
+                if (!is_hole(entry.chunks[i]))
+                    streamed[entry.chunks[i]].push_back({job, i, position});
                 position += job->lengths[i];
             }
             return;
@@ -461,11 +503,48 @@ struct Extractor::Impl {
         }
         std::uint64_t position = 0;
         for (std::size_t i = 0; i < job->lengths.size(); ++i) {
-            in_flight.acquire(job->lengths[i]);
-            pool.submit([this, job, i, position] {
-                run_chunk(*job, i, position,
-                          [&] { return reader.chunk(job->entry, i, job->lengths[i], decompress); });
-            });
+            if (is_hole(entry.chunks[i])) {
+                submit_hole(job, i, position);
+            } else {
+                in_flight.acquire(job->lengths[i]);
+                pool.submit([this, job, i, position] {
+                    run_chunk(*job, i, position,
+                              [&] { return reader.chunk(job->entry, i, job->lengths[i], decompress); });
+                });
+            }
+            position += job->lengths[i];
+        }
+    }
+
+    // A chunk stored as a hole (§6.5): zeros, with no block to read.
+    void submit_hole(const std::shared_ptr<FileJob>& job, std::size_t index, std::uint64_t position)
+    {
+        in_flight.acquire(0);    // nothing in memory, but it's still an item
+        pool.submit([this, job, index, position] {
+            auto& j = *job;
+            const auto length = j.lengths[index];
+            if (!j.failed) {
+                try {
+                    j.crcs[index] = crc32c_zeros(0, length);
+                    if (j.out && options.sparse == SparseMode::Never)
+                        write_zeros(j.out.get(), position, length);
+                    else
+                        j.skipped = true;
+                } catch (const std::exception& e) {
+                    j.fail(e.what());
+                }
+            }
+            chunk_done(j, 0);
+        });
+    }
+
+    // Stream: the holes of a file that has just been created.
+    void submit_holes(const std::shared_ptr<FileJob>& job)
+    {
+        std::uint64_t position = 0;
+        for (std::size_t i = 0; i < job->lengths.size(); ++i) {
+            if (is_hole(job->entry.chunks[i]))
+                submit_hole(job, i, position);
             position += job->lengths[i];
         }
     }
@@ -493,7 +572,9 @@ struct Extractor::Impl {
             try {
                 const auto data = load();
                 job.crcs[index] = crc32c(data);
-                if (job.out)
+                if (job.out && options.sparse == SparseMode::Auto && all_zeros(data))
+                    job.skipped = true;
+                else if (job.out)
                     pwrite_all(job.out.get(), data, position, "cannot write");
             } catch (const StreamLost& e) {
                 job.fail(e.what(), true);
@@ -501,7 +582,13 @@ struct Extractor::Impl {
                 job.fail(e.what());
             }
         }
-        in_flight.release(job.lengths[index]);
+        chunk_done(job, job.lengths[index]);
+    }
+
+    // Each chunk's last step: `bytes` is what it acquired from `in_flight`.
+    void chunk_done(FileJob& job, std::uint64_t bytes)
+    {
+        in_flight.release(bytes);
         if (--job.remaining == 0)
             complete(job);
     }
@@ -530,13 +617,16 @@ struct Extractor::Impl {
 
             for (const auto& ref : refs) {
                 auto& job = *ref.job;
-                if (writing && !job.opened) {
+                if (!job.opened) {
                     job.opened = true;
-                    try {
-                        create_file(job, open_directory(job.dir_path, true).get());
-                    } catch (const std::exception& e) {
-                        job.fail(e.what());
+                    if (writing) {
+                        try {
+                            create_file(job, open_directory(job.dir_path, true).get());
+                        } catch (const std::exception& e) {
+                            job.fail(e.what());
+                        }
                     }
+                    submit_holes(ref.job);
                 }
                 in_flight.acquire(job.lengths[ref.index]);
                 pool.submit([this, ref, block, error, lost] {
@@ -567,6 +657,10 @@ struct Extractor::Impl {
                 if (!crc_matches(*job.entry.content_crc, crc))
                     throw FormatError("content checksum mismatch");
             }
+            // Holes at the end exist only once the file has its full size.
+            if (job.out && job.skipped &&
+                ::ftruncate(job.out.get(), static_cast<off_t>(job.entry.size.value_or(0))) != 0)
+                throw_path_error("cannot set size");
         } catch (const std::exception& e) {
             if (job.out)
                 ::unlinkat(job.dir.get(), job.name.c_str(), 0);    // don't leave a partial file

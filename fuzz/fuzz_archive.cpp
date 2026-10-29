@@ -145,6 +145,8 @@ std::vector<Bytes> make_seeds()
     write(dir / "src/sub/b.bin", noise);
     write(dir / "src/sub/c.txt", words);
     write(dir / "src/empty", {});
+    write(dir / "src/sparse", words);
+    fs::resize_file(dir / "src/sparse", 64 << 10);    // a hole, where supported
     fs::create_symlink("a.txt", dir / "src/link");
     fs::create_hard_link(dir / "src/a.txt", dir / "src/sub/hard");
 

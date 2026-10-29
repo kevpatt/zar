@@ -29,6 +29,13 @@ enum class DirMode {
     Replace,    // delete each existing directory being extracted whole first
 };
 
+// How to write the zeros in sparse files.
+enum class SparseMode {
+    Keep,     // leave holes where the archive has them (§6.5)
+    Auto,     // and wherever a whole chunk is zeros
+    Never,    // write every byte
+};
+
 struct ExtractOptions {
     ExtractMode mode = ExtractMode::Extract;
     std::filesystem::path directory = ".";
@@ -38,8 +45,10 @@ struct ExtractOptions {
     // Recreate hard links with link(2) where the target is extracted too and
     // the filesystem allows it, rather than extracting independent copies.
     bool hard_links = false;
-    // The most file data to decompress (Extract and Test), checked up front.
-    // Without it, extraction is limited to the destination's free space.
+    SparseMode sparse = SparseMode::Keep;
+    // The most file data to decompress (Extract and Test), checked up front,
+    // not counting holes that stay holes. Without it, extraction is limited
+    // to the destination's free space.
     std::optional<std::uint64_t> size_limit;
     std::function<void(std::string_view)> on_warning;    // may be called from any thread
 };

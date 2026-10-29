@@ -26,13 +26,14 @@ struct Version {
 
 // The version of FORMAT.md this implements. It changes only when the format
 // does, independently of the program's version (CMakeLists.txt).
-inline constexpr Version kFormatVersion{0, 3, 6};
+inline constexpr Version kFormatVersion{0, 5, 0};
 
 inline constexpr std::size_t kHeaderSize = 32;        // zar and block headers
 inline constexpr std::size_t kTrailerSize = kHeaderSize + 16;
 inline constexpr std::array<std::uint8_t, 8> kMagic{0x89, 'Z', 'A', 'R', '\r', '\n', 0x1a, '\n'};
 
-// Offsets are relative to the archive's base (§2.2); -1 means "none".
+// Offsets are relative to the archive's base (§2.2); -1 means "none" (and in
+// CHUNKS, a hole: a chunk of zeros with no block, §6.5).
 inline constexpr std::int64_t kNoOffset = -1;
 
 inline constexpr std::uint8_t kAlignLog2Max = 20;     // §2.1

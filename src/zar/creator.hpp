@@ -66,6 +66,7 @@ struct CreateStats {
     std::uint64_t input_bytes = 0;
     std::uint64_t archive_bytes = 0;
     std::uint64_t deduplicated_bytes = 0;    // uncompressed data not stored again
+    std::uint64_t hole_bytes = 0;            // holes in sparse files, stored as such
     std::uint64_t warnings = 0;
     bool solid = false;         // the solid form was kept
     bool dictionary = false;    // files were compressed with a trained dictionary

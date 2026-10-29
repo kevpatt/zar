@@ -18,7 +18,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.4.1). Both tools work and are well
+> **Status:** development (0.5.0). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -31,6 +31,7 @@ $ unzar project.zar project/src/main.cpp
 - [Solid archives](#solid-archives)
 - [Dictionaries](#dictionaries)
 - [Deduplication](#deduplication)
+- [Sparse files](#sparse-files)
 - [Streaming through pipes](#streaming-through-pipes)
 - [Safety](#safety)
 - [The archive format](#the-archive-format)
@@ -61,6 +62,9 @@ $ unzar project.zar project/src/main.cpp
   duplicate files (or repeated chunks, like runs of zeros in disk images)
   cost almost nothing. Candidates are found by an XXH3-128 hash, and confirmed by
   comparing bytes before a block is reused.
+- **Sparse files.** Holes in sparse files, such as disk images, are
+  recorded rather than read and stored, and `unzar` recreates them as
+  holes, so a mostly empty 100 GB image doesn't take 100 GB to extract.
 - **Alignment.** `--align` places payloads on cache-line or page boundaries,
   and `--contiguous` keeps each file in a single block, so stored data can be
   `mmap`ed straight from the archive.
@@ -82,6 +86,7 @@ $ unzar project.zar project/src/main.cpp
 | Random access *within* a large file | ✅ (per chunk) | ❌ | ❌ |
 | Compression across similar small files | ✅ with `--solid` or `--dict` | ✅ | ❌ |
 | Duplicate files and data stored once | ✅ (by default) | ⚠️ only within zstd's window | ❌ |
+| Sparse files kept sparse | ✅ (per chunk) | ✅ GNU tar `--sparse`, bsdtar | ❌ |
 | Checksums | every block, and every file | whole stream (optional) | every file |
 | Verify without decompressing | ✅ `--scan` | ❌ | ❌ |
 | Write to a pipe | ✅ | ✅ | ⚠️ limited |
@@ -126,8 +131,8 @@ cmake --install build         # install zar and unzar (default prefix /usr/local
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
-zar is developed on macOS (Apple Silicon) and also builds and passes its
-tests on Linux with GCC 15. It uses only POSIX APIs and should build on the
+zar is developed on macOS (Apple Silicon) with Apple Clang, and also builds
+and passes its tests with GCC 15 on Linux and GCC 16 on macOS. It uses only POSIX APIs and should build on the
 BSDs, but those aren't regularly tested yet.
 
 Useful CMake options:
@@ -276,6 +281,7 @@ src/sub/
 | `-y, --yes` | overwrite files and directories that already exist |
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` first deletes each one that is extracted whole (not the parents of a selected path). Either needs `-y`. |
 | `--hard-links` | recreate hard links with `link(2)` where their targets are extracted too; by default each is extracted as an independent copy. Falls back to a copy where the filesystem refuses. |
+| `--sparse=MODE` | sparse files: `keep` (default) leaves holes where the archive has them; `auto` also wherever a whole chunk is zeros; `never` writes every byte. See [Sparse files](#sparse-files). |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`); without it, the limit is the free space where the data would go |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
@@ -370,6 +376,44 @@ own; it does in `--solid`'s fallback and dictionary archives. Memory use is
 about 40 bytes per distinct chunk, and hashing costs little next to
 compression. `--dedup=off` turns it off.
 
+## Sparse files
+
+A sparse file has **holes**: ranges the filesystem has no storage for,
+which read as zeros. Disk images, database files, and core dumps are often
+mostly holes.
+
+zar asks the filesystem where a file's holes are (`SEEK_DATA` and
+`SEEK_HOLE`). A chunk that lies entirely within a hole is recorded as a hole,
+with no block and without being read, so a sparse 100 GB image archives as
+quickly as the data in it. A chunk that is only partly a hole is stored as
+usual; its zeros compress to almost nothing. `zar -v` reports how much was
+in holes.
+
+`unzar` leaves those chunks unallocated, so the file takes no more space
+than the data in it, and `--max-size` and the free-space check count only
+the data. The file is still verified as a whole: its CRC covers the zeros.
+`--sparse` chooses how the zeros are written:
+
+| Mode | Holes in the archive | Other chunks of zeros |
+|---|---|---|
+| `keep` (default) | left as holes | written |
+| `auto` | left as holes | left as holes |
+| `never` | written | written |
+
+`auto` makes holes even in archives of files that weren't sparse, like
+`cp --sparse=always`. `never` is for files that must be fully allocated,
+such as swap files. Holes are kept a chunk at a time (1 MiB by default), so
+smaller ones come back as written zeros; archive with a smaller
+`--chunk-size` to keep them. A file stored with `--contiguous` is a single
+chunk, so it is kept sparse only if it's entirely a hole. Some filesystems
+allocate small holes anyway: APFS fills in a gap of under about 16 MiB
+when data is written after it.
+
+Holes depend on how a file was written, not just on its contents, so two
+copies of the same data can archive differently, though they extract the
+same. Holes are part of format 0.5.0; older versions of `unzar` reject a
+file with holes (and extract the rest of the archive).
+
 ## Streaming through pipes
 
 `zar -o -` writes an archive to standard output, and `unzar -` reads one
@@ -415,7 +459,8 @@ them to a file first. If standard input is a redirected file
   caps how much will be decompressed, both for the files selected (checked
   up front) and for solid archives (checked as they expand). Without it,
   extraction is limited to the free space at the destination, and a solid
-  archive to the free space in `$TMPDIR`.
+  archive to the free space in `$TMPDIR`. Holes left as holes don't count,
+  since they take neither time nor space.
 - **Memory.** Nothing is allocated at a size the archive merely claims:
   blocks read from a pipe grow as their data arrives, and a compressed block
   can't claim more than zstd could produce from it (32,768 times its size).
@@ -432,8 +477,9 @@ them to a file first. If standard input is a redirected file
   terminal.
 
 The test suite includes deliberately malicious archives for each of these
-cases, and `fuzz/` has a fuzz target for the reader (see below). CRC-32C detects accidental damage, not tampering; cryptographic
-signatures are [on the roadmap](TODO.md).
+cases, and `fuzz/` has a fuzz target for the reader (see below). CRC-32C
+detects accidental damage, not tampering; cryptographic signatures are
+[on the roadmap](TODO.md).
 
 ## The archive format
 
@@ -451,7 +497,8 @@ The format is specified in [FORMAT.md](FORMAT.md). In outline:
 - Everything else is a **block**: a 32-byte header (type, size, its own
   offset, and CRCs of both the header and the payload) followed by the
   payload. Blocks hold file data (compressed or stored), indexes,
-  dictionaries, or a whole compressed archive.
+  dictionaries, or a whole compressed archive. A chunk of a sparse file's
+  hole has no block at all.
 - The **index** lists every entry as a path plus optional, typed metadata
   fields, so new fields can be added without breaking older readers. Large
   directories can be split into sub-indexes.
@@ -486,12 +533,17 @@ src/
     dictionary.*       collecting samples and training dictionaries
     dedup.*            chunk hashes for deduplication
     thread_pool.*      worker threads and in-flight limits for extraction
-    posix.*            file descriptors, I/O loops, and user lookups
+    posix.*            file descriptors, I/O loops, holes, free space,
+                       temporary files, and user lookups
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated
     names.*            UTF-8 and path rules
     policy.*           which files are already compressed
-tests/                 unit and end-to-end tests (run with ctest)
+    bytes.hpp          little-endian integers and varints
+    error.hpp          format errors
+    version.hpp.in     version information, filled in by CMake
+tests/                 unit and end-to-end tests, and cli_test.sh for the
+                       commands themselves (all run with ctest)
 fuzz/                  a fuzz target for everything unzar reads
 third_party/xxhash/    xxHash 0.8.3 (BSD 2-Clause), for XXH3-128
 ```

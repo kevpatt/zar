@@ -23,6 +23,10 @@ Files are compressed with zstd in independently checksummed chunks, so
 can list, verify, or extract any file without decompressing the rest.
 Directories, symbolic links, and hard links are stored as such, with
 permissions and modification times.
+A chunk that lies entirely within a hole of a sparse file is recorded as a
+hole, without being read or stored, and
+.Xr unzar 1
+recreates it as a hole.
 Devices, FIFOs, and sockets are skipped with a warning.
 .Pp
 A
@@ -102,6 +106,8 @@ Split files into independently compressed chunks of
 .Ar size
 bytes: a power of two from 4K to 1G.
 The default is 1M.
+Holes in sparse files are kept a chunk at a time, so smaller chunks keep
+smaller holes.
 .It Fl \-align Ns Op = Ns Ar n
 Align each block's payload to
 .Ar n
@@ -180,7 +186,7 @@ of the solid archive's size (and fits too).
 The default is 120; 0 never tries.
 .It Fl v , Fl \-verbose
 List each path on standard error as it is added, and print a summary at the
-end.
+end, including how much data was deduplicated or in holes.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

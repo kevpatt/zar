@@ -99,6 +99,15 @@ Either needs
 .It Fl \-hard-links
 Recreate hard links as links, where their targets are extracted too.
 By default each is extracted as an independent copy.
+.It Fl \-sparse Ns = Ns Ar mode
+How to write the zeros in sparse files:
+.Cm keep
+(the default) leaves holes, unallocated, wherever the archive records them;
+.Cm auto
+also leaves a hole wherever a whole chunk is zeros; and
+.Cm never
+writes every byte, for files that must be fully allocated.
+Holes are kept a chunk at a time, so smaller ones are written as zeros.
 .It Fl j , Fl \-threads Ns Op = Ns Ar n
 Use
 .Ar n
@@ -116,6 +125,7 @@ solid archive stops decompressing once it passes
 Without this option, extraction is limited to the free space at the
 destination, and a solid archive to the free space in
 .Ev TMPDIR .
+Holes left as holes count toward neither limit.
 .It Fl h , Fl \-human-readable
 Show sizes as 512, 1.0K, 31.4M, 2.0G, and so on.
 .It Fl v , Fl \-verbose

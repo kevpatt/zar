@@ -8,11 +8,13 @@
 
 #include "zar/archive_reader.hpp"
 #include "zar/archive_writer.hpp"
+#include "zar/compressor.hpp"
 #include "zar/crc32c.hpp"
 #include "zar/creator.hpp"
 #include "zar/dedup.hpp"
 #include "zar/dictionary.hpp"
 #include "zar/extractor.hpp"
+#include "zar/posix.hpp"
 
 #include <algorithm>
 #include <fcntl.h>
@@ -1389,4 +1391,213 @@ TEST(set_id_bits_need_a_restored_owner)
     CHECK(permitted_mode(02775, false) == 0775);
     CHECK(permitted_mode(01777, false) == 01777);
     CHECK(permitted_mode(06755, true) == 06755);
+}
+
+namespace {
+
+constexpr std::uint64_t kMiB = 1 << 20;
+
+// Whether `dir`'s filesystem keeps holes and reports them to SEEK_DATA.
+bool holes_supported(const fs::path& dir)
+{
+#ifdef SEEK_DATA
+    const auto probe = dir / "hole-probe";
+    const UniqueFd fd(::open(probe.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+    const bool supported = fd && ::ftruncate(fd.get(), 64 * kMiB) == 0 &&
+                           ::lseek(fd.get(), 0, SEEK_DATA) < 0 && errno == ENXIO;
+    fs::remove(probe);
+    return supported;
+#else
+    (void)dir;
+    return false;
+#endif
+}
+
+// A file of `size` bytes, all holes but for `data` written at each offset.
+// The gaps should be large: APFS fills in gaps of under 16 MiB.
+void write_sparse(const fs::path& path, std::uint64_t size, const std::map<std::uint64_t, Bytes>& data)
+{
+    fs::create_directories(path.parent_path());
+    const UniqueFd fd(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+    for (const auto& [offset, bytes] : data)
+        pwrite_all(fd.get(), bytes, offset, path.string());
+    if (::ftruncate(fd.get(), static_cast<off_t>(size)) != 0)
+        throw_errno(path.string());
+}
+
+std::uint64_t allocated(const fs::path& path)
+{
+    return static_cast<std::uint64_t>(stat_of(path).st_blocks) * 512;
+}
+
+// Extracts an archive's bytes through a pipe, as `unzar -` does.
+Run run_from_pipe(const Bytes& bytes, const ExtractOptions& options)
+{
+    int fds[2];
+    if (::pipe(fds) != 0)
+        throw_errno("pipe");
+    std::jthread feeder([&, fd = fds[1]] {
+        try {
+            write_all(fd, bytes, "pipe");
+        } catch (const std::exception&) {
+        }
+        ::close(fd);
+    });
+    auto reader = ArchiveReader::open_stream(fds[0], "pipe");
+    auto result = run(reader, options);
+    feeder.join();
+    ::close(fds[0]);
+    return result;
+}
+
+} // namespace
+
+TEST(sparse_files_keep_their_holes)
+{
+    TempDir tmp;
+    if (!holes_supported(tmp.path()))
+        return;    // nothing to test on this filesystem
+    const auto src = tmp.path() / "src";
+    const auto start = random_bytes(kMiB, 1), middle = random_bytes(5000, 2);
+    write_sparse(src / "disk.img", 80 * kMiB, {{0, start}, {40 * kMiB, middle}});
+    write_sparse(src / "empty.img", 50 * kMiB, {});
+    Bytes expected(80 * kMiB);
+    std::ranges::copy(start, expected.begin());
+    std::ranges::copy(middle, expected.begin() + 40 * kMiB);
+
+    const auto archive = tmp.path() / "a.zar";
+    CreateStats created;
+    {
+        auto out = Output::create_file(archive, true);
+        created = create_archive(out, std::vector{src / "."}, {});
+        out.commit();
+    }
+    CHECK(created.hole_bytes == 78 * kMiB + 50 * kMiB);
+    CHECK(fs::file_size(archive) < 2 * kMiB);
+    auto reader = ArchiveReader::open(archive);
+    for (const auto& entry : reader.entries())
+        if (entry.path == "disk.img")
+            CHECK(std::ranges::count(entry.chunks, kNoOffset) == 78);
+
+    // Kept as holes: only the chunks with data take space.
+    const auto keep = tmp.path() / "keep";
+    CHECK(run(archive, into(keep)).warnings.empty());
+    CHECK(read_file(keep / "disk.img") == expected);
+    CHECK(fs::file_size(keep / "empty.img") == 50 * kMiB);
+    CHECK(allocated(keep / "disk.img") <= 3 * kMiB);
+    CHECK(allocated(keep / "empty.img") < kMiB);
+
+    // Or written out in full.
+    const auto never = tmp.path() / "never";
+    auto options = into(never);
+    options.sparse = SparseMode::Never;
+    CHECK(run(archive, options).warnings.empty());
+    CHECK(read_file(never / "disk.img") == expected);
+    CHECK(allocated(never / "disk.img") >= 80 * kMiB);
+    CHECK(allocated(never / "empty.img") >= 50 * kMiB);
+
+    CHECK(run(archive, into(tmp.path(), ExtractMode::Test)).warnings.empty());
+}
+
+TEST(sparse_files_extract_from_a_pipe)
+{
+    TempDir tmp;
+    if (!holes_supported(tmp.path()))
+        return;
+    const auto src = tmp.path() / "src";
+    const auto data = random_bytes(70'000, 3);
+    // With 64K chunks, b.img's data chunks repeat a.img's, so the stream
+    // delivers its blocks out of order; c.img has no blocks at all.
+    write_sparse(src / "a.img", 40 * kMiB, {{20 * kMiB, data}});
+    write_sparse(src / "b.img", 60 * kMiB, {{0, Bytes(64 * 1024)}, {20 * kMiB, data}});
+    write_sparse(src / "c.img", 30 * kMiB, {});
+    const auto archive = tmp.path() / "head.zar";
+    {
+        auto out = Output::create_file(archive, true);
+        CreateOptions options;
+        options.head_index = true;
+        options.chunk_size = 64 * 1024;
+        create_archive(out, std::vector{src / "."}, options);
+        out.commit();
+    }
+    const auto bytes = read_file(archive);
+
+    const auto dest = tmp.path() / "out";
+    auto options = into(dest);
+    options.threads = 4;
+    CHECK(run_from_pipe(bytes, options).warnings.empty());
+    for (const auto* name : {"a.img", "b.img", "c.img"}) {
+        CHECK(read_file(dest / name) == read_file(src / name));
+        CHECK(allocated(dest / name) <= kMiB);
+    }
+    CHECK(run_from_pipe(bytes, into(dest, ExtractMode::Test)).warnings.empty());
+}
+
+TEST(zero_chunks_become_holes_when_asked)
+{
+    TempDir tmp;
+    if (!holes_supported(tmp.path()))
+        return;
+    // Zeros that were written, so the archive stores them (once) as data.
+    Bytes dense = random_bytes(kMiB, 4);
+    dense.resize(41 * kMiB);
+    const auto tail = random_bytes(kMiB, 5);
+    dense.insert(dense.end(), tail.begin(), tail.end());
+    write_file(tmp.path() / "src/dense.img", dense);
+    const auto archive = make_archive(tmp.path() / "a.zar", tmp.path() / "src");
+
+    const auto keep = tmp.path() / "keep";
+    CHECK(run(archive, into(keep)).warnings.empty());
+    CHECK(allocated(keep / "dense.img") >= 42 * kMiB);
+
+    const auto sparse = tmp.path() / "auto";
+    auto options = into(sparse);
+    options.sparse = SparseMode::Auto;
+    CHECK(run(archive, options).warnings.empty());
+    CHECK(read_file(sparse / "dense.img") == dense);
+    CHECK(allocated(sparse / "dense.img") <= 3 * kMiB);
+}
+
+// Crafted, so these run on any filesystem.
+TEST(holes_are_checked_and_cost_no_size_limit)
+{
+    TempDir tmp;
+    constexpr std::uint64_t kHoles = std::uint64_t{1} << 36;    // 64 GiB
+    const auto archive = tmp.path() / "holes.zar";
+    const auto write = [&](std::uint32_t crc) {
+        auto out = Output::create_file(archive, true);
+        ArchiveWriter writer(out, kAlignLog2Default);
+        auto file = make(EntryType::File, "f");
+        file.size = kHoles + 1;
+        file.chunk_size = kMiB;
+        file.chunks.assign(kHoles / kMiB, kNoOffset);
+        file.chunks.push_back(writer.write_block(BlockType::DataRaw, text("x")));
+        file.content_crc = crc;
+        Bytes index;
+        encode_entry(index, file);
+        writer.finish(BlockType::IndexZstd, zstd_compress(index, 3));
+        out.commit();
+    };
+    write(crc32c(crc32c_zeros(0, kHoles), text("x")));
+
+    // Only the one byte of data counts against a size limit...
+    auto test = into(tmp.path(), ExtractMode::Test);
+    test.size_limit = 10;
+    CHECK(run(archive, test).warnings.empty());
+    const auto dest = tmp.path() / "out";
+    auto options = into(dest);
+    options.size_limit = 10;
+    CHECK(run(archive, options).warnings.empty());
+    CHECK(fs::file_size(dest / "f") == kHoles + 1);
+    fs::remove(dest / "f");
+
+    // ...unless the holes are to be written out.
+    options.sparse = SparseMode::Never;
+    CHECK_THROWS_WITH(run(archive, options), "size limit");
+
+    // The content checksum still covers the zeros.
+    write(crc32c(text("x")));
+    const auto result = run(archive, test);
+    CHECK(result.warnings.size() == 1 &&
+          result.warnings[0].find("checksum mismatch") != std::string::npos);
 }

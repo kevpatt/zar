@@ -31,7 +31,8 @@ namespace fs = std::filesystem;
 constexpr std::string_view kDescription =
     "Creates a zar archive of a file or directory. Files are compressed with\n"
     "zstd in independently checksummed chunks, so any file can be listed,\n"
-    "verified, or extracted without decompressing the rest.";
+    "verified, or extracted without decompressing the rest. Holes in sparse\n"
+    "files are recorded rather than stored.";
 
 constexpr std::string_view kUsage = R"(usage: zar [options] PATH
        zar [options] -m -o ARCHIVE PATH...
@@ -52,7 +53,8 @@ PATH is stored under its own name, so extracting recreates it:
   -j, --threads[=N]      worker threads (default: one per CPU core)
       --chunk-size=SIZE  split files into independently compressed chunks
                          of SIZE bytes: a power of two from 4K to 1G, with
-                         an optional K, M, or G suffix (default 1M)
+                         an optional K, M, or G suffix (default 1M). Holes
+                         in sparse files are kept a chunk at a time.
       --align[=N]        align block payloads to N bytes (default 8; with no
                          N, the CPU's cache-line size)
       --owner[=WHICH]    store file ownership: ids, names, or both (default)
@@ -79,7 +81,7 @@ PATH is stored under its own name, so extracting recreates it:
                          compressed with a dictionary, and keep it instead if
                          it's at most PERCENT of the solid size and fits too
                          (default 120; 0 never tries)
-  -v, --verbose          list files as they are added
+  -v, --verbose          list files as they are added, and print a summary
       --help             show this help
       --version          show version information
 
@@ -310,6 +312,8 @@ int run(Command& cmd)
                   << (stats.solid ? " (solid)" : stats.dictionary ? " (dictionary)" : "");
         if (stats.deduplicated_bytes)
             std::cerr << ", " << zar::cli::human_size(stats.deduplicated_bytes) << " deduplicated";
+        if (stats.hole_bytes)
+            std::cerr << ", " << zar::cli::human_size(stats.hole_bytes) << " in holes";
         std::cerr << '\n';
     }
     return stats.warnings ? 1 : 0;

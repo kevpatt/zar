@@ -49,6 +49,25 @@ std::size_t pread_full(int fd, std::span<std::uint8_t> out, std::uint64_t positi
 void write_all(int fd, std::span<const std::uint8_t> data, const std::string& what);
 void pwrite_all(int fd, std::span<const std::uint8_t> data, std::uint64_t position, const std::string& what);
 
+// Finds the holes in a sparse file: ranges the filesystem has no storage
+// for, which read as zeros. Uses lseek(SEEK_DATA/SEEK_HOLE), so it moves
+// the file offset; read with pread(). A filesystem that doesn't track holes
+// reports none.
+class HoleFinder {
+public:
+    HoleFinder(int fd, std::uint64_t size) : fd_(fd), size_(size) {}
+
+    // Whether [from, from + length) lies entirely within a hole. `from` must
+    // not decrease from call to call.
+    bool is_hole(std::uint64_t from, std::uint64_t length);
+
+private:
+    int fd_;
+    std::uint64_t size_;
+    std::uint64_t data_ = 0;        // the next data at or after the last lookup
+    std::uint64_t data_end_ = 0;    // where that data ends
+};
+
 // Bytes available to unprivileged users on the filesystem holding `path`.
 std::optional<std::uint64_t> free_space(const std::filesystem::path& path);
 

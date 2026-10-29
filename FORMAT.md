@@ -1,12 +1,12 @@
 # The zar archive format
 
-Version 0.3.6 (draft)
+Version 0.5.0 (draft)
 
 A zar archive is a sequence of **blocks** behind a fixed **zar header**.
 Every block is self-describing and independently checksummed, and every
-piece of file content lives in its own block, so any file — or any chunk of
-a file — can be read and decompressed without touching the rest of the
-archive.
+piece of file content lives in its own block (except the holes of sparse
+files, which need none), so any file — or any chunk of a file — can be read
+and decompressed without touching the rest of the archive.
 
 ## 1. Conventions
 
@@ -18,8 +18,8 @@ archive.
   first, high bit set on all but the last byte. At most 10 bytes; the
   encoding must be minimal (no trailing `0x80`-only groups).
 - **Offsets** are signed 64-bit byte offsets relative to the archive's
-  **base** (§2.2). The value `-1` (all bits set) means "none"; writers must
-  never place a block at offset -1.
+  **base** (§2.2). The value `-1` (all bits set) means "none", or in
+  `CHUNKS`, a hole (§6.5); writers must never place a block at offset -1.
 - "Must", "should", and "may" are used in the RFC 2119 sense.
 
 ## 2. File layout
@@ -280,7 +280,7 @@ and 8 bytes only when it doesn't, so a 32-bit size is the default and a
 | `0x01` | PATH          | bytes               | all — **required**  |
 | `0x02` | SIZE          | u32 / u64           | FILE, HARDLINK      |
 | `0x03` | CHUNK_SIZE    | u32 / u64           | FILE, HARDLINK      |
-| `0x04` | CHUNKS        | i64 × n             | FILE, HARDLINK      |
+| `0x04` | CHUNKS        | i64 × n (-1: hole)  | FILE, HARDLINK      |
 | `0x05` | DICT          | i64                 | FILE, HARDLINK      |
 | `0x06` | CONTENT_CRC   | u32                 | FILE, HARDLINK      |
 | `0x07` | LINK_TARGET   | bytes               | SYMLINK, HARDLINK   |
@@ -313,11 +313,18 @@ Each tag may appear at most once per entry.
   what that implies. `CHUNK_SIZE` may be omitted when there is exactly one chunk.
   Data blocks may be shared: any number of chunks, in the same entry or in
   others, may reference one block holding identical data.
+
+  An offset of -1 marks a **hole**: the chunk is all zeros, and no block
+  holds it. Holes let a sparse file be stored, and extracted, without
+  reading or writing its unallocated ranges. A writer should store a chunk
+  as a hole when it lies entirely within one of the file's holes, and may
+  for any chunk of zeros. An extractor may leave a hole unallocated, or
+  write the zeros.
 - **DICT** — offset of the ZSTD_DICT block needed to decompress this entry's
   DATA_ZSTD chunks. Since this identifies the dictionary, writers may omit
   the dictionary ID from those frames' headers.
 - **CONTENT_CRC** — CRC of the file's entire uncompressed content, for
-  end-to-end verification.
+  end-to-end verification. It covers the zeros of any holes.
 - **LINK_TARGET** — for SYMLINK, the link text exactly as `readlink(2)`
   returned it. For HARDLINK, the PATH (relative to the archive root) of the
   entry it is linked to.
@@ -392,4 +399,10 @@ earlier while extracting the same archive.
 - **patch** — clarifications only; it has no effect on compatibility.
 
 While the major version is 0, the format is unstable and no compatibility
-is promised.
+is promised, and a minor version may add things older readers must reject.
+
+Changes in recent versions:
+
+- **0.5.0** — holes: a `CHUNKS` offset of -1 is a chunk of zeros with no
+  block (§6.5). Readers of earlier versions reject such entries.
+- **0.3.6** — `base_offset` must be 0 or at least 32 (§2.2).

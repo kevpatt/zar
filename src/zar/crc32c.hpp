@@ -34,4 +34,8 @@ constexpr bool crc_matches(std::uint32_t stored, std::uint32_t computed) noexcep
 // touching the data. Lets chunks be checksummed independently, in any order.
 std::uint32_t crc32c_combine(std::uint32_t crc_a, std::uint32_t crc_b, std::uint64_t length_b) noexcept;
 
+// Extends `crc` over `length` zero bytes, as crc32c() would, without them:
+// for holes in sparse files.
+std::uint32_t crc32c_zeros(std::uint32_t crc, std::uint64_t length) noexcept;
+
 } // namespace zar
