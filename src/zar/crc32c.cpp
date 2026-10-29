@@ -45,7 +45,7 @@ constexpr auto kTable = [] {
 
 #if ZAR_CRC32C_ARM
 
-__attribute__((target("crc")))
+__attribute__((target("+crc")))
 std::uint32_t update_arm(std::uint32_t crc, const std::uint8_t* p, std::size_t n) noexcept
 {
     for (; n >= 8; p += 8, n -= 8) {

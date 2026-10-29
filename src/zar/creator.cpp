@@ -591,7 +591,7 @@ CreateStats Creator::finish()
     drain(0);
 
     // Hard links share their target's data blocks (§6.5).
-    for (const auto [link, target] : hardlinks_) {
+    for (const auto& [link, target] : hardlinks_) {
         auto& entry = entries_[link];
         const auto& source = entries_[target];
         entry.size = source.size;

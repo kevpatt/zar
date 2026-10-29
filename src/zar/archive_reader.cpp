@@ -462,11 +462,10 @@ void ArchiveReader::load_index(std::int64_t offset, const Entry* parent, std::si
             entry.path = parent->path + '/' + entry.path;
             entry.flags |= parent->flags & entry_flags::kPathRaw;
         }
-        const auto subindex = entry.type == EntryType::Dir ? entry.subindex : std::nullopt;
         out.push_back(std::move(entry));
-        if (subindex) {
+        if (out.back().type == EntryType::Dir && out.back().subindex) {
             const Entry dir = out.back();    // `out` may reallocate
-            load_index(*subindex, &dir, depth + 1, seen, out);
+            load_index(*dir.subindex, &dir, depth + 1, seen, out);
         }
     }
 }
