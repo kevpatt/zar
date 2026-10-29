@@ -36,12 +36,9 @@ maps native libraries straight out of an APK).
 
 ## Other
 
-- **Continuous integration.** zar builds and passes its tests on Linux and
-  macOS, but only when someone runs them by hand. A GitHub Actions workflow
-  could do it on every push, with a sanitizer job and a time-limited run of
-  the libFuzzer target (`fuzz/`). That would also cover the non-UTF-8
-  name test, which skips itself on macOS because APFS refuses such names,
-  and the runtime check for ARM CRC instructions on Linux.
+- **Windows.** CI (`.github/workflows/ci.yml`) covers Linux and macOS.
+  Windows needs its own file and path handling, since zar uses POSIX APIs
+  throughout, and then a CI job.
 - **Content-defined chunking for deduplication.** Deduplication only
   matches whole chunks at fixed boundaries, so a copy with one byte
   inserted near the start shares nothing. Choosing chunk boundaries from

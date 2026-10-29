@@ -147,6 +147,25 @@ else()
     if(NOT ZAR_USE_SYSTEM_XXHASH)
         install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
     endif()
+
+    # A Debian package of the above, under /usr: `cpack -G DEB` in the build
+    # directory, on Linux. Its library dependencies come from dpkg-shlibdeps.
+    set(CPACK_PACKAGE_NAME zar)
+    set(CPACK_PACKAGE_VENDOR "Kevin H. Patterson")
+    set(CPACK_PACKAGE_CONTACT "Kevin H. Patterson <kevpatt@khptech.com>")
+    set(CPACK_PACKAGE_HOMEPAGE_URL https://github.com/kevpatt/zar)
+    set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.txt)
+    set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)    # zar_<version>_<arch>.deb
+    set(CPACK_DEBIAN_PACKAGE_SECTION utils)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "random-access archiver built on zstd
+zar packs a file or directory into a single .zar archive, and unzar lists,
+verifies, and extracts it. Every file, and every chunk of a large file, is
+compressed and checksummed on its own, so any file can be read without
+decompressing the rest. Archives can be streamed through pipes, keep sparse
+files sparse, and store duplicate data once.")
+    include(CPack)
 endif()
 
 if(ZAR_BUILD_TESTS)

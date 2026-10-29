@@ -1,0 +1,137 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2026 Kevin H. Patterson
+#
+# Builds and tests zar on Linux and macOS, runs the sanitizers and the
+# fuzzer, and builds Debian packages. When a release is published
+# (publish.sh), the packages are attached to it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x64, os: ubuntu-24.04 }
+          - { name: Linux arm64, os: ubuntu-24.04-arm }
+          - { name: macOS arm64, os: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libzstd-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja zstd
+      - run: cmake -S . -B build -G Ninja -DZAR_WARNINGS_AS_ERRORS=ON
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: Sanitizers (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ASan and UBSan, flags: "-fsanitize=address,undefined -fno-sanitize-recover=all" }
+          - { name: TSan, flags: "-fsanitize=thread" }
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libzstd-dev
+      # ThreadSanitizer can't map its shadow memory with Ubuntu 24.04's
+      # default address randomization.
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build -G Ninja -DCMAKE_CXX_FLAGS="${{ matrix.flags }} -fno-omit-frame-pointer"
+      - run: cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+
+  fuzz:
+    name: Fuzz (2 minutes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libzstd-dev
+      - name: Build with libFuzzer
+        run: |
+          cmake -S . -B build -G Ninja -DZAR_BUILD_FUZZERS=ON -DCMAKE_CXX_COMPILER=clang++ \
+                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          cmake --build build
+      # Seeds in several shapes, made by this build's zar (its writer is
+      # unaffected by the fuzzing build's skipped CRC checks).
+      - name: Make seed archives
+        run: |
+          mkdir -p src/sub corpus
+          cp README.md FORMAT.md src/ && cp LICENSE.txt src/sub/ && ln -s README.md src/link
+          printf hello > src/sparse && truncate -s 1M src/sparse
+          build/zar -o corpus/plain.zar --chunk-size=4K src
+          build/zar -o corpus/head.zar --chunk-size=4K --head-index src
+          build/zar -o corpus/dict.zar --chunk-size=4K --head-index --dict=4K src
+          build/zar -o corpus/solid.zar --solid=1M --dict-over-solid=0 src
+      - run: build/zar_fuzz -max_total_time=120 -timeout=30 -artifact_prefix=crash- corpus
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: crash-*
+
+  package:
+    name: Debian package (${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write    # to attach the packages to a release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu, so the packages install on as many
+          # releases as possible (Ubuntu 22.04 and later, Debian 12 and later).
+          - { arch: amd64, os: ubuntu-22.04 }
+          - { arch: arm64, os: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libzstd-dev dpkg-dev g++-12
+      - run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_CXX_COMPILER=g++-12 -DZAR_WARNINGS_AS_ERRORS=ON
+          cmake --build build
+      - run: ctest --test-dir build --output-on-failure
+      - name: Build the package
+        working-directory: build
+        run: |
+          cpack -G DEB
+          dpkg-deb --info zar_*.deb
+          dpkg-deb --contents zar_*.deb
+      - name: Install and try it
+        run: |
+          sudo apt-get install -y ./build/zar_*.deb
+          zar --version
+          mkdir -p try/in && echo hello > try/in/a.txt
+          (cd try && zar in && unzar -l in.zar && unzar -C out in.zar && cmp in/a.txt out/in/a.txt)
+      - name: Check the version matches the release
+        if: github.event_name == 'release'
+        run: test "zar ${GITHUB_REF_NAME#v}" = "$(zar --version | head -1 | cut -d' ' -f1-2)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zar-deb-${{ matrix.arch }}
+          path: build/zar_*.deb
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" build/zar_*.deb --clobber --repo "$GITHUB_REPOSITORY"

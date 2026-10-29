@@ -330,9 +330,9 @@ buffer on `ERANGE`, up to 16 MiB.
 
 ## Still open
 
-- **CI:** the TODO's CI item should run the fuzzer for a fixed time and
-  cover Linux. Since 0.3.7, zar builds and passes its tests on Linux with
-  GCC, but only when run by hand.
+- **CI:** done: GitHub Actions builds and tests Linux (x64 and
+  arm64) and macOS on every push, with ASan, UBSan, TSan, and two minutes
+  of fuzzing.
 - **Default limit for `unzar --test`:** the free-space default applies only
   when extracting. Test mode is limited by the 32,768× rule and the
   in-flight budget, but a dedup-amplified archive can still make it

@@ -1,5 +1,7 @@
 # zar
 
+[![CI](https://github.com/kevpatt/zar/actions/workflows/ci.yml/badge.svg)](https://github.com/kevpatt/zar/actions/workflows/ci.yml)
+
 **Random-access archives, compressed with [zstd](https://github.com/facebook/zstd).**
 
 `zar` packs a file or directory into a single `.zar` archive; `unzar` lists,
@@ -113,7 +115,17 @@ brew install kevpatt/tap/zar
 That installs `zar` and `unzar` with their manual pages, built against
 Homebrew's zstd and xxHash. `brew upgrade` picks up new releases, and
 `brew install --HEAD kevpatt/tap/zar` builds the latest commit instead.
-Otherwise, build it from source.
+
+On Debian or Ubuntu, download the package for your architecture (amd64 or
+arm64) from the [latest release](https://github.com/kevpatt/zar/releases/latest)
+and install it with apt, which also installs its dependency, libzstd:
+
+```sh
+sudo apt install ./zar_*_amd64.deb    # or _arm64
+```
+
+The packages need Ubuntu 22.04 or Debian 12, or later. Elsewhere, build zar
+from source.
 
 ## Building
 
@@ -146,8 +158,15 @@ cmake --install build         # install zar and unzar (default prefix /usr/local
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
+On Debian or Ubuntu, `cpack -G DEB` in the build directory makes a package
+of the same files, under `/usr`, like those on the releases page (it needs
+`dpkg-dev`).
+
 zar builds and passes its full test suite on both macOS and Linux: on macOS
 (Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15.
+CI (`.github/workflows/ci.yml`) builds and tests every push on Linux
+(x64 and arm64) and macOS, with the sanitizers and a short fuzzing run, and
+builds the Debian packages.
 It uses only POSIX APIs and should build on the BSDs, but those aren't
 tested yet.
 
@@ -529,7 +548,8 @@ existing archive without changing any other offset.
 ## Project layout
 
 ```
-CMakeLists.txt
+.github/workflows/     CI: tests, sanitizers, fuzzing, and Debian packages
+CMakeLists.txt         the build, and Debian packaging (cpack -G DEB)
 FORMAT.md              the archive format specification
 LICENSE.txt            BSD 3-Clause
 TODO.md                planned work
