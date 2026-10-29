@@ -173,6 +173,8 @@ files sparse, and store duplicate data once.")
     set(CPACK_RPM_PACKAGE_LICENSE BSD-3-Clause)
     set(CPACK_RPM_PACKAGE_GROUP Applications/Archiving)
     set(CPACK_RPM_PACKAGE_DESCRIPTION "${zar_package_description}")
+    # Owned by the system's filesystem package, not this one.
+    set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION /usr/share/man /usr/share/man/man1)
     include(CPack)
 endif()
 
