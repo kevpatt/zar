@@ -36,12 +36,12 @@ maps native libraries straight out of an APK).
 
 ## Other
 
-- **Continuous integration.** Linux has never been built or tested. A
-  GitHub Actions workflow could build and test on Linux and macOS, with a
-  sanitizer job and a time-limited run of the libFuzzer target (`fuzz/`),
-  on every push. That would also cover the non-UTF-8 name test, which
-  skips itself on macOS because APFS refuses such names, and the runtime
-  check for ARM CRC instructions on Linux.
+- **Continuous integration.** zar builds and passes its tests on Linux and
+  macOS, but only when someone runs them by hand. A GitHub Actions workflow
+  could do it on every push, with a sanitizer job and a time-limited run of
+  the libFuzzer target (`fuzz/`). That would also cover the non-UTF-8
+  name test, which skips itself on macOS because APFS refuses such names,
+  and the runtime check for ARM CRC instructions on Linux.
 - **Content-defined chunking for deduplication.** Deduplication only
   matches whole chunks at fixed boundaries, so a copy with one byte
   inserted near the start shares nothing. Choosing chunk boundaries from

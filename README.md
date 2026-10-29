@@ -131,9 +131,10 @@ cmake --install build         # install zar and unzar (default prefix /usr/local
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
-zar is developed on macOS (Apple Silicon) with Apple Clang, and also builds
-and passes its tests with GCC 15 on Linux and GCC 16 on macOS. It uses only POSIX APIs and should build on the
-BSDs, but those aren't regularly tested yet.
+zar builds and passes its full test suite on both macOS and Linux: on macOS
+(Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15.
+It uses only POSIX APIs and should build on the BSDs, but those aren't
+tested yet.
 
 Useful CMake options:
 
