@@ -106,9 +106,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y ninja-build pkg-config libzstd-dev dpkg-dev g++-12
+      # Not -Werror: GCC 12 warns falsely about its own std::string code
+      # (-Wrestrict, GCC bug 105329); the test jobs check warnings.
       - run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_CXX_COMPILER=g++-12 -DZAR_WARNINGS_AS_ERRORS=ON
+                -DCMAKE_CXX_COMPILER=g++-12
           cmake --build build
       - run: ctest --test-dir build --output-on-failure
       - name: Build the package
