@@ -11,14 +11,14 @@ extracted without decompressing anything else.
 
 ```sh
 $ zar ~/src/project
-$ unzar --list --scan -h project.zar
+$ unzar --list -h project.zar
 project/
   README.md	5.7K	2026-10-13 09:22:27
   ...
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.3.7). Both tools work and are well
+> **Status:** development (0.4.0). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -209,6 +209,10 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `-v, --verbose` | list files as they are added, and print a summary |
 | `--help`, `--version` | |
 
+Short options can be combined, as in `zar -myv -o all.zar a b`. `-l`'s
+level can be attached or separate (`-l19` or `-l 19`), but `-j`'s count
+must be attached (`-j4`).
+
 Files whose extension marks them as already compressed (`.jpg`, `.png`,
 `.mp3`, `.m4a`, `.mp4`, `.mov`, `.zip`, `.gz`, `.zst`, `.docx`, and about 60
 others; see [`src/zar/policy.cpp`](src/zar/policy.cpp)) are stored without
@@ -221,7 +225,8 @@ chunk that zstd fails to shrink is stored as-is.
 unzar proj.zar                    # extract into the current directory
 unzar -C /tmp/out proj.zar        # extract elsewhere
 unzar proj.zar proj/src           # extract one directory (or file)
-unzar -l --scan -h proj.zar       # list, checking the archive, sizes like 1.5M
+unzar -lh proj.zar                # list, checking the archive, sizes like 1.5M
+unzar -lx proj.zar                # list while extracting
 unzar --test proj.zar             # decompress and verify everything
 unzar -y --dirs=replace proj.zar  # replace an earlier extraction
 ```
@@ -230,9 +235,14 @@ unzar -y --dirs=replace proj.zar  # replace an earlier extraction
 
 | Mode | Reads data | Decompresses | Writes files |
 |---|---|---|---|
-| extract (default) | ✅ | ✅ | ✅ |
-| `--test` | ✅ | ✅ | ❌ |
-| `--scan` | ✅ | ❌ | ❌ |
+| `-x, --extract` (default) | ✅ | ✅ | ✅ |
+| `-t, --test` | ✅ | ✅ | ❌ |
+| `--scan` (default with `--list`) | ✅ | ❌ | ❌ |
+
+Give at most one mode. A listing on its own never writes anything:
+`unzar -l` lists and scans, `unzar -lt` lists and tests, and `unzar -lx`
+lists and extracts. Short options can be combined, as in `-lxv`; `-j`'s
+count must be attached, as in `-j4`.
 
 `--scan` still checks every block's checksums and every chunk's recorded
 size, so it's a quick way to verify an archive's integrity. On an archive of
@@ -259,7 +269,8 @@ src/sub/
 | Option | Meaning |
 |---|---|
 | `-C, --directory=DIR` | extract into DIR (created if needed) |
-| `-l, --list` | print a listing as entries are processed |
+| `-l, --list` | print a listing as entries are processed; on its own, scans rather than extracting |
+| `-x, --extract` | extract (the default, except with `--list`) |
 | `--scan` | check checksums, sizes, and paths without decompressing; write nothing |
 | `-t, --test` | like `--scan`, but also decompress and verify all data |
 | `-y, --yes` | overwrite files and directories that already exist |

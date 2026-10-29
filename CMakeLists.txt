@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.3.7
+    VERSION 0.4.0
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 
@@ -140,4 +140,6 @@ if(ZAR_BUILD_TESTS)
         tests/extractor_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)
     add_test(NAME zar_tests COMMAND zar_tests)
+    add_test(NAME cli_test
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:zar> $<TARGET_FILE:unzar>)
 endif()

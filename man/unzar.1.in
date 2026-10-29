@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd October 14, 2026
+.Dd October 29, 2026
 .Dt UNZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -31,24 +31,28 @@ ones that are directories.
 .Pp
 .Nm
 runs in one of three modes:
-.Bl -tag -width "--scan" -offset indent
-.It extract
-(the default) writes the files, directories, and links
-.It Fl \-test
+.Bl -tag -width "-t, --test" -offset indent
+.It Fl x , Fl \-extract
+writes the files, directories, and links
+.It Fl t , Fl \-test
 decompresses and verifies everything, and writes nothing
 .It Fl \-scan
 checks the archive's structure, checksums, and sizes without
 decompressing, and writes nothing
 .El
 .Pp
-.Fl \-list
-combines with any of them.
-Note that
+At most one may be given.
+Without any,
+.Nm
+extracts, or with
+.Fl \-list ,
+scans: so
 .Nm
 .Fl l
-alone extracts as well as listing; use
-.Fl l Fl \-scan
-just to list.
+lists an archive without writing anything, and
+.Nm
+.Fl lx
+lists it while extracting.
 .Pp
 Nothing is extracted if anything to be extracted already exists, unless
 .Fl y
@@ -67,9 +71,15 @@ Print a listing: each directory on its own line, followed by its files with
 their size and modification time, separated by tabs.
 Control characters, backslashes, and bytes of names that aren't UTF-8 are
 escaped.
+.It Fl x , Fl \-extract
+Extract.
+This is the default except with
+.Fl l .
 .It Fl \-scan
 Check everything except decompression: block and index checksums, sizes,
 and paths.
+This is the default with
+.Fl l .
 .It Fl t , Fl \-test
 Like
 .Fl \-scan ,
@@ -119,6 +129,12 @@ Show a summary of the options.
 Show the version, the archive format version, and the zstd version.
 .El
 .Pp
+Short options can be combined, as in
+.Fl lxv .
+The count for
+.Fl j
+must be attached, as in
+.Fl j4 .
 Sizes take an optional
 .Cm K ,
 .Cm M ,
@@ -155,7 +171,10 @@ Extract one directory from it, elsewhere:
 .Dl $ unzar -C /tmp/out proj.zar proj/src
 .Pp
 List an archive with human-readable sizes, checking it as it goes:
-.Dl $ unzar -l --scan -h proj.zar
+.Dl $ unzar -lh proj.zar
+.Pp
+List it while extracting it:
+.Dl $ unzar -lx proj.zar
 .Pp
 Replace an earlier extraction:
 .Dl $ unzar -y --dirs=replace proj.zar

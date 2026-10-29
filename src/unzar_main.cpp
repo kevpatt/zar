@@ -35,7 +35,10 @@ archives created with zar --head-index.
 
   -C, --directory=DIR    extract into DIR (default: current directory)
   -l, --list             print a listing: each directory on its own line,
-                         followed by its files with their size and mtime
+                         followed by its files with their size and mtime.
+                         On its own this scans; add -x or -t to extract or
+                         test as well.
+  -x, --extract          extract (the default, except with --list)
       --scan             check everything except decompression: block and
                          index checksums, sizes, and paths; write nothing
   -t, --test             like --scan, but also decompress and verify data
@@ -58,10 +61,14 @@ archives created with zar --head-index.
       --help             show this help
       --version          show version information
 
-If PATHs are given, only those entries (and directories' contents) are
-processed. Nothing is extracted if any target already exists, unless -y is
-given. --list combines with any mode: `unzar --list --scan` lists an
-archive while checking it, without extracting.
+-x, -t, and --scan choose the mode; give at most one. Without any, unzar
+extracts, or with --list, scans. So `unzar -l` lists an archive while
+checking it, and `unzar -lx` lists it while extracting.
+
+Short options can be combined, as in -lxv; -j's count must be attached, as
+in -j4. If PATHs are given, only those entries (and directories' contents)
+are processed. Nothing is extracted if any target already exists, unless -y
+is given.
 )";
 
 using zar::cli::printable;
@@ -90,6 +97,7 @@ std::optional<Command> parse(int argc, char** argv)
     static const option kOptions[] = {
         {"directory", required_argument, nullptr, 'C'},
         {"list", no_argument, nullptr, 'l'},
+        {"extract", no_argument, nullptr, 'x'},
         {"scan", no_argument, nullptr, kScan},
         {"test", no_argument, nullptr, 't'},
         {"yes", no_argument, nullptr, 'y'},
@@ -105,13 +113,20 @@ std::optional<Command> parse(int argc, char** argv)
     };
 
     Command cmd;
+    std::optional<zar::ExtractMode> mode;
+    const auto set_mode = [&](zar::ExtractMode m) {
+        if (mode && *mode != m)
+            throw UsageError("give only one of -x, -t, and --scan");
+        mode = m;
+    };
     int c;
-    while ((c = ::getopt_long(argc, argv, "C:ltyj::vh", kOptions, nullptr)) != -1) {
+    while ((c = ::getopt_long(argc, argv, "C:lxtyj::vh", kOptions, nullptr)) != -1) {
         switch (c) {
         case 'C': cmd.options.directory = optarg; break;
         case 'l': cmd.list = true; break;
-        case kScan: cmd.options.mode = zar::ExtractMode::Scan; break;
-        case 't': cmd.options.mode = zar::ExtractMode::Test; break;
+        case 'x': set_mode(zar::ExtractMode::Extract); break;
+        case kScan: set_mode(zar::ExtractMode::Scan); break;
+        case 't': set_mode(zar::ExtractMode::Test); break;
         case 'y': cmd.options.overwrite = true; break;
         case 'j': cmd.options.threads = zar::cli::parse_threads(optarg); break;
         case kMaxSize: cmd.options.size_limit = zar::cli::parse_size(optarg, "size limit"); break;
@@ -136,6 +151,8 @@ std::optional<Command> parse(int argc, char** argv)
             throw UsageError("");
         }
     }
+    // A listing on its own shouldn't write anything.
+    cmd.options.mode = mode.value_or(cmd.list ? zar::ExtractMode::Scan : zar::ExtractMode::Extract);
     if (optind >= argc)
         throw UsageError("no archive given");
     cmd.archive = argv[optind++];

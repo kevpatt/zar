@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd October 14, 2026
+.Dd October 29, 2026
 .Dt ZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -187,6 +187,16 @@ Show a summary of the options.
 Show the version, the archive format version, and the zstd version.
 .El
 .Pp
+Short options can be combined, as in
+.Fl myv .
+The level for
+.Fl l
+can be attached or separate
+.Pq Fl l19 No or Fl l No 19 ,
+but the count for
+.Fl j
+must be attached, as in
+.Fl j4 .
 Sizes take an optional
 .Cm K ,
 .Cm M ,

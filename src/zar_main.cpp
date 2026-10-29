@@ -82,6 +82,9 @@ PATH is stored under its own name, so extracting recreates it:
   -v, --verbose          list files as they are added
       --help             show this help
       --version          show version information
+
+Short options can be combined, as in -myv; -l's level can be attached or
+separate (-l19 or -l 19), but -j's count must be attached (-j4).
 )";
 
 using zar::cli::parse_number;
