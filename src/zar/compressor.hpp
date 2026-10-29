@@ -6,6 +6,7 @@
 
 #include "zar/bytes.hpp"
 #include "zar/format.hpp"
+#include "zar/thread_pool.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -13,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <vector>
 
 struct ZSTD_CDict_s;
@@ -48,14 +48,16 @@ private:
         std::promise<CompressedChunk> result;
     };
 
-    void work(std::stop_token stop);
+    void work();
+    void stop() noexcept;    // lets the workers finish the queue, and joins them
 
     int level_;
     std::shared_ptr<ZSTD_CDict_s> dict_;
     std::mutex mutex_;
-    std::condition_variable_any ready_;
+    std::condition_variable ready_;
     std::deque<Job> jobs_;
-    std::vector<std::jthread> workers_;
+    bool stopping_ = false;
+    std::vector<JoiningThread> workers_;
 };
 
 // One-shot compression on the calling thread, for index blocks.

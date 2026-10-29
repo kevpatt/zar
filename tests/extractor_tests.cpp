@@ -15,6 +15,7 @@
 #include "zar/dictionary.hpp"
 #include "zar/extractor.hpp"
 #include "zar/posix.hpp"
+#include "zar/thread_pool.hpp"
 
 #include <algorithm>
 #include <fcntl.h>
@@ -444,7 +445,7 @@ TEST(head_index_archives_extract_from_a_pipe)
         // Feed the archive through a pipe from another thread.
         int fds[2];
         CHECK(::pipe(fds) == 0);
-        std::jthread feeder([&, fd = fds[1]] {
+        JoiningThread feeder([&, fd = fds[1]] {
             for (std::size_t done = 0; done < bytes.size();) {
                 const auto n = ::write(fd, bytes.data() + done, std::min<std::size_t>(65'536, bytes.size() - done));
                 if (n <= 0)
@@ -705,7 +706,7 @@ Run run_stream(const Bytes& bytes, ExtractOptions options)
 {
     int fds[2];
     CHECK(::pipe(fds) == 0);
-    std::jthread feeder([&, fd = fds[1]] {
+    JoiningThread feeder([&, fd = fds[1]] {
         for (std::size_t done = 0; done < bytes.size();) {
             const auto n = ::write(fd, bytes.data() + done, std::min<std::size_t>(65'536, bytes.size() - done));
             if (n <= 0)
@@ -1357,7 +1358,7 @@ TEST(a_broken_stream_is_reported_once)
     for (int attempt = 0; attempt < 5; ++attempt) {
         int fds[2];
         CHECK(::pipe(fds) == 0);
-        std::jthread feeder([&, fd = fds[1]] {
+        JoiningThread feeder([&, fd = fds[1]] {
             // Three fifths of it, then the stream breaks.
             const auto end = bytes.size() * 3 / 5;
             for (std::size_t done = 0; done < end;) {
@@ -1436,7 +1437,7 @@ Run run_from_pipe(const Bytes& bytes, const ExtractOptions& options)
     int fds[2];
     if (::pipe(fds) != 0)
         throw_errno("pipe");
-    std::jthread feeder([&, fd = fds[1]] {
+    JoiningThread feeder([&, fd = fds[1]] {
         try {
             write_all(fd, bytes, "pipe");
         } catch (const std::exception&) {

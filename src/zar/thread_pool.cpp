@@ -17,8 +17,13 @@ ThreadPool::ThreadPool(unsigned threads)
 {
     threads = std::max(threads, 1u);
     workers_.reserve(threads);
-    for (unsigned i = 0; i < threads; ++i)
-        workers_.emplace_back([this](std::stop_token stop) { work(stop); });
+    try {
+        for (unsigned i = 0; i < threads; ++i)
+            workers_.emplace_back([this] { work(); });
+    } catch (...) {
+        stop();    // the workers already started
+        throw;
+    }
 }
 
 ThreadPool::~ThreadPool()
@@ -27,9 +32,18 @@ ThreadPool::~ThreadPool()
         std::unique_lock lock(mutex_);
         idle_.wait(lock, [this] { return jobs_.empty() && running_ == 0; });
     }
-    for (auto& worker : workers_)
-        worker.request_stop();
+    stop();
+}
+
+void ThreadPool::stop() noexcept
+{
+    {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
     work_ready_.notify_all();
+    for (auto& worker : workers_)
+        worker.join();
 }
 
 void ThreadPool::submit(std::function<void()> job)
@@ -49,14 +63,15 @@ void ThreadPool::wait()
         std::rethrow_exception(std::exchange(failure_, nullptr));
 }
 
-void ThreadPool::work(std::stop_token stop)
+void ThreadPool::work()
 {
     for (;;) {
         std::function<void()> job;
         {
             std::unique_lock lock(mutex_);
-            if (!work_ready_.wait(lock, stop, [this] { return !jobs_.empty(); }))
-                return;
+            work_ready_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+            if (jobs_.empty())
+                return;    // stopping, with nothing left to do
             job = std::move(jobs_.front());
             jobs_.pop_front();
             ++running_;

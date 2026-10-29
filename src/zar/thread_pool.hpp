@@ -11,9 +11,39 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace zar {
+
+// A thread that is joined when it's destroyed, like std::jthread, which
+// some standard libraries still lack (that of the macOS 15 SDK, say).
+class JoiningThread {
+public:
+    template <typename F>
+        requires(!std::is_same_v<std::remove_cvref_t<F>, JoiningThread>)
+    explicit JoiningThread(F&& f) : thread_(std::forward<F>(f))
+    {
+    }
+    JoiningThread(JoiningThread&&) noexcept = default;
+    JoiningThread& operator=(JoiningThread&& other)    // joins this one first
+    {
+        join();
+        thread_ = std::move(other.thread_);
+        return *this;
+    }
+    ~JoiningThread() { join(); }
+
+    void join()
+    {
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+private:
+    std::thread thread_;
+};
 
 class ThreadPool {
 public:
@@ -30,15 +60,17 @@ public:
     void wait();
 
 private:
-    void work(std::stop_token stop);
+    void work();
+    void stop() noexcept;    // lets the workers finish the queue, and joins them
 
     std::mutex mutex_;
-    std::condition_variable_any work_ready_;
-    std::condition_variable_any idle_;
+    std::condition_variable work_ready_;
+    std::condition_variable idle_;
     std::deque<std::function<void()>> jobs_;
     std::size_t running_ = 0;
+    bool stopping_ = false;
     std::exception_ptr failure_;
-    std::vector<std::jthread> workers_;
+    std::vector<JoiningThread> workers_;
 };
 
 // Limits work in flight, both in items and in bytes. An item bigger than the

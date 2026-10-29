@@ -18,11 +18,11 @@
 #include "zar/extractor.hpp"
 #include "zar/index.hpp"
 #include "zar/posix.hpp"
+#include "zar/thread_pool.hpp"
 
 #include <cstdint>
 #include <cstdio>
 #include <span>
-#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -68,7 +68,7 @@ void from_pipe(std::span<const std::uint8_t> data)
     int fds[2];
     if (::pipe(fds) != 0)
         return;
-    std::jthread feeder([data, fd = fds[1]] {
+    zar::JoiningThread feeder([data, fd = fds[1]] {
         try {
             zar::write_all(fd, data, "pipe");
         } catch (const std::exception&) {

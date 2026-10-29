@@ -3,7 +3,10 @@
 
 #include "zar/dedup.hpp"
 
+// The bundled xxHash is compiled in; an installed one is linked instead.
+#ifndef ZAR_SYSTEM_XXHASH
 #define XXH_INLINE_ALL
+#endif
 #include <xxhash.h>
 
 namespace zar {

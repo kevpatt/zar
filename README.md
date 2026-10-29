@@ -18,13 +18,14 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.5.0). Both tools work and are well
+> **Status:** development (0.5.1). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
 
 - [Features](#features)
 - [How it compares](#how-it-compares)
+- [Installing](#installing)
 - [Building](#building)
 - [Using zar](#using-zar)
 - [Using unzar](#using-unzar)
@@ -100,11 +101,25 @@ zar is for when the archive is *read in place*: picking files out of big
 archives, verifying backups cheaply, or shipping bundles that a loader
 reads without unpacking.
 
+## Installing
+
+With [Homebrew](https://brew.sh), from the
+[kevpatt/tap](https://github.com/kevpatt/homebrew-tap) tap:
+
+```sh
+brew install kevpatt/tap/zar
+```
+
+That installs `zar` and `unzar` with their manual pages, built against
+Homebrew's zstd and xxHash. `brew upgrade` picks up new releases, and
+`brew install --HEAD kevpatt/tap/zar` builds the latest commit instead.
+Otherwise, build it from source.
+
 ## Building
 
-You need CMake 3.20 or newer, libzstd 1.4 or newer, and a C++20 compiler and
-standard library that include `std::jthread` (zar is developed with Apple
-Clang 17).
+You need CMake 3.20 or newer, libzstd 1.4 or newer, and a C++20 compiler
+(zar is developed with Apple Clang 17). On macOS it builds against the
+macOS 13 SDK and newer.
 
 ```sh
 # macOS
@@ -144,6 +159,7 @@ Useful CMake options:
 | `ZAR_BUILD_TESTS` | `ON` | build the test suite |
 | `ZAR_WARNINGS_AS_ERRORS` | `OFF` | treat compiler warnings as errors |
 | `ZAR_BUILD_FUZZERS` | `OFF` | build the fuzz target instead of an installable build |
+| `ZAR_USE_SYSTEM_XXHASH` | `OFF` | link an installed libxxhash 0.8 or newer (found like libzstd) instead of compiling in the bundled copy |
 
 The version comes from `project()` in `CMakeLists.txt`. Each build also
 records the git revision (with `-dirty` if there are uncommitted changes)
@@ -586,6 +602,7 @@ application bundle format, read in place by a loader:
 
 zar is released under the [BSD 3-Clause License](LICENSE.txt). It includes
 [xxHash](https://github.com/Cyan4973/xxHash) by Yann Collet, under the
-[BSD 2-Clause License](third_party/xxhash/LICENSE).
+[BSD 2-Clause License](third_party/xxhash/LICENSE), unless it's built with
+`ZAR_USE_SYSTEM_XXHASH`.
 
 Copyright (C) 2026 Kevin H. Patterson

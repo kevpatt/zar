@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.5.0
+    VERSION 0.5.1
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES CXX)
 
@@ -21,6 +21,7 @@ endif()
 
 option(ZAR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(ZAR_BUILD_TESTS "Build the test suite" ON)
+option(ZAR_USE_SYSTEM_XXHASH "Link an installed libxxhash instead of compiling in the bundled copy" OFF)
 
 # libzstd: prefer pkg-config, fall back to zstd's own CMake package.
 find_package(PkgConfig QUIET)
@@ -35,6 +36,20 @@ else()
         set(ZAR_ZSTD_TARGET zstd::libzstd_shared)
     else()
         set(ZAR_ZSTD_TARGET zstd::libzstd_static)
+    endif()
+endif()
+
+# libxxhash, if asked for: the same way. Otherwise third_party/xxhash is
+# compiled in, header-only.
+if(ZAR_USE_SYSTEM_XXHASH)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(XXHASH IMPORTED_TARGET libxxhash>=0.8.0)
+    endif()
+    if(TARGET PkgConfig::XXHASH)
+        set(ZAR_XXHASH_TARGET PkgConfig::XXHASH)
+    else()
+        find_package(xxHash 0.8 CONFIG REQUIRED)
+        set(ZAR_XXHASH_TARGET xxHash::xxhash)
     endif()
 endif()
 
@@ -68,7 +83,12 @@ set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 set(ZAR_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated)
 configure_file(src/zar/version.hpp.in ${ZAR_GENERATED_DIR}/zar/version.hpp @ONLY)
 target_include_directories(libzar PUBLIC src ${ZAR_GENERATED_DIR})
-target_include_directories(libzar SYSTEM PRIVATE third_party/xxhash)
+if(ZAR_USE_SYSTEM_XXHASH)
+    target_compile_definitions(libzar PRIVATE ZAR_SYSTEM_XXHASH)
+    target_link_libraries(libzar PRIVATE ${ZAR_XXHASH_TARGET})
+else()
+    target_include_directories(libzar SYSTEM PRIVATE third_party/xxhash)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads PRIVATE zar_warnings)
 
@@ -124,7 +144,9 @@ else()
 
     install(TARGETS zar unzar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES LICENSE.txt README.md FORMAT.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
-    install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
+    if(NOT ZAR_USE_SYSTEM_XXHASH)
+        install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
+    endif()
 endif()
 
 if(ZAR_BUILD_TESTS)

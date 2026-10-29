@@ -42,7 +42,9 @@ bool is_precompressed(std::string_view filename) noexcept
     std::ranges::transform(ext, lower, [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    return std::ranges::binary_search(kPrecompressed, std::string_view(lower, ext.size()));
+    // Not std::ranges::binary_search, which answers wrongly in the libc++ of
+    // the macOS 13 SDK.
+    return std::binary_search(kPrecompressed.begin(), kPrecompressed.end(), std::string_view(lower, ext.size()));
 }
 
 } // namespace zar

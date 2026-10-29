@@ -71,16 +71,29 @@ Compressor::Compressor(int level, unsigned threads) : level_(level)
 {
     make_context(level);    // validate the level up front, on this thread
     workers_.reserve(threads);
-    for (unsigned i = 0; i < std::max(threads, 1u); ++i)
-        workers_.emplace_back([this](std::stop_token stop) { work(stop); });
+    try {
+        for (unsigned i = 0; i < std::max(threads, 1u); ++i)
+            workers_.emplace_back([this] { work(); });
+    } catch (...) {
+        stop();    // the workers already started
+        throw;
+    }
 }
 
 Compressor::~Compressor()
 {
-    for (auto& worker : workers_)
-        worker.request_stop();
+    stop();
+}
+
+void Compressor::stop() noexcept
+{
+    {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+    }
     ready_.notify_all();
-    // jthread destructors join.
+    for (auto& worker : workers_)
+        worker.join();
 }
 
 void Compressor::use_dictionary(ByteView dict)
@@ -103,7 +116,7 @@ std::future<CompressedChunk> Compressor::submit(Bytes data, bool compress)
     return future;
 }
 
-void Compressor::work(std::stop_token stop)
+void Compressor::work()
 {
     const auto cctx = make_context(level_);
 
@@ -111,8 +124,9 @@ void Compressor::work(std::stop_token stop)
         Job job;
         {
             std::unique_lock lock(mutex_);
-            if (!ready_.wait(lock, stop, [this] { return !jobs_.empty(); }))
-                return;    // stop requested
+            ready_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+            if (jobs_.empty())
+                return;    // stopping, with nothing left to do
             job = std::move(jobs_.front());
             jobs_.pop_front();
         }

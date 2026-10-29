@@ -34,7 +34,7 @@ TEST(budget_limits_items_and_bytes)
     Budget budget(4, 100);
     std::atomic<bool> admitted = false;
     const auto wait_for = [&](std::uint64_t bytes) {
-        return std::jthread([&, bytes] {
+        return JoiningThread([&, bytes] {
             budget.acquire(bytes);
             admitted = true;
             budget.release(bytes);
@@ -66,7 +66,7 @@ TEST(budget_limits_items_and_bytes)
     for (int i = 0; i < 4; ++i)
         budget.acquire(1);
     admitted = false;
-    std::jthread fifth([&] {
+    JoiningThread fifth([&] {
         budget.acquire(1);
         admitted = true;
         budget.release(1);
