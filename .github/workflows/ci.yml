@@ -2,8 +2,9 @@
 # Copyright (C) 2026 Kevin H. Patterson
 #
 # Builds and tests zar on Linux and macOS, runs the sanitizers and the
-# fuzzer, and builds Debian packages. When a release is published
-# (publish.sh), the packages are attached to it.
+# fuzzer, and builds Debian and RPM packages, trying them on several
+# distributions. When a release is published (publish.sh), the packages
+# are attached to it.
 
 name: CI
 
@@ -89,12 +90,10 @@ jobs:
           name: fuzz-crash
           path: crash-*
 
-  package:
+  deb:
     name: Debian package (${{ matrix.arch }})
     needs: test
     runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write    # to attach the packages to a release
     strategy:
       fail-fast: false
       matrix:
@@ -123,8 +122,10 @@ jobs:
         run: |
           sudo apt-get install -y ./build/zar_*.deb
           zar --version
-          mkdir -p try/in && echo hello > try/in/a.txt
-          (cd try && zar in && unzar -l in.zar && unzar -C out in.zar && cmp in/a.txt out/in/a.txt)
+          mkdir -p /tmp/try/in/sub && cd /tmp/try
+          echo hello > in/a.txt && echo world > in/sub/b.txt
+          zar in && unzar -l in.zar && unzar -C out in.zar
+          test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
       - name: Check the version matches the release
         if: github.event_name == 'release'
         run: test "zar ${GITHUB_REF_NAME#v}" = "$(zar --version | head -1 | cut -d' ' -f1-2)"
@@ -132,8 +133,95 @@ jobs:
         with:
           name: zar-deb-${{ matrix.arch }}
           path: build/zar_*.deb
-      - name: Attach to the release
+
+  rpm:
+    name: RPM package (${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.os }}
+    # The oldest supported RHEL, so the packages install on RHEL, Rocky, and
+    # AlmaLinux 9 and later, and on current Fedora and openSUSE. The
+    # gcc-toolset compiler links statically what its newer libstdc++ has
+    # beyond RHEL 9's.
+    container: almalinux:9
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    steps:
+      - run: dnf install -y git make cmake gcc-toolset-13-gcc-c++ pkgconf-pkg-config libzstd-devel rpm-build
+      - uses: actions/checkout@v4
+      # The container runs as root, which would bypass the permission
+      # checks some tests rely on, so build and test as an ordinary user.
+      - run: useradd --create-home builder && chown -R builder .
+      - run: |
+          runuser -u builder -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/g++
+          runuser -u builder -- cmake --build build --parallel
+      - run: runuser -u builder -- ctest --test-dir build --output-on-failure
+      - name: Build the package
+        working-directory: build
+        run: |
+          runuser -u builder -- cpack -G RPM
+          rpm -qip zar-*.rpm
+          rpm -qp --requires zar-*.rpm
+          rpm -qlp zar-*.rpm
+      - name: Install and try it
+        run: |
+          dnf install -y ./build/zar-*.rpm
+          zar --version
+          mkdir -p /tmp/try/in/sub && cd /tmp/try
+          echo hello > in/a.txt && echo world > in/sub/b.txt
+          zar in && unzar -l in.zar && unzar -C out in.zar
+          test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
+      - name: Check the version matches the release
         if: github.event_name == 'release'
-        env:
+        run: test "zar ${GITHUB_REF_NAME#v}" = "$(zar --version | head -1 | cut -d' ' -f1-2)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zar-rpm-${{ matrix.arch }}
+          path: build/zar-*.rpm
+
+  try:
+    name: Try the package on ${{ matrix.image }}
+    needs: [deb, rpm]
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "debian:12", install: "apt-get update && apt-get install -y ./zar_*_amd64.deb" }
+          - { image: "fedora:latest", install: "dnf install -y ./zar-*.x86_64.rpm" }
+          - { image: "opensuse/leap:15.6", install: "zypper --non-interactive install --allow-unsigned-rpm ./zar-*.x86_64.rpm" }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zar-*
+          merge-multiple: true
+      - run: ${{ matrix.install }}
+      - run: |
+          zar --version
+          mkdir -p /tmp/try/in/sub && cd /tmp/try
+          echo hello > in/a.txt && echo world > in/sub/b.txt
+          zar in && unzar -l in.zar && unzar -C out in.zar
+          test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
+
+  release:
+    name: Attach the packages to the release
+    if: github.event_name == 'release'
+    needs: [deb, rpm, try]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zar-*
+          merge-multiple: true
+          path: dist
+      - run: ls -l dist
+      - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" build/zar_*.deb --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"

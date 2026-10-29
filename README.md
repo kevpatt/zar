@@ -116,16 +116,18 @@ That installs `zar` and `unzar` with their manual pages, built against
 Homebrew's zstd and xxHash. `brew upgrade` picks up new releases, and
 `brew install --HEAD kevpatt/tap/zar` builds the latest commit instead.
 
-On Debian or Ubuntu, download the package for your architecture (amd64 or
-arm64) from the [latest release](https://github.com/kevpatt/zar/releases/latest)
-and install it with apt, which also installs its dependency, libzstd:
+On Linux, download the package for your distribution and architecture from
+the [latest release](https://github.com/kevpatt/zar/releases/latest) and
+install it with your package manager, which also installs its dependency,
+libzstd:
 
-```sh
-sudo apt install ./zar_*_amd64.deb    # or _arm64
-```
+| Distribution | Package | Install with |
+|---|---|---|
+| Debian 12+, Ubuntu 22.04+ | `zar_X.Y.Z_amd64.deb`, `zar_X.Y.Z_arm64.deb` | `sudo apt install ./zar_*_amd64.deb` |
+| RHEL, Rocky, AlmaLinux 9+, Fedora | `zar-X.Y.Z-1.x86_64.rpm`, `zar-X.Y.Z-1.aarch64.rpm` | `sudo dnf install ./zar-*.x86_64.rpm` |
+| openSUSE | the same `.rpm` | `sudo zypper install ./zar-*.x86_64.rpm` |
 
-The packages need Ubuntu 22.04 or Debian 12, or later. Elsewhere, build zar
-from source.
+Elsewhere, build zar from source.
 
 ## Building
 
@@ -158,15 +160,16 @@ cmake --install build         # install zar and unzar (default prefix /usr/local
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
-On Debian or Ubuntu, `cpack -G DEB` in the build directory makes a package
-of the same files, under `/usr`, like those on the releases page (it needs
-`dpkg-dev`).
+On Linux, `cpack -G DEB` or `cpack -G RPM` in the build directory makes a
+package of the same files, under `/usr`, like those on the releases page
+(they need `dpkg-dev` or `rpm-build`).
 
 zar builds and passes its full test suite on both macOS and Linux: on macOS
 (Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15.
 CI (`.github/workflows/ci.yml`) builds and tests every push on Linux
-(x64 and arm64) and macOS, with the sanitizers and a short fuzzing run, and
-builds the Debian packages.
+(x64 and arm64) and macOS, with the sanitizers and a short fuzzing run. It
+also builds the `.deb` and `.rpm` packages and tries them on Debian,
+Fedora, and openSUSE.
 It uses only POSIX APIs and should build on the BSDs, but those aren't
 tested yet.
 
@@ -548,8 +551,8 @@ existing archive without changing any other offset.
 ## Project layout
 
 ```
-.github/workflows/     CI: tests, sanitizers, fuzzing, and Debian packages
-CMakeLists.txt         the build, and Debian packaging (cpack -G DEB)
+.github/workflows/     CI: tests, sanitizers, fuzzing, and Linux packages
+CMakeLists.txt         the build, and .deb and .rpm packaging (cpack)
 FORMAT.md              the archive format specification
 LICENSE.txt            BSD 3-Clause
 TODO.md                planned work
