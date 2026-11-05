@@ -126,6 +126,7 @@ jobs:
           echo hello > in/a.txt && echo world > in/sub/b.txt
           zar in && unzar -l in.zar && unzar -C out in.zar
           test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
+          rezar --delete=in/sub/b.txt -o less.zar in.zar && unzar -C less less.zar && test ! -e less/in/sub/b.txt
       - name: Check the version matches the release
         if: github.event_name == 'release'
         run: test "zar ${GITHUB_REF_NAME#v}" = "$(zar --version | head -1 | cut -d' ' -f1-2)"
@@ -175,6 +176,7 @@ jobs:
           echo hello > in/a.txt && echo world > in/sub/b.txt
           zar in && unzar -l in.zar && unzar -C out in.zar
           test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
+          rezar --delete=in/sub/b.txt -o less.zar in.zar && unzar -C less less.zar && test ! -e less/in/sub/b.txt
       - name: Check the version matches the release
         if: github.event_name == 'release'
         run: test "zar ${GITHUB_REF_NAME#v}" = "$(zar --version | head -1 | cut -d' ' -f1-2)"
@@ -207,6 +209,7 @@ jobs:
           echo hello > in/a.txt && echo world > in/sub/b.txt
           zar in && unzar -l in.zar && unzar -C out in.zar
           test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
+          rezar --delete=in/sub/b.txt -o less.zar in.zar && unzar -C less less.zar && test ! -e less/in/sub/b.txt
 
   release:
     name: Attach the packages to the release

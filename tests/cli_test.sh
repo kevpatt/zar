@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (C) 2026 Kevin H. Patterson
 #
-# Runs the zar and unzar commands themselves, to check how options combine.
+# Runs the zar, unzar, and rezar commands themselves, to check how options
+# combine.
 #
-#   cli_test.sh ZAR UNZAR
+#   cli_test.sh ZAR UNZAR REZAR
 
 set -u
 absolute() { case $1 in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
 zar=$(absolute "$1")
 unzar=$(absolute "$2")
+rezar=$(absolute "$3")
 work=$(mktemp -d "${TMPDIR:-/tmp}/zar-cli-test.XXXXXX") || exit 1
 trap 'rm -rf "$work"' EXIT
 failures=0
@@ -36,7 +38,7 @@ wrote_nothing() { [ -z "$(ls -A "$work/run")" ] || fail "$1: wrote files"; }
 extracted() { [ -f "$work/run/proj/sub/b.txt" ] || fail "$1: didn't extract"; }
 listed() { grep -q 'b\.txt' "$work/out" || fail "$1: didn't list"; }
 not_listed() { [ ! -s "$work/out" ] || fail "$1: listed"; }
-said() { grep -q "$2" "$work/err" || fail "$1: no '$2' in: $(cat "$work/err")"; }
+said() { grep -q -e "$2" "$work/err" || fail "$1: no '$2' in: $(cat "$work/err")"; }
 
 mkdir -p "$work/proj/sub"
 echo hello >"$work/proj/a.txt"
@@ -98,6 +100,40 @@ for modes in "-xt" "-x --scan" "-lt --scan" "--extract -t"; do
 done
 expect 0 "unzar -xx" "$unzar" -xx "$archive"
 extracted "unzar -xx"
+
+# rezar: lists from files and standard input, and safety checks.
+mkdir -p "$work/add/proj/sub"
+echo new >"$work/add/proj/new.txt"
+echo replaced >"$work/add/proj/sub/b.txt"
+printf 'proj/new.txt\n' >"$work/add.list"
+expect 0 "rezar lists" "$rezar" -C "$work/add" --add-list="$work/add.list" --replace=proj/sub/b.txt \
+    -o "$work/edited.zar" "$archive"
+expect 0 "unzar the edited archive" "$unzar" "$work/edited.zar"
+[ "$(cat "$work/run/proj/new.txt")" = new ] && [ "$(cat "$work/run/proj/sub/b.txt")" = replaced ] &&
+    [ "$(cat "$work/run/proj/a.txt")" = hello ] || fail "rezar lists: wrong contents"
+
+expect 0 "rezar --delete-list=-" sh -c "printf 'proj/a.txt\\n' | '$rezar' -yv --delete-list=- -o '$work/deleted.zar' '$archive'"
+said "rezar --delete-list=-" 'deleted 1'
+expect 0 "rezar -0" sh -c "printf 'proj/sub/**\\0' | '$rezar' -y0 --delete-list=- -o '$work/deleted.zar' '$archive'"
+expect 0 "unzar -l the trimmed archive" "$unzar" -l "$work/deleted.zar"
+not_listed_b() { ! grep -q 'b\.txt' "$work/out" || fail "$1: still lists b.txt"; }
+not_listed_b "rezar -0"
+
+expect 0 "rezar -n" "$rezar" -n --delete=proj/a.txt "$archive"
+grep -q '^- proj/a.txt' "$work/out" || fail "rezar -n: didn't show the deletion"
+wrote_nothing "rezar -n"
+
+expect 2 "rezar onto itself" "$rezar" -y --delete=proj/a.txt -o "$archive" "$archive"
+said "rezar onto itself" 'archive being edited'
+expect 2 "rezar without -o" "$rezar" --delete=proj/a.txt "$archive"
+said "rezar without -o" '-o is needed'
+expect 2 "rezar bad list" "$rezar" --delete=nope -o "$work/never.zar" "$archive"
+said "rezar bad list" 'nope: not in the archive'
+[ ! -e "$work/never.zar" ] || fail "rezar bad list: wrote an archive"
+expect 2 "rezar two stdin lists" "$rezar" --add-list=- --delete-list=- -o "$work/never.zar" "$archive"
+said "rezar two stdin lists" 'only one list'
+expect 2 "rezar --dedup=bogus" "$rezar" --dedup=bogus -o "$work/never.zar" "$archive"
+said "rezar --dedup=bogus" 'on, off, or deep'
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures failures" >&2

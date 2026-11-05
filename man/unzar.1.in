@@ -192,6 +192,7 @@ Replace an earlier extraction:
 Extract an archive as it downloads:
 .Dl $ curl -s https://example.com/proj.zar | unzar -
 .Sh SEE ALSO
+.Xr rezar 1 ,
 .Xr zar 1 ,
 .Xr zstd 1
 .Sh AUTHORS

@@ -390,7 +390,9 @@ ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
             if (const auto root = reader.block_header(roots[i]); root.type == BlockType::ArchiveZstd) {
                 if (!allow_solid)
                     throw FormatError("a solid archive can't contain another");
-                return from_file(reader.unwrap(root, size_limit), on_warning, false, size_limit);
+                auto inner = from_file(reader.unwrap(root, size_limit), on_warning, false, size_limit);
+                inner.solid_ = true;
+                return inner;
             }
             std::vector<Entry> entries;
             std::set<std::int64_t> seen;
@@ -587,7 +589,9 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
             auto inner = inflater.inflate(block, [&](std::uint64_t, std::span<std::uint8_t> piece) {
                 file->read_next(piece);
             });
-            return from_file(std::move(inner), on_warning, false, size_limit);
+            auto reader = from_file(std::move(inner), on_warning, false, size_limit);
+            reader.solid_ = true;
+            return reader;
         }
     }
 

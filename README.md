@@ -5,7 +5,8 @@
 **Random-access archives, compressed with [zstd](https://github.com/facebook/zstd).**
 
 `zar` packs a file or directory into a single `.zar` archive; `unzar` lists,
-verifies, and extracts it. Unlike a `.tar.zst`, which is one long compressed
+verifies, and extracts it; `rezar` adds, replaces, and deletes files in it
+without recompressing the rest. Unlike a `.tar.zst`, which is one long compressed
 stream, a zar archive is compressed piece by piece: every file, and every
 chunk of a large file, is its own independently checksummed block, and an
 index records where each one lives. Any file can be listed, verified, or
@@ -31,6 +32,7 @@ $ unzar project.zar project/src/main.cpp
 - [Building](#building)
 - [Using zar](#using-zar)
 - [Using unzar](#using-unzar)
+- [Editing archives with rezar](#editing-archives-with-rezar)
 - [Solid archives](#solid-archives)
 - [Dictionaries](#dictionaries)
 - [Deduplication](#deduplication)
@@ -65,6 +67,9 @@ $ unzar project.zar project/src/main.cpp
   duplicate files (or repeated chunks, like runs of zeros in disk images)
   cost almost nothing. Candidates are found by an XXH3-128 hash, and confirmed by
   comparing bytes before a block is reused.
+- **Editing without recompressing.** `rezar` adds, replaces, and deletes
+  files, copying everything it keeps block for block, and reclaims the space
+  of what it deletes.
 - **Sparse files.** Holes in sparse files, such as disk images, are
   recorded rather than read and stored, and `unzar` recreates them as
   holes, so a mostly empty 100 GB image doesn't take 100 GB to extract.
@@ -89,6 +94,7 @@ $ unzar project.zar project/src/main.cpp
 | Random access *within* a large file | ✅ (per chunk) | ❌ | ❌ |
 | Compression across similar small files | ✅ with `--solid` or `--dict` | ✅ | ❌ |
 | Duplicate files and data stored once | ✅ (by default) | ⚠️ only within zstd's window | ❌ |
+| Add or delete files without recompressing the rest | ✅ `rezar` | ❌ | ✅ |
 | Sparse files kept sparse | ✅ (per chunk) | ✅ GNU tar `--sparse`, bsdtar | ❌ |
 | Checksums | every block, and every file | whole stream (optional) | every file |
 | Verify without decompressing | ✅ `--scan` | ❌ | ❌ |
@@ -112,7 +118,7 @@ With [Homebrew](https://brew.sh), from the
 brew install kevpatt/tap/zar
 ```
 
-That installs `zar` and `unzar` with their manual pages, built against
+That installs `zar`, `unzar`, and `rezar` with their manual pages, built against
 Homebrew's zstd and xxHash. `brew upgrade` picks up new releases, and
 `brew install --HEAD kevpatt/tap/zar` builds the latest commit instead.
 
@@ -152,11 +158,11 @@ Then:
 cmake -S . -B build -G Ninja
 cmake --build build
 ctest --test-dir build        # run the tests
-cmake --install build         # install zar and unzar (default prefix /usr/local)
+cmake --install build         # install the commands (default prefix /usr/local)
 ```
 
 `cmake --install` puts the commands in `bin`, their manual pages
-(`man zar`, `man unzar`) in `share/man/man1`, and the README, format
+(`man zar`, `man unzar`, `man rezar`) in `share/man/man1`, and the README, format
 specification, and licenses in `share/doc/zar`, under the prefix. Use
 `--prefix DIR` to install elsewhere.
 
@@ -329,7 +335,7 @@ src/sub/
 
 ### Exit status
 
-Both commands exit with:
+All three commands exit with:
 
 | Code | Meaning |
 |---|---|
@@ -337,8 +343,65 @@ Both commands exit with:
 | 1 | finished, but some files had problems, each reported on stderr |
 | 2 | fatal error: bad usage, unreadable or invalid archive, existing targets without `-y`, ... |
 
-A fatal error in `zar` leaves no archive behind: it writes to a temporary
-file and renames it into place only on success.
+A fatal error in `zar` or `rezar` leaves no archive behind: each writes to a
+temporary file and renames it into place only on success.
+
+## Editing archives with rezar
+
+```sh
+rezar -C ~/src --replace=proj/main.c -o new.zar proj.zar     # replace a file
+rezar -C ~/src --add='proj/docs/**' -o new.zar proj.zar      # add a directory tree
+rezar -n --delete-list=gone.txt proj.zar                     # what would deleting these do?
+rezar --delete-list=gone.txt -o trimmed.zar proj.zar         # delete them
+rezar --align=4K --head-index -o aligned.zar proj.zar        # repack, changing nothing else
+```
+
+`rezar` writes a new archive: a copy of the old one with paths added,
+replaced, or deleted. The old archive is never changed. Everything kept is
+copied block for block, never decompressed or recompressed, so editing a
+large archive takes about as long as copying it. Blocks that only deleted
+or replaced files used are left out, so their space is reclaimed, and blocks
+that several files share stay shared. New files are stored as `zar` would
+store them, with the old archive's dictionary if it has one. Without
+options, the alignment and head index are as in the old archive.
+
+The paths to change come in lists, one per line (`-0` for NUL-separated
+lists, as from `find -print0`; `-` reads a list from standard input), or one
+at a time with `--add=PATH` and the like:
+
+| Option | The paths listed |
+|---|---|
+| `--add-list=FILE`, `--add=PATH` | are added; they must not be in the archive yet |
+| `--replace-list=FILE`, `--replace=PATH` | replace what's there; they must be in the archive |
+| `--add-replace-list=FILE`, `--add-replace=PATH` | are added, or replace what's there |
+| `--delete-list=FILE`, `--delete=PATH` | are deleted; they must be in the archive |
+
+Each is a path in the archive, and what's added there is read from the same
+path below `-C DIR` (default: the current directory):
+
+| Path | Means |
+|---|---|
+| `a/b` | the file or symlink `a/b` (not followed) |
+| `a/d/` | the directory `a/d` alone; deleted only if it ends up empty |
+| `a/d/**` | the directory `a/d` and everything below it (quote it in a shell) |
+
+All deletions happen first, then all additions, so the order of lines
+doesn't matter, but a path may be listed only once in all. Missing parent
+directories are added too. A hard link to a file that's deleted or replaced
+keeps the old content, as an ordinary file. If anything listed is wrong,
+`rezar` reports every problem and writes nothing; `-n` shows what would
+change without writing anything.
+
+New chunks are deduplicated among themselves by default. `--dedup=deep`
+also reuses blocks already in the archive that hold the same data. Finding
+those means decompressing them, but only the ones whose uncompressed length
+matches a new chunk's, each once. `--dedup=off` turns deduplication off.
+
+The options for new files are those of `zar`: `-l`, `-j`, `--chunk-size`,
+`--owner`, `--nsec`, `--all-times`, `--names`, `--compress-all`, and
+`--contiguous`. `--align` and `--head-index[=on|off]` apply to the whole
+archive. A solid archive can't be edited, since everything in it would be
+recompressed. See `rezar --help` or `man rezar` for the rest.
 
 ## Solid archives
 
@@ -557,17 +620,21 @@ FORMAT.md              the archive format specification
 LICENSE.txt            BSD 3-Clause
 TODO.md                planned work
 cmake/build_info.cmake records the git revision and build time
-man/                   manual pages for zar(1) and unzar(1)
+man/                   manual pages for zar(1), unzar(1), and rezar(1)
 src/
   zar_main.cpp         the zar command
   unzar_main.cpp       the unzar command
-  cli.hpp              command-line helpers shared by both
+  rezar_main.cpp       the rezar command
+  cli.hpp              command-line helpers shared by all three
+  create_options.hpp   options for storing new files, shared by zar and rezar
   zar/                 libzar, the format library
     format.*           zar and block headers
     index.*            index entries
     archive_writer.*   block layout, alignment, head index, trailer
     archive_reader.*   locating and reading archives, from files or streams
-    creator.*          walking a tree and building an archive
+    creator.*          walking a tree and building an archive, or rebuilding
+                       one from another (rezar)
+    editor.*           what rezar's lists change in an archive
     extractor.*        extracting, testing, and scanning
     compressor.*       parallel chunk compression
     dictionary.*       collecting samples and training dictionaries
@@ -609,7 +676,7 @@ build-fuzz/zar_fuzz -runs=100000 -artifact=crash.zar
 ```
 
 A fuzzing build skips CRC checks, so that mutations get past them; it has
-no install rules, and its `zar` and `unzar` must not be used.
+no install rules, and its commands must not be used.
 
 ## Roadmap
 

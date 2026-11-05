@@ -3,6 +3,8 @@
 
 #include "zar/names.hpp"
 
+#include <algorithm>
+
 #include <cstdint>
 
 namespace zar {
@@ -58,6 +60,18 @@ std::string latin1_to_utf8(std::string_view text)
         }
     }
     return out;
+}
+
+bool path_less(std::string_view a, std::string_view b) noexcept
+{
+    const auto key = [](char c) { return c == '/' ? 0 : static_cast<unsigned char>(c) + 1; };
+    return std::ranges::lexicographical_compare(a, b, [&](char x, char y) { return key(x) < key(y); });
+}
+
+std::string_view parent_path(std::string_view path) noexcept
+{
+    const auto slash = path.rfind('/');
+    return slash == std::string_view::npos ? std::string_view{} : path.substr(0, slash);
 }
 
 bool is_valid_archive_path(std::string_view path) noexcept

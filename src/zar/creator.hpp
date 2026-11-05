@@ -5,6 +5,7 @@
 #pragma once
 
 #include "zar/format.hpp"
+#include "zar/index.hpp"
 #include "zar/output.hpp"
 
 #include <filesystem>
@@ -35,6 +36,9 @@ struct CreateOptions {
     // block back, so it needs an output that can be read back (a file, or
     // head_index). Unset: on whenever it can be; true: required.
     std::optional<bool> dedup;
+    // rezar: also compare new chunks with the blocks copied from the source
+    // archive, decompressing those of the same length to hash them.
+    bool dedup_copied = false;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
     // Store each file of at most this many bytes as a single block, whatever
@@ -67,6 +71,8 @@ struct CreateStats {
     std::uint64_t archive_bytes = 0;
     std::uint64_t deduplicated_bytes = 0;    // uncompressed data not stored again
     std::uint64_t hole_bytes = 0;            // holes in sparse files, stored as such
+    std::uint64_t copied_entries = 0;        // rezar: entries kept from the source archive
+    std::uint64_t copied_bytes = 0;          // and the payload bytes of their blocks
     std::uint64_t warnings = 0;
     bool solid = false;         // the solid form was kept
     bool dictionary = false;    // files were compressed with a trained dictionary
@@ -103,6 +109,35 @@ std::filesystem::path default_archive_path(const InputSpec& input);
 // would store the same path.
 CreateStats create_archive(Output& out, std::span<const std::filesystem::path> inputs,
                            const CreateOptions& options);
+
+class ArchiveReader;
+
+// A path for rezar to add, read from below a source directory, where it has
+// the same relative path as in the archive.
+struct Addition {
+    enum class Kind {
+        File,         // a file or symlink (not followed)
+        Directory,    // a directory's own entry, without its contents
+        Tree,         // a directory and everything below it
+    };
+    Kind kind = Kind::File;
+    std::string path;    // the archive path
+
+    bool operator==(const Addition&) const = default;
+};
+
+// Writes a new archive (without committing it) holding `keep`, entries of
+// `source` whose data is copied block for block, never decompressed or
+// recompressed, and `additions`, read from `source_dir`. Missing parent
+// directories of additions are added too. New files are compressed with the
+// source's dictionary, if the kept entries use one.
+//
+// Throws for a solid source, whose data can't be copied without
+// recompressing it, and, like create_archive(), for problems with an
+// addition itself rather than with something below it.
+CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<const Entry> keep,
+                            std::span<const Addition> additions,
+                            const std::filesystem::path& source_dir, const CreateOptions& options);
 
 // For tests: called just before each file is opened to be read, so a test
 // can change it at that moment.

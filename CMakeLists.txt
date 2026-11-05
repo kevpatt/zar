@@ -70,6 +70,7 @@ add_library(libzar STATIC
     src/zar/dedup.cpp
     src/zar/dictionary.cpp
     src/zar/creator.cpp
+    src/zar/editor.cpp
     src/zar/extractor.cpp
     src/zar/format.cpp
     src/zar/index.cpp
@@ -113,6 +114,9 @@ target_link_libraries(zar PRIVATE libzar zar_build_info zar_warnings)
 add_executable(unzar src/unzar_main.cpp)
 target_link_libraries(unzar PRIVATE libzar zar_build_info zar_warnings)
 
+add_executable(rezar src/rezar_main.cpp)
+target_link_libraries(rezar PRIVATE libzar zar_build_info zar_warnings)
+
 option(ZAR_BUILD_FUZZERS "Build the fuzz target; this disables CRC checks, so such a build is never installed" OFF)
 if(ZAR_BUILD_FUZZERS)
     target_compile_definitions(libzar PUBLIC FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
@@ -137,12 +141,12 @@ if(ZAR_BUILD_FUZZERS)
     endif()
 else()
     # Manual pages, with the version filled in.
-    foreach(page zar.1 unzar.1)
+    foreach(page zar.1 unzar.1 rezar.1)
         configure_file(man/${page}.in ${CMAKE_CURRENT_BINARY_DIR}/man/${page} @ONLY)
         install(FILES ${CMAKE_CURRENT_BINARY_DIR}/man/${page} DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
     endforeach()
 
-    install(TARGETS zar unzar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    install(TARGETS zar unzar rezar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(FILES LICENSE.txt README.md FORMAT.md DESTINATION ${CMAKE_INSTALL_DOCDIR})
     if(NOT ZAR_USE_SYSTEM_XXHASH)
         install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
@@ -188,9 +192,11 @@ if(ZAR_BUILD_TESTS)
         tests/policy_tests.cpp
         tests/posix_tests.cpp
         tests/writer_tests.cpp
-        tests/extractor_tests.cpp)
+        tests/extractor_tests.cpp
+        tests/rezar_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)
     add_test(NAME zar_tests COMMAND zar_tests)
     add_test(NAME cli_test
-             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:zar> $<TARGET_FILE:unzar>)
+             COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_test.sh $<TARGET_FILE:zar> $<TARGET_FILE:unzar>
+                     $<TARGET_FILE:rezar>)
 endif()

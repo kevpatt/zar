@@ -252,6 +252,7 @@ Package many small files as compactly as possible, if it comes to at most
 1 MiB:
 .Dl $ zar --solid=1M config
 .Sh SEE ALSO
+.Xr rezar 1 ,
 .Xr unzar 1 ,
 .Xr zstd 1
 .Pp

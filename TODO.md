@@ -34,6 +34,19 @@ maps native libraries straight out of an APK).
 - **Faster training.** `ZDICT_trainFromBuffer` is single-threaded; the
   fastCover API can use threads, but isn't exported by every libzstd build.
 
+## rezar
+
+- **Editing in place.** rezar always writes a new archive. The format also
+  allows appending (§5.3): new blocks, a new index, and a new trailer after
+  the old end, with the header rewritten. That would make adding a file to a
+  big archive cost only the file, at the price of leaving deleted data in
+  place until the next full rewrite.
+- **Solid archives.** rezar refuses them, since their data can only be
+  copied by recompressing everything. It could do that when asked, or turn
+  them into normal archives.
+- **Several dictionaries.** rezar keeps one dictionary, the only kind zar
+  writes; it refuses archives whose entries use more than one.
+
 ## Other
 
 - **Windows.** CI (`.github/workflows/ci.yml`) covers Linux and macOS.

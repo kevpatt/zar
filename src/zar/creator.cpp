@@ -3,6 +3,7 @@
 
 #include "zar/creator.hpp"
 
+#include "zar/archive_reader.hpp"
 #include "zar/archive_writer.hpp"
 #include "zar/compressor.hpp"
 #include "zar/crc32c.hpp"
@@ -20,6 +21,7 @@
 #include <deque>
 #include <fcntl.h>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -111,6 +113,12 @@ public:
     }
 
     void add_input(const InputSpec& input);
+    // rezar: copies `keep`, entries of `source`, with the blocks they use.
+    void copy_entries(const ArchiveReader& source, std::span<const Entry> keep);
+    // rezar: adds a path at its archive path, reading it from below `dir`.
+    void add_at(const Addition& addition, const fs::path& dir);
+    // Writes the index in path order (zar's walk is in that order anyway).
+    void sort_entries() noexcept { sort_ = true; }
     CreateStats finish();
 
 private:
@@ -135,6 +143,12 @@ private:
         bool hole = false;                // zeros, stored as no block at all
     };
 
+    // A block copied from another archive (rezar), not yet hashed for dedup.
+    struct Copied {
+        Stored stored;
+        std::uint64_t payload_size;
+    };
+
     // A block that dedup may reuse, by the hash of its uncompressed data.
     struct Known {
         std::uint64_t sequence;    // its place among all chunks queued
@@ -150,7 +164,7 @@ private:
 
     std::optional<Name> child_name(const Name& parent, std::string_view component,
                                    const fs::path& where);
-    void add(const fs::path& path, const Name& name, const struct stat& st);
+    void add(const fs::path& path, const Name& name, const struct stat& st, bool recurse = true);
     void add_directory_contents(const fs::path& dir, const Name& name);
     void add_file(const fs::path& path, const Name& name, const struct stat& st);
     void add_symlink(const fs::path& path, const Name& name, const struct stat& st);
@@ -162,6 +176,7 @@ private:
 
     void queue_chunk(Bytes chunk, std::size_t entry, bool compress);
     void queue_hole(std::size_t entry);
+    void hash_copied(std::uint64_t length);
     std::optional<Stored> find_duplicate(const ChunkHash& hash, ByteView chunk);
     void drain(std::size_t keep);
     void write_next();
@@ -186,6 +201,10 @@ private:
     std::unordered_map<ChunkHash, Known, ChunkHash::Hasher> known_;
     std::uint64_t queued_ = 0;     // chunks queued so far
     std::uint64_t written_ = 0;    // chunks written so far, in queue order
+    // Copied blocks by uncompressed length, for dedup_copied: hashed only
+    // when a new chunk of that length comes by, since only then can they match.
+    std::unordered_map<std::uint64_t, std::vector<Copied>> unhashed_;
+    bool sort_ = false;
 
     std::vector<Entry> entries_;
     std::set<std::size_t> dropped_;              // entries abandoned after a read error
@@ -246,7 +265,7 @@ void Creator::add_input(const InputSpec& input)
         add(input.path, *name, st);
 }
 
-void Creator::add(const fs::path& path, const Name& name, const struct stat& st)
+void Creator::add(const fs::path& path, const Name& name, const struct stat& st, bool recurse)
 {
     if (identity_.is_file(st.st_dev, st.st_ino))
         return;    // the archive being written, or the one it replaces
@@ -267,7 +286,8 @@ void Creator::add(const fs::path& path, const Name& name, const struct stat& st)
         ++stats_.directories;
         if (options_.on_entry)
             options_.on_entry(name.path + '/');
-        add_directory_contents(path, name);
+        if (recurse)
+            add_directory_contents(path, name);
         break;
     case S_IFLNK:
         add_symlink(path, name, st);
@@ -297,6 +317,74 @@ void Creator::add_directory_contents(const fs::path& dir, const Name& name)
         }
         if (auto child_path = child_name(name, child, path))
             add(path, *child_path, st);
+    }
+}
+
+void Creator::add_at(const Addition& addition, const fs::path& dir)
+{
+    const auto path = dir / fs::path(addition.path);
+    Name name{addition.path, 0};
+    if (!is_valid_utf8(name.path)) {
+        switch (options_.names) {
+        case NameMode::Skip:
+            warn(path.string() + ": skipped; name is not valid UTF-8");
+            return;
+        case NameMode::Latin1:
+            name.path = latin1_to_utf8(name.path);
+            warn(path.string() + ": name is not valid UTF-8; converted from Latin-1");
+            break;
+        case NameMode::Raw:
+            name.flags |= entry_flags::kPathRaw;
+            warn(path.string() + ": name is not valid UTF-8; stored as raw bytes");
+            break;
+        }
+    }
+
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) != 0)
+        throw std::runtime_error(path.string() + ": " + errno_text());
+    const bool directory = S_ISDIR(st.st_mode);
+    if (addition.kind == Addition::Kind::File && directory)
+        throw std::runtime_error(path.string() + ": is a directory; list it as " + addition.path +
+                                 "/ (alone) or " + addition.path + "/** (with its contents)");
+    if (addition.kind != Addition::Kind::File && !directory)
+        throw std::runtime_error(path.string() + ": not a directory");
+    add(path, name, st, addition.kind == Addition::Kind::Tree);
+}
+
+// Copies each block once, however many chunks share it: at a new offset,
+// but otherwise exactly as it was.
+void Creator::copy_entries(const ArchiveReader& source, std::span<const Entry> keep)
+{
+    std::map<std::int64_t, Stored> copied;    // by offset in the source
+    for (auto entry : keep) {
+        try {
+            const auto lengths = ArchiveReader::chunk_lengths(entry);
+            for (std::size_t i = 0; i < entry.chunks.size(); ++i) {
+                auto& chunk = entry.chunks[i];
+                if (chunk == kNoOffset)
+                    continue;    // a hole
+                auto it = copied.find(chunk);
+                if (it == copied.end()) {
+                    const auto block = source.block_header(chunk);
+                    if (block.type != BlockType::DataRaw && block.type != BlockType::DataZstd)
+                        throw FormatError("block at offset " + std::to_string(chunk) + " is not a data block");
+                    const auto payload = source.payload(block);    // verifies its CRC
+                    const Stored stored{writer_->write_block(block.type, payload), block.type};
+                    it = copied.emplace(chunk, stored).first;
+                    stats_.copied_bytes += payload.size();
+                    if (dedup_ && options_.dedup_copied)
+                        unhashed_[lengths[i]].push_back({stored, payload.size()});
+                }
+                chunk = it->second.offset;
+            }
+        } catch (const FormatError& e) {
+            throw FormatError(entry.path + ": " + e.what());
+        }
+        if (entry.dict)
+            entry.dict = dict_offset_.value();    // the constructor wrote it again
+        entries_.push_back(std::move(entry));
+        ++stats_.copied_entries;
     }
 }
 
@@ -510,6 +598,7 @@ void Creator::queue_chunk(Bytes chunk, std::size_t entry, bool compress)
 {
     std::optional<ChunkHash> hash;
     if (dedup_) {
+        hash_copied(chunk.size());
         hash = hash_chunk(chunk);
         if (const auto stored = find_duplicate(*hash, chunk)) {
             stats_.deduplicated_bytes += chunk.size();
@@ -537,13 +626,33 @@ void Creator::queue_hole(std::size_t entry)
     drain(threads_ * 4);
 }
 
+// Adds the copied blocks holding `length` bytes to those dedup may reuse,
+// decompressing them to hash them.
+void Creator::hash_copied(std::uint64_t length)
+{
+    const auto it = unhashed_.find(length);
+    if (it == unhashed_.end())
+        return;
+    for (const auto& [stored, payload_size] : it->second) {
+        auto data = writer_->read_payload(stored.offset, static_cast<std::size_t>(payload_size));
+        if (stored.type == BlockType::DataZstd) {
+            auto plain = zstd_decompress(data, static_cast<std::size_t>(length), dict_ ? ByteView(*dict_) : ByteView{});
+            if (!plain)
+                continue;    // can't be reused, but it's still a valid copy
+            data = std::move(*plain);
+        }
+        known_.try_emplace(hash_chunk(data), Known{0, stored, payload_size});
+    }
+    unhashed_.erase(it);
+}
+
 // A block already written (or queued) whose contents equal `chunk`.
 std::optional<Creator::Stored> Creator::find_duplicate(const ChunkHash& hash, ByteView chunk)
 {
     const auto it = known_.find(hash);
     if (it == known_.end())
         return std::nullopt;
-    while (written_ <= it->second.sequence)    // it's still being compressed
+    while (!it->second.stored && written_ <= it->second.sequence)    // it's still being compressed
         write_next();
 
     // Equal hashes are very likely equal contents, but compare to be sure.
@@ -625,8 +734,12 @@ CreateStats Creator::finish()
         entry.content_crc = source.content_crc;
     }
 
+    std::vector<std::size_t> order(entries_.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    if (sort_)
+        std::ranges::stable_sort(order, path_less, [this](std::size_t i) -> std::string_view { return entries_[i].path; });
     Bytes index;
-    for (std::size_t i = 0; i < entries_.size(); ++i)
+    for (const auto i : order)
         if (!dropped_.contains(i))
             encode_entry(index, entries_[i]);
 
@@ -821,6 +934,63 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
     if (options.dict_size)
         dict = train_dictionary(out, specs, options, *options.dict_size);
     return create(out, out, specs, options, Pass::Normal, nullptr, dict ? &*dict : nullptr);
+}
+
+CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<const Entry> keep,
+                            std::span<const Addition> additions, const fs::path& source_dir,
+                            const CreateOptions& options)
+{
+    if (source.solid())
+        throw std::runtime_error("can't edit a solid archive without recompressing all of it; "
+                                 "extract it and make a new one with zar");
+
+    // zar writes at most one dictionary; new files are compressed with it too.
+    std::optional<std::int64_t> dict_at;
+    for (const auto& entry : keep) {
+        if (entry.dict && dict_at && *entry.dict != *dict_at)
+            throw std::runtime_error("the archive uses more than one dictionary, which isn't supported");
+        if (entry.dict)
+            dict_at = entry.dict;
+    }
+    Bytes dict;
+    if (dict_at) {
+        const auto block = source.block_header(*dict_at);
+        if (block.type != BlockType::ZstdDict)
+            throw FormatError("block at offset " + std::to_string(*dict_at) + " is not a dictionary");
+        dict = source.payload(block);
+    }
+
+    // Additions in path order, each after any parent directories that
+    // neither the kept entries nor other additions provide.
+    std::set<std::string, PathLess> present;    // directories there will be
+    for (const auto& entry : keep) {
+        if (entry.type == EntryType::Dir)
+            present.emplace(entry.path);
+        for (auto dir = parent_path(entry.path); !dir.empty() && present.emplace(dir).second;)
+            dir = parent_path(dir);    // implied by the entry, though it may have none
+    }
+    std::vector<Addition> sorted(additions.begin(), additions.end());
+    std::ranges::stable_sort(sorted, path_less, [](const Addition& a) -> std::string_view { return a.path; });
+    std::vector<Addition> all;
+    for (const auto& addition : sorted) {
+        std::vector<std::string> missing;
+        for (auto dir = parent_path(addition.path); !dir.empty() && !present.contains(dir); dir = parent_path(dir))
+            missing.emplace_back(dir);
+        for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+            all.push_back({Addition::Kind::Directory, *it});
+            present.insert(*it);
+        }
+        all.push_back(addition);
+        if (addition.kind != Addition::Kind::File)
+            present.insert(addition.path);
+    }
+
+    Creator creator(out, out, options, true, Pass::Normal, nullptr, dict_at ? &dict : nullptr);
+    creator.sort_entries();
+    creator.copy_entries(source, keep);
+    for (const auto& addition : all)
+        creator.add_at(addition, source_dir);
+    return creator.finish();
 }
 
 } // namespace zar

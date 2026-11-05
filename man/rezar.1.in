@@ -1,0 +1,212 @@
+.\" SPDX-License-Identifier: BSD-3-Clause
+.\" Copyright (C) 2026 Kevin H. Patterson
+.Dd November 5, 2026
+.Dt REZAR 1
+.Os zar @PROJECT_VERSION@
+.Sh NAME
+.Nm rezar
+.Nd add, replace, or delete paths in a zar archive
+.Sh SYNOPSIS
+.Nm
+.Op Ar options
+.Fl o Ar output
+.Ar archive
+.Sh DESCRIPTION
+.Nm
+writes a new archive,
+.Ar output :
+a copy of
+.Ar archive ,
+made by
+.Xr zar 1 ,
+with paths added, replaced, or deleted.
+Everything kept is copied block by block, never decompressed or
+recompressed, so editing a large archive takes about as long as copying
+it.
+Blocks only deleted files used are left out, so their space is reclaimed.
+Blocks that several files share stay shared.
+.Ar archive
+itself is never changed, and
+.Ar output
+can't be the same file.
+.Pp
+The paths to change are given in lists, one path per line
+.Pq or, with Fl 0 , No separated by NUL bytes ,
+or one at a time with options such as
+.Fl \-add .
+Each is a path in the archive.
+What is added there is read from the same path below the directory given by
+.Fl C :
+.Bl -tag -width "a/d/**" -offset indent
+.It Pa a/b
+the file or symbolic link
+.Pa a/b
+(not followed)
+.It Pa a/d/
+the directory
+.Pa a/d
+alone; deleted only if it ends up empty
+.It Pa a/d/**
+the directory
+.Pa a/d
+and everything below it
+.El
+.Pp
+All deletions happen first, then all additions, so the order of the lines
+doesn't matter, but a path may be listed only once in all.
+Missing parent directories of what's added are added too.
+A hard link to a file that is deleted or replaced keeps the old content,
+as an ordinary file.
+If anything listed is wrong, such as a path to add that is already in the
+archive, every such problem is reported and nothing is written.
+.Pp
+New files are stored as
+.Xr zar 1
+would store them, compressed with the archive's dictionary if it has one.
+Entries are written in path order.
+A solid archive
+.Pq Nm zar Fl \-solid
+can't be edited, since everything in it would have to be recompressed.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl o , Fl \-output Ns = Ns Ar file
+Write the new archive to
+.Ar file .
+It is written to a temporary file and renamed into place only when
+complete.
+.It Fl y , Fl \-yes
+Overwrite
+.Ar output
+if it exists.
+.It Fl C , Fl \-directory Ns = Ns Ar dir
+Read the paths to add from below
+.Ar dir .
+The default is the current directory.
+.It Fl \-add-list Ns = Ns Ar file
+Add the paths listed in
+.Ar file ,
+or standard input if
+.Ar file
+is
+.Ql - .
+They must not be in the archive yet.
+.It Fl \-replace-list Ns = Ns Ar file
+Replace the paths listed, which must be in the archive.
+Replacing
+.Pa a/d/**
+replaces the whole directory with what is in
+.Ar dir
+now.
+.It Fl \-add-replace-list Ns = Ns Ar file
+Add the paths listed, replacing any that are already in the archive.
+.It Fl \-delete-list Ns = Ns Ar file
+Delete the paths listed, which must be in the archive.
+.It Fl \-add Ns = Ns Ar path , Fl \-replace Ns = Ns Ar path , Fl \-add-replace Ns = Ns Ar path , Fl \-delete Ns = Ns Ar path
+The same, for one
+.Ar path .
+Each may be given more than once, and they combine with the lists.
+.It Fl 0 , Fl \-null
+Lists are separated by NUL bytes rather than newlines, as from
+.Ql find -print0 ,
+so that paths may contain newlines.
+.It Fl n , Fl \-dry-run
+Print each entry that would be removed, after a
+.Ql - ,
+and each path that would be added, after a
+.Ql + ,
+and write nothing.
+.It Fl \-dedup Ns = Ns Cm on Ns | Ns Cm off Ns | Ns Cm deep
+Store identical chunks of new files only once:
+.Cm on ,
+the default.
+.Cm deep
+also reuses blocks already in the archive that hold the same data,
+decompressing those of the same length to compare them.
+.It Fl \-align Ns Op = Ns Ar n
+Align block payloads to
+.Ar n
+bytes, a power of two up to 1M; without
+.Ar n ,
+the CPU's cache-line size.
+The default is the archive's alignment.
+.It Fl \-head-index Ns Op = Ns Cm on Ns | Ns Cm off
+Also write the index at the front of the archive, so that
+.Xr unzar 1
+can extract it from a pipe.
+The default is to do so if
+.Ar archive
+has one;
+.Cm on
+without a value.
+.It Fl v , Fl \-verbose
+List each path on standard error as it is added, and print a summary at the
+end.
+.It Fl \-help
+Show a summary of the options.
+.It Fl \-version
+Show the version, the archive format version, and the zstd version.
+.El
+.Pp
+These options apply to the files added, as in
+.Xr zar 1 :
+.Fl l , Fl \-level ,
+.Fl j , Fl \-threads ,
+.Fl \-chunk-size ,
+.Fl \-owner ,
+.Fl \-nsec ,
+.Fl \-all-times ,
+.Fl \-names ,
+.Fl \-compress-all ,
+and
+.Fl \-contiguous .
+.Pp
+Short options can be combined, as in
+.Fl yv0 .
+The count for
+.Fl j
+must be attached, as in
+.Fl j4 .
+.Sh EXIT STATUS
+.Bl -tag -width Ds -compact
+.It 0
+Success.
+.It 1
+The archive was written, but some files had problems, each reported on
+standard error.
+.It 2
+A fatal error: bad usage, a mistake in the lists, an unreadable or solid
+archive, an existing output without
+.Fl y ,
+and so on.
+No archive is left behind.
+.El
+.Sh EXAMPLES
+Replace one file and add a directory, read from
+.Pa ~/src :
+.Dl $ rezar -C ~/src --replace=proj/main.c --add='proj/docs/**' -o new.zar proj.zar
+.Pp
+Delete everything listed in
+.Pa gone.txt ,
+after checking what that would do:
+.Dl $ rezar -n --delete-list=gone.txt proj.zar
+.Dl $ rezar --delete-list=gone.txt -o trimmed.zar proj.zar
+.Pp
+Delete the
+.Pa .o
+files that
+.Xr find 1
+finds in the tree the archive was made from, whatever characters their
+names hold:
+.Dl $ (cd ~/src && find proj -name '*.o' -print0) | rezar -0 --delete-list=- -o clean.zar proj.zar
+.Pp
+Add a page-aligned head index to an archive, changing nothing else:
+.Dl $ rezar --align=4K --head-index -o aligned.zar proj.zar
+.Pp
+Quote paths ending in
+.Ql /**
+on the command line, or the shell may expand them.
+.Sh SEE ALSO
+.Xr unzar 1 ,
+.Xr zar 1
+.Sh AUTHORS
+.An Kevin H. Patterson

@@ -41,6 +41,10 @@ public:
 
     bool streaming() const noexcept;
 
+    // Whether the archive was solid (§5.5). Everything else describes the
+    // archive inside it, which open() and open_stream() decompress.
+    bool solid() const noexcept { return solid_; }
+
     ArchiveReader(ArchiveReader&&) noexcept;
     ~ArchiveReader();
 
@@ -94,6 +98,7 @@ private:
     ArchiveHeader header_;
     std::uint64_t base_;    // file position of offset 0
     std::vector<Entry> entries_;
+    bool solid_ = false;
 };
 
 } // namespace zar

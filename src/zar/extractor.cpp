@@ -4,6 +4,7 @@
 #include "zar/extractor.hpp"
 
 #include "zar/crc32c.hpp"
+#include "zar/names.hpp"
 #include "zar/posix.hpp"
 #include "zar/thread_pool.hpp"
 
@@ -39,23 +40,8 @@ struct StreamLost : std::runtime_error {
     throw ExtractError(what + ": " + std::generic_category().message(errno));
 }
 
-std::string_view parent_of(std::string_view path)
-{
-    const auto slash = path.rfind('/');
-    return slash == std::string_view::npos ? std::string_view{} : path.substr(0, slash);
-}
+std::string_view parent_of(std::string_view path) { return parent_path(path); }
 
-// Orders paths component by component, so a directory's contents sort
-// directly after it ("a", "a/b", "a-c" rather than "a", "a-c", "a/b").
-struct PathLess {
-    using is_transparent = void;
-    bool operator()(std::string_view a, std::string_view b) const
-    {
-        const auto key = [](char c) { return c == '/' ? 0 : static_cast<unsigned char>(c) + 1; };
-        return std::ranges::lexicographical_compare(
-            a, b, [&](char x, char y) { return key(x) < key(y); });
-    }
-};
 
 timespec to_timespec(const std::optional<Timestamp>& t)
 {
