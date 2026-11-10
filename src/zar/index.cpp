@@ -3,10 +3,14 @@
 
 #include "zar/index.hpp"
 
+#include "zar/fields.hpp"
 #include "zar/names.hpp"
 
+#include <algorithm>
 #include <limits>
+#include <optional>
 #include <set>
+#include <span>
 #include <utility>
 
 namespace zar {
@@ -14,115 +18,54 @@ namespace {
 
 constexpr std::uint32_t kNanosPerSecond = 1'000'000'000;
 
-// ---- encoding ---------------------------------------------------------------
+// An algorithm byte, then the digests (§6.7).
+void write_digests(FieldWriter& field, Tag tag, std::span<const Digest> digests)
+{
+    Bytes value{static_cast<std::uint8_t>(HashAlgorithm::Blake3)};
+    for (const auto& digest : digests)
+        value.insert(value.end(), digest.begin(), digest.end());
+    field.bytes(tag, ByteView(value));
+}
 
-class FieldWriter {
-public:
-    explicit FieldWriter(Bytes& out) : out_(out) {}
+// The digests in a hash field, or nullopt if its algorithm isn't one zar
+// knows.
+std::optional<std::vector<Digest>> as_digests(ByteView value)
+{
+    if (value.empty())
+        throw FormatError("empty hash field");
+    if (value[0] != static_cast<std::uint8_t>(HashAlgorithm::Blake3))
+        return std::nullopt;
+    value = value.subspan(1);
+    if (value.size() % kDigestSize != 0)
+        throw FormatError("hash field length is not a whole number of digests");
+    std::vector<Digest> digests(value.size() / kDigestSize);
+    for (std::size_t i = 0; i < digests.size(); ++i)
+        std::copy_n(value.begin() + static_cast<std::ptrdiff_t>(i * kDigestSize), kDigestSize, digests[i].begin());
+    return digests;
+}
 
-    void bytes(Tag tag, std::string_view value)
-    {
-        start(tag, value.size());
-        out_.insert(out_.end(), value.begin(), value.end());
+// One digest, as DICT_HASH and SUBINDEX_HASH hold.
+std::optional<Digest> as_digest(ByteView value, bool& unknown)
+{
+    const auto digests = as_digests(value);
+    if (!digests) {
+        unknown = true;
+        return std::nullopt;
     }
+    if (digests->size() != 1)
+        throw FormatError("hash field must hold one digest");
+    return digests->front();
+}
 
-    template <std::unsigned_integral T>
-    void fixed(Tag tag, T value)
-    {
-        start(tag, sizeof(T));
-        append_le(out_, value);
-    }
-
-    // 4 bytes when the value fits, otherwise 8 (§6.4).
-    void unsigned_number(Tag tag, std::uint64_t value)
-    {
-        if (value <= std::numeric_limits<std::uint32_t>::max())
-            fixed(tag, static_cast<std::uint32_t>(value));
-        else
-            fixed(tag, value);
-    }
-
-    void signed_number(Tag tag, std::int64_t value)
-    {
-        if (value >= std::numeric_limits<std::int32_t>::min() &&
-            value <= std::numeric_limits<std::int32_t>::max())
-            fixed(tag, static_cast<std::uint32_t>(static_cast<std::int32_t>(value)));
-        else
-            fixed(tag, static_cast<std::uint64_t>(value));
-    }
-
-    void offsets(Tag tag, const std::vector<std::int64_t>& values)
-    {
-        start(tag, values.size() * 8);
-        for (const auto value : values)
-            append_le(out_, static_cast<std::uint64_t>(value));
-    }
-
-    void time(Tag seconds_tag, Tag nanos_tag, const Timestamp& t)
-    {
-        signed_number(seconds_tag, t.seconds);
-        if (t.nanoseconds)
-            fixed(nanos_tag, *t.nanoseconds);
-    }
-
-private:
-    void start(Tag tag, std::size_t length)
-    {
-        append_varint(out_, static_cast<std::uint64_t>(tag));
-        append_varint(out_, length);
-    }
-
-    Bytes& out_;
-};
+// A time and, if it has one, its sub-second part (§6.5).
+void write_time(FieldWriter& field, Tag seconds_tag, Tag nanos_tag, const Timestamp& t)
+{
+    field.signed_number(seconds_tag, t.seconds);
+    if (t.nanoseconds)
+        field.fixed(nanos_tag, *t.nanoseconds);
+}
 
 // ---- decoding ---------------------------------------------------------------
-
-std::uint64_t as_unsigned(ByteView value)
-{
-    switch (value.size()) {
-    case 4: return load_le<std::uint32_t>(value.data());
-    case 8: return load_le<std::uint64_t>(value.data());
-    default: throw FormatError("numeric field must be 4 or 8 bytes");
-    }
-}
-
-std::int64_t as_signed(ByteView value)
-{
-    switch (value.size()) {
-    case 4: return static_cast<std::int32_t>(load_le<std::uint32_t>(value.data()));
-    case 8: return static_cast<std::int64_t>(load_le<std::uint64_t>(value.data()));
-    default: throw FormatError("numeric field must be 4 or 8 bytes");
-    }
-}
-
-template <std::unsigned_integral T>
-T as_fixed(ByteView value)
-{
-    if (value.size() != sizeof(T))
-        throw FormatError("field must be " + std::to_string(sizeof(T)) + " bytes");
-    return load_le<T>(value.data());
-}
-
-std::int64_t as_offset(ByteView value)
-{
-    return static_cast<std::int64_t>(as_fixed<std::uint64_t>(value));
-}
-
-std::vector<std::int64_t> as_offsets(ByteView value)
-{
-    if (value.size() % 8 != 0)
-        throw FormatError("offset list length is not a multiple of 8");
-    std::vector<std::int64_t> offsets;
-    offsets.reserve(value.size() / 8);
-    for (std::size_t i = 0; i < value.size(); i += 8)
-        offsets.push_back(static_cast<std::int64_t>(load_le<std::uint64_t>(&value[i])));
-    return offsets;
-}
-
-std::string as_string(ByteView value)
-{
-    return {reinterpret_cast<const char*>(value.data()), value.size()};
-}
 
 std::uint32_t as_nanos(ByteView value)
 {
@@ -167,13 +110,8 @@ Entry decode_entry(std::uint8_t type, std::uint8_t flags, ByteView body)
     };
 
     while (!body.empty()) {
-        const auto raw_tag = read_varint(body);
+        const auto [raw_tag, value] = read_field(body, "index");
         const auto tag = static_cast<Tag>(raw_tag);
-        const auto length = read_varint(body);
-        if (length > body.size())
-            throw FormatError("index field overruns its entry");
-        const auto value = body.first(static_cast<std::size_t>(length));
-        body = body.subspan(static_cast<std::size_t>(length));
 
         if (!first_sight(raw_tag))
             throw FormatError("index entry repeats a field");
@@ -190,6 +128,14 @@ Entry decode_entry(std::uint8_t type, std::uint8_t flags, ByteView body)
         case Tag::ContentCrc: entry.content_crc = as_fixed<std::uint32_t>(value); break;
         case Tag::LinkTarget: entry.link_target = as_string(value); break;
         case Tag::Subindex: entry.subindex = as_offset(value); break;
+        case Tag::ChunkHashes:
+            if (auto digests = as_digests(value))
+                entry.chunk_hashes = std::move(*digests);
+            else
+                entry.unknown_hashes = true;
+            break;
+        case Tag::DictHash: entry.dict_hash = as_digest(value, entry.unknown_hashes); break;
+        case Tag::SubindexHash: entry.subindex_hash = as_digest(value, entry.unknown_hashes); break;
         case Tag::Mode: entry.mode = as_fixed<std::uint16_t>(value); break;
         case Tag::Uid: entry.uid = as_unsigned(value); break;
         case Tag::Gid: entry.gid = as_unsigned(value); break;
@@ -243,6 +189,12 @@ void encode_entry(Bytes& out, const Entry& entry)
         field.bytes(Tag::LinkTarget, *entry.link_target);
     if (entry.subindex)
         field.fixed(Tag::Subindex, static_cast<std::uint64_t>(*entry.subindex));
+    if (!entry.chunk_hashes.empty())
+        write_digests(field, Tag::ChunkHashes, entry.chunk_hashes);
+    if (entry.dict_hash)
+        write_digests(field, Tag::DictHash, std::span(&*entry.dict_hash, 1));
+    if (entry.subindex_hash)
+        write_digests(field, Tag::SubindexHash, std::span(&*entry.subindex_hash, 1));
     if (entry.mode)
         field.fixed(Tag::Mode, *entry.mode);
     if (entry.uid)
@@ -254,13 +206,13 @@ void encode_entry(Bytes& out, const Entry& entry)
     if (entry.gname)
         field.bytes(Tag::Gname, *entry.gname);
     if (entry.mtime)
-        field.time(Tag::Mtime, Tag::MtimeNsec, *entry.mtime);
+        write_time(field, Tag::Mtime, Tag::MtimeNsec, *entry.mtime);
     if (entry.atime)
-        field.time(Tag::Atime, Tag::AtimeNsec, *entry.atime);
+        write_time(field, Tag::Atime, Tag::AtimeNsec, *entry.atime);
     if (entry.ctime)
-        field.time(Tag::Ctime, Tag::CtimeNsec, *entry.ctime);
+        write_time(field, Tag::Ctime, Tag::CtimeNsec, *entry.ctime);
     if (entry.btime)
-        field.time(Tag::Btime, Tag::BtimeNsec, *entry.btime);
+        write_time(field, Tag::Btime, Tag::BtimeNsec, *entry.btime);
 
     out.push_back(static_cast<std::uint8_t>(entry.type));
     out.push_back(entry.flags);

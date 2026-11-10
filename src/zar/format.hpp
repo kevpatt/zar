@@ -26,7 +26,7 @@ struct Version {
 
 // The version of FORMAT.md this implements. It changes only when the format
 // does, independently of the program's version (CMakeLists.txt).
-inline constexpr Version kFormatVersion{0, 5, 0};
+inline constexpr Version kFormatVersion{0, 6, 0};
 
 inline constexpr std::size_t kHeaderSize = 32;        // zar and block headers
 inline constexpr std::size_t kTrailerSize = kHeaderSize + 16;
@@ -48,6 +48,7 @@ enum class BlockType : std::uint16_t {
     ZstdDict = 0x0005,
     Trailer = 0x0006,
     ArchiveZstd = 0x0007,    // a whole archive, compressed as one frame (§5.5)
+    Signature = 0x0008,      // a signed root (§5.6)
 };
 
 // §6.2
@@ -73,6 +74,9 @@ enum class Tag : std::uint64_t {
     ContentCrc = 0x06,
     LinkTarget = 0x07,
     Subindex = 0x08,
+    ChunkHashes = 0x09,    // §6.7
+    DictHash = 0x0A,
+    SubindexHash = 0x0B,
     Mode = 0x10,
     Uid = 0x11,
     Gid = 0x12,

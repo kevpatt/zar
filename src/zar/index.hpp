@@ -6,6 +6,7 @@
 
 #include "zar/bytes.hpp"
 #include "zar/format.hpp"
+#include "zar/hash.hpp"
 
 #include <optional>
 #include <string>
@@ -34,6 +35,12 @@ struct Entry {
 
     std::optional<std::string> link_target;    // SYMLINK and HARDLINK
     std::optional<std::int64_t> subindex;      // DIR
+
+    // Block hashes (§6.7): one per chunk (a hole's is all zeros), or none.
+    std::vector<Digest> chunk_hashes;
+    std::optional<Digest> dict_hash;
+    std::optional<Digest> subindex_hash;
+    bool unknown_hashes = false;    // hash fields in algorithms zar doesn't know
 
     // Metadata
     std::optional<std::uint16_t> mode;

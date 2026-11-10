@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.20)
 project(zar
     VERSION 0.6.0
     DESCRIPTION "Random-access zstd archiver"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,6 +22,8 @@ endif()
 option(ZAR_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 option(ZAR_BUILD_TESTS "Build the test suite" ON)
 option(ZAR_USE_SYSTEM_XXHASH "Link an installed libxxhash instead of compiling in the bundled copy" OFF)
+option(ZAR_USE_SYSTEM_BLAKE3 "Link an installed libblake3 instead of compiling in the bundled copy" OFF)
+option(ZAR_USE_SYSTEM_MONOCYPHER "Link an installed Monocypher instead of compiling in the bundled copy" OFF)
 
 # libzstd: prefer pkg-config, fall back to zstd's own CMake package.
 find_package(PkgConfig QUIET)
@@ -53,6 +55,8 @@ if(ZAR_USE_SYSTEM_XXHASH)
     endif()
 endif()
 
+include(cmake/crypto.cmake)
+
 add_library(zar_warnings INTERFACE)
 if(MSVC)
     target_compile_options(zar_warnings INTERFACE /W4 $<$<BOOL:${ZAR_WARNINGS_AS_ERRORS}>:/WX>)
@@ -73,11 +77,14 @@ add_library(libzar STATIC
     src/zar/editor.cpp
     src/zar/extractor.cpp
     src/zar/format.cpp
+    src/zar/hash.cpp
     src/zar/index.cpp
     src/zar/names.cpp
     src/zar/output.cpp
     src/zar/policy.cpp
     src/zar/posix.cpp
+    src/zar/signature.cpp
+    src/zar/signing.cpp
     src/zar/thread_pool.cpp)
 set_target_properties(libzar PROPERTIES OUTPUT_NAME zar)
 
@@ -91,7 +98,8 @@ else()
     target_include_directories(libzar SYSTEM PRIVATE third_party/xxhash)
 endif()
 find_package(Threads REQUIRED)
-target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads PRIVATE zar_warnings)
+target_link_libraries(libzar PUBLIC ${ZAR_ZSTD_TARGET} Threads::Threads
+                             PRIVATE ${ZAR_BLAKE3_TARGET} ${ZAR_MONOCYPHER_TARGET} zar_warnings)
 
 # The build time and git revision, refreshed on every build. Only the
 # commands link this, so the library and tests don't rebuild for it.
@@ -151,6 +159,12 @@ else()
     if(NOT ZAR_USE_SYSTEM_XXHASH)
         install(FILES third_party/xxhash/LICENSE DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.xxhash)
     endif()
+    if(NOT ZAR_USE_SYSTEM_BLAKE3)
+        install(FILES third_party/blake3/LICENSE_CC0 DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.blake3)
+    endif()
+    if(NOT ZAR_USE_SYSTEM_MONOCYPHER)
+        install(FILES third_party/monocypher/LICENCE.md DESTINATION ${CMAKE_INSTALL_DOCDIR} RENAME LICENSE.monocypher)
+    endif()
 
     # Linux packages of the above, under /usr: `cpack -G DEB` or `cpack -G RPM`
     # in the build directory. Their library dependencies are found
@@ -193,7 +207,8 @@ if(ZAR_BUILD_TESTS)
         tests/posix_tests.cpp
         tests/writer_tests.cpp
         tests/extractor_tests.cpp
-        tests/rezar_tests.cpp)
+        tests/rezar_tests.cpp
+        tests/crypto_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)
     add_test(NAME zar_tests COMMAND zar_tests)
     add_test(NAME cli_test
