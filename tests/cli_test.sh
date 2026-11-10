@@ -135,6 +135,33 @@ said "rezar two stdin lists" 'only one list'
 expect 2 "rezar --dedup=bogus" "$rezar" --dedup=bogus -o "$work/never.zar" "$archive"
 said "rezar --dedup=bogus" 'on, off, or deep'
 
+# Signing: key pairs, signed archives, and verifying them.
+expect 0 "zar --keygen" "$zar" --keygen="$work/k1.key"
+expect 0 "zar --keygen, a second key" "$zar" --keygen="$work/k2.key"
+[ "$(stat -f %Lp "$work/k1.key" 2>/dev/null || stat -c %a "$work/k1.key")" = 600 ] || fail "zar --keygen: secret key isn't mode 600"
+expect 2 "zar --keygen over a key" "$zar" --keygen="$work/k1.key"
+said "zar --keygen over a key" 'already exists'
+expect 0 "zar --sign" "$zar" -y --sign="$work/k1.key" --sequence=3 --name=nightly -o "$work/signed.zar" "$work/proj"
+expect 0 "unzar --verify" "$unzar" -t --verify="$work/k1.key.pub" "$work/signed.zar"
+expect 2 "unzar --verify, wrong key" "$unzar" -t --verify="$work/k2.key.pub" "$work/signed.zar"
+said "unzar --verify, wrong key" 'not signed by any key'
+expect 0 "unzar --verify, either key" "$unzar" -t --verify="$work/k2.key.pub" --verify="$work/k1.key.pub" "$work/signed.zar"
+expect 0 "unzar -lv --verify" "$unzar" -lv --verify="$work/k1.key.pub" "$work/signed.zar"
+grep -q '^signed, sequence 3, .*, name nightly$' "$work/out" || fail "unzar -lv: no signature line"
+grep -q ': verified$' "$work/out" || fail "unzar -lv: signer not shown verified"
+expect 0 "unzar, signature unchecked" "$unzar" -t "$work/signed.zar"
+said "unzar, signature unchecked" "signature wasn't checked"
+expect 2 "unzar --verify, unsigned" "$unzar" -t --verify="$work/k1.key.pub" "$archive"
+said "unzar --verify, unsigned" 'not signed'
+expect 2 "zar --sequence without --sign" "$zar" --sequence=1 -o "$work/never.zar" "$work/proj"
+said "zar --sequence without --sign" 'go with --sign'
+expect 2 "zar --sign --solid" "$zar" --sign="$work/k1.key" --solid=1M -o "$work/never.zar" "$work/proj"
+said "zar --sign --solid" 'solid'
+expect 0 "rezar --verify --sign" "$rezar" --verify="$work/k1.key.pub" --sign="$work/k2.key" \
+    --delete=proj/a.txt -o "$work/resigned.zar" "$work/signed.zar"
+expect 0 "unzar --verify the re-signed" "$unzar" -t --verify="$work/k2.key.pub" "$work/resigned.zar"
+expect 2 "unzar --verify the re-signed, old key" "$unzar" -t --verify="$work/k1.key.pub" "$work/resigned.zar"
+
 if [ "$failures" -ne 0 ]; then
     echo "$failures failures" >&2
     exit 1

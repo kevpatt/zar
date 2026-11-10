@@ -208,7 +208,8 @@ if(ZAR_BUILD_TESTS)
         tests/writer_tests.cpp
         tests/extractor_tests.cpp
         tests/rezar_tests.cpp
-        tests/crypto_tests.cpp)
+        tests/crypto_tests.cpp
+        tests/signing_tests.cpp)
     target_link_libraries(zar_tests PRIVATE libzar zar_warnings)
     add_test(NAME zar_tests COMMAND zar_tests)
     add_test(NAME cli_test

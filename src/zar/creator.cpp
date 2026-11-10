@@ -13,6 +13,7 @@
 #include "zar/names.hpp"
 #include "zar/policy.hpp"
 #include "zar/posix.hpp"
+#include "zar/signature.hpp"
 #include "zar/thread_pool.hpp"
 
 #include <algorithm>
@@ -106,8 +107,12 @@ public:
         // Neither a pipe nor a solid archive's frame can be read back; in a
         // solid archive, zstd finds repeats itself.
         dedup_ = options.dedup.value_or(true) && pass_ == Pass::Normal && writer_->can_read_back();
+        hashing_ = options.hash || !options.sign.empty();
+        if (hashing_)
+            compressor_.hash_blocks();
         if (dict) {
             dict_offset_ = writer_->write_dictionary(*dict);
+            dict_hash_ = block_hash(BlockType::ZstdDict, *dict);
             compressor_.use_dictionary(*dict);
         }
     }
@@ -132,6 +137,7 @@ private:
     struct Stored {
         std::int64_t offset;
         BlockType type;
+        std::optional<Digest> hash;    // its block hash, when hashing
     };
 
     struct PendingChunk {
@@ -197,6 +203,8 @@ private:
     Compressor compressor_;
     const Bytes* dict_;
     std::optional<std::int64_t> dict_offset_;
+    Digest dict_hash_{};
+    bool hashing_ = false;    // storing block hashes (§6.7)
     bool dedup_ = false;
     std::unordered_map<ChunkHash, Known, ChunkHash::Hasher> known_;
     std::uint64_t queued_ = 0;     // chunks queued so far
@@ -353,36 +361,61 @@ void Creator::add_at(const Addition& addition, const fs::path& dir)
 }
 
 // Copies each block once, however many chunks share it: at a new offset,
-// but otherwise exactly as it was.
+// but otherwise exactly as it was. Hashes the entry has are checked as each
+// block is read, and any missing are computed if hashing.
 void Creator::copy_entries(const ArchiveReader& source, std::span<const Entry> keep)
 {
     std::map<std::int64_t, Stored> copied;    // by offset in the source
     for (auto entry : keep) {
+        const bool hashed = !entry.chunk_hashes.empty();
+        const bool hash = hashing_ || hashed;
+        std::vector<Digest> hashes;
         try {
-            const auto lengths = ArchiveReader::chunk_lengths(entry);
+            const auto lengths = ArchiveReader::chunk_lengths(entry);    // checks the hashes' count
             for (std::size_t i = 0; i < entry.chunks.size(); ++i) {
                 auto& chunk = entry.chunks[i];
-                if (chunk == kNoOffset)
-                    continue;    // a hole
+                if (chunk == kNoOffset) {    // a hole
+                    hashes.push_back(kHoleDigest);
+                    continue;
+                }
                 auto it = copied.find(chunk);
                 if (it == copied.end()) {
                     const auto block = source.block_header(chunk);
                     if (block.type != BlockType::DataRaw && block.type != BlockType::DataZstd)
                         throw FormatError("block at offset " + std::to_string(chunk) + " is not a data block");
                     const auto payload = source.payload(block);    // verifies its CRC
-                    const Stored stored{writer_->write_block(block.type, payload), block.type};
+                    std::optional<Digest> digest;
+                    if (hash)
+                        digest = block_hash(block.type, payload);
+                    const Stored stored{writer_->write_block(block.type, payload), block.type, digest};
                     it = copied.emplace(chunk, stored).first;
                     stats_.copied_bytes += payload.size();
                     if (dedup_ && options_.dedup_copied)
                         unhashed_[lengths[i]].push_back({stored, payload.size()});
                 }
+                if (hash && !it->second.hash)    // copied earlier, for an entry without hashes
+                    it->second.hash = block_hash(it->second.type, source.payload(source.block_header(chunk)));
+                if (hashed && !digest_matches(entry.chunk_hashes[i], *it->second.hash))
+                    throw FormatError("block at offset " + std::to_string(chunk) + " fails its hash");
+                if (hash)
+                    hashes.push_back(*it->second.hash);
                 chunk = it->second.offset;
             }
+            if (entry.dict_hash && !digest_matches(*entry.dict_hash, dict_hash_))
+                throw FormatError("its dictionary fails its hash");
         } catch (const FormatError& e) {
             throw FormatError(entry.path + ": " + e.what());
         }
-        if (entry.dict)
+        if (hash && !entry.chunks.empty())
+            entry.chunk_hashes = std::move(hashes);
+        if (entry.dict) {
             entry.dict = dict_offset_.value();    // the constructor wrote it again
+            if (hash)
+                entry.dict_hash = dict_hash_;
+        }
+        // The new archive has one index, holding every entry.
+        entry.subindex.reset();
+        entry.subindex_hash.reset();
         entries_.push_back(std::move(entry));
         ++stats_.copied_entries;
     }
@@ -659,7 +692,7 @@ std::optional<Creator::Stored> Creator::find_duplicate(const ChunkHash& hash, By
     const auto& known = it->second;
     if (!known.stored)
         return std::nullopt;
-    const auto [offset, type] = *known.stored;
+    const auto [offset, type, digest] = *known.stored;
     if (type == BlockType::DataRaw && known.payload_size != chunk.size())
         return std::nullopt;
     auto payload = writer_->read_payload(offset, static_cast<std::size_t>(known.payload_size));
@@ -693,7 +726,10 @@ void Creator::write_next()
     ++written_;
 
     if (pending.hole) {
-        entries_[pending.entry].chunks.push_back(kNoOffset);
+        auto& entry = entries_[pending.entry];
+        entry.chunks.push_back(kNoOffset);
+        if (hashing_)
+            entry.chunk_hashes.push_back(kHoleDigest);
         return;
     }
     Stored stored{};
@@ -701,7 +737,7 @@ void Creator::write_next()
         stored = *pending.reuse;
     } else {
         const auto chunk = pending.chunk.get();
-        stored = {writer_->write_block(chunk.type, chunk.payload), chunk.type};
+        stored = {writer_->write_block(chunk.type, chunk.payload), chunk.type, chunk.hash};
         if (pending.hash) {
             auto& known = known_.at(*pending.hash);
             known.stored = stored;
@@ -711,8 +747,12 @@ void Creator::write_next()
 
     auto& entry = entries_[pending.entry];
     entry.chunks.push_back(stored.offset);
+    if (hashing_)
+        entry.chunk_hashes.push_back(stored.hash.value());
     if (stored.type == BlockType::DataZstd && dict_offset_) {
         entry.dict = dict_offset_;
+        if (hashing_)
+            entry.dict_hash = dict_hash_;
         stats_.dictionary = true;
     }
 }
@@ -730,7 +770,9 @@ CreateStats Creator::finish()
         entry.size = source.size;
         entry.chunk_size = source.chunk_size;
         entry.chunks = source.chunks;
+        entry.chunk_hashes = source.chunk_hashes;
         entry.dict = source.dict;
+        entry.dict_hash = source.dict_hash;
         entry.content_crc = source.content_crc;
     }
 
@@ -744,10 +786,24 @@ CreateStats Creator::finish()
             encode_entry(index, entries_[i]);
 
     const auto packed = pass_ == Pass::Raw ? Bytes{} : zstd_compress(index, options_.level);
-    if (!packed.empty() && packed.size() < index.size())
-        writer_->finish(BlockType::IndexZstd, packed);
-    else
-        writer_->finish(BlockType::IndexRaw, index);
+    const bool use_packed = !packed.empty() && packed.size() < index.size();
+    const auto type = use_packed ? BlockType::IndexZstd : BlockType::IndexRaw;
+    const ByteView root = use_packed ? ByteView(packed) : ByteView(index);
+
+    ArchiveWriter::SignRoot sign;
+    if (!options_.sign.empty()) {
+        SignedRoot statement;
+        statement.root_hash = block_hash(type, root);
+        statement.sequence = options_.sequence;
+        statement.time = options_.sign_time;
+        statement.name = options_.sign_name;
+        sign = [this, statement](std::int64_t at) mutable {
+            statement.root = at;
+            return encode_signature(statement, options_.sign);
+        };
+        stats_.signed_by = options_.sign.size();
+    }
+    writer_->finish(type, root, sign);
 
     stats_.archive_bytes = out_.position();
     return stats_;
@@ -922,6 +978,9 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
         specs.push_back(parse_input(input));
 
     // Checked first, so nothing is written.
+    if (!options.sign.empty() && options.solid_limit)
+        throw std::runtime_error("a solid archive can't be signed: it would have to be decompressed "
+                                 "before anything in it could be checked");
     if (options.dedup == true && !options.head_index && !out.readable())
         throw std::runtime_error("--dedup=on reads back what it has written, so it can't write "
                                  "to a pipe (unless with --head-index)");
@@ -985,7 +1044,12 @@ CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<
             present.insert(addition.path);
     }
 
-    Creator creator(out, out, options, true, Pass::Normal, nullptr, dict_at ? &dict : nullptr);
+    // A hashed archive stays hashed.
+    auto rebuilt = options;
+    rebuilt.hash = options.hash || std::ranges::any_of(keep, [](const Entry& e) {
+        return !e.chunk_hashes.empty() || e.dict_hash.has_value();
+    });
+    Creator creator(out, out, rebuilt, true, Pass::Normal, nullptr, dict_at ? &dict : nullptr);
     creator.sort_entries();
     creator.copy_entries(source, keep);
     for (const auto& addition : all)

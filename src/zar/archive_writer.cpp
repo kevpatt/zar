@@ -132,10 +132,16 @@ Bytes ArchiveWriter::read_payload(std::int64_t offset, std::size_t size)
     return payload;
 }
 
-void ArchiveWriter::finish(BlockType index_type, ByteView index)
+void ArchiveWriter::finish(BlockType index_type, ByteView index, const SignRoot& sign)
 {
+    // The index, and its signature if any: the root.
+    const auto write_root = [&] {
+        const auto at = write_block(index_type, index);
+        return sign ? write_block(BlockType::Signature, sign(at)) : at;
+    };
+
     if (!spool_) {
-        const auto root = write_block(index_type, index);
+        const auto root = write_root();
         write_trailer(out_, origin_, start_, root, alignment());
         if (out_.seekable()) {
             header_.index_offset = root;
@@ -144,37 +150,44 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index)
         return;
     }
 
-    // zar header | head index | padding | [dictionary] | base: spooled blocks |
-    // tail index | trailer
+    // zar header | head index | [signature] | padding | [dictionary] |
+    // base: spooled blocks | tail index | [signature] | trailer
     //
     // Everything before the base is known up front, so this works on a pipe.
+    // A signature's size doesn't depend on the offset it names.
     const auto head_payload_at = round_up(2 * kHeaderSize, alignment());
     const auto head_end = head_payload_at + index.size();
+    const auto signature_size = sign ? sign(0).size() : 0;
+    const auto signature_at = round_up(head_end + kHeaderSize, alignment()) - kHeaderSize;
+    const auto used = sign ? signature_at + kHeaderSize + signature_size : head_end;
     const auto dict_span = dictionary_.empty() ? 0 : kHeaderSize + round_up(dictionary_.size(), alignment());
-    const auto base = round_up(head_end + dict_span, alignment());
+    const auto base = round_up(used + dict_span, alignment());
     if (base > std::numeric_limits<std::uint32_t>::max())
         throw std::runtime_error("the index is too large to put at the head of the archive");
 
     // The head index lies before the base, so its offset is negative.
+    const auto shift = -static_cast<std::int64_t>(base);
+    const auto index_offset = static_cast<std::int64_t>(head_payload_at - kHeaderSize) + shift;
     header_.base_offset = static_cast<std::uint32_t>(base);
-    header_.index_offset =
-        static_cast<std::int64_t>(head_payload_at - kHeaderSize) - static_cast<std::int64_t>(base);
+    header_.index_offset = sign ? static_cast<std::int64_t>(signature_at) + shift : index_offset;
     out_.write(header_.encode());
-    place(out_, kHeaderSize, -static_cast<std::int64_t>(base), index_type, index);
+    place(out_, kHeaderSize, shift, index_type, index);
+    if (sign)
+        place(out_, head_end, shift, BlockType::Signature, sign(index_offset));
     if (!dictionary_.empty()) {
         const auto dict_at = base - dict_span;
-        out_.write_zeros(static_cast<std::size_t>(dict_at - head_end));
+        out_.write_zeros(static_cast<std::size_t>(dict_at - used));
         place(out_, dict_at, -static_cast<std::int64_t>(base), BlockType::ZstdDict, dictionary_);
         out_.write_zeros(static_cast<std::size_t>(base - (dict_at + kHeaderSize + dictionary_.size())));
     } else {
-        out_.write_zeros(static_cast<std::size_t>(base - head_end));
+        out_.write_zeros(static_cast<std::size_t>(base - used));
     }
 
     spool_->copy_to(out_);
     spool_.reset();
     origin_ = start_ + base;
 
-    const auto tail = write_block(index_type, index);    // the second copy (§5.2)
+    const auto tail = write_root();    // the second copy (§5.2)
     write_trailer(out_, origin_, start_, tail, alignment());
 }
 

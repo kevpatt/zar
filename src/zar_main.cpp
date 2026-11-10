@@ -30,6 +30,7 @@ constexpr std::string_view kDescription =
 
 constexpr std::string_view kUsage = R"(usage: zar [options] PATH
        zar [options] -m -o ARCHIVE PATH...
+       zar [-y] --keygen=KEYFILE
 
 PATH is stored under its own name, so extracting recreates it:
   zar proj      proj (file, directory, or symlink) is stored as proj
@@ -68,6 +69,13 @@ constexpr std::string_view kUsageTail = R"(      --align[=N]        align block 
       --help             show this help
       --version          show version information
 
+Hashes and signatures:
+)";
+
+constexpr std::string_view kUsageEnd = R"(      --keygen=KEYFILE   make a new Ed25519 key pair for --sign: the secret
+                         key in KEYFILE (mode 0600, kept private) and the
+                         public key, for unzar --verify, in KEYFILE.pub
+
 Short options can be combined, as in -myv; -l's level can be attached or
 separate (-l19 or -l 19), but -j's count must be attached (-j4).
 )";
@@ -84,6 +92,7 @@ struct Command {
     bool many = false;
     bool verbose = false;
     std::vector<fs::path> inputs;
+    std::optional<fs::path> keygen;
 };
 
 enum LongOnly {
@@ -92,6 +101,7 @@ enum LongOnly {
     kDedup,
     kDict,
     kDictOverSolid,
+    kKeygen,
     kHelp,
     kVersion,
 };
@@ -99,7 +109,8 @@ enum LongOnly {
 void print_help()
 {
     zar::cli::print_banner(std::cout, "zar", kDescription);
-    std::cout << kUsage << zar::cli::kCreateOptionsHelp << kUsageTail;
+    std::cout << kUsage << zar::cli::kCreateOptionsHelp << kUsageTail << zar::cli::kSigningOptionsHelp
+              << kUsageEnd;
 }
 
 // Returns nullopt when the command was fully handled (--help, --version).
@@ -117,6 +128,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"dict-over-solid", required_argument, nullptr, kDictOverSolid},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, kHelp},
+        {"keygen", required_argument, nullptr, kKeygen},
         {"version", no_argument, nullptr, kVersion},
     });
 
@@ -160,6 +172,7 @@ std::optional<Command> parse(int argc, char** argv)
         case kHelp:
             print_help();
             return std::nullopt;
+        case kKeygen: cmd.keygen = fs::path(std::string(arg)); break;
         case kVersion:
             zar::cli::print_version(std::cout, "zar");
             return std::nullopt;
@@ -170,8 +183,14 @@ std::optional<Command> parse(int argc, char** argv)
 
     for (int i = optind; i < argc; ++i)
         cmd.inputs.emplace_back(argv[i]);
+    if (cmd.keygen) {
+        if (!cmd.inputs.empty())
+            throw UsageError("--keygen makes a key pair; it doesn't archive anything");
+        return cmd;
+    }
     if (cmd.inputs.empty())
         throw UsageError("nothing to archive");
+    zar::cli::finish_signing_options(cmd.options);
     if (cmd.many) {
         if (cmd.output.empty())
             throw UsageError("-m needs -o to name the archive");
@@ -184,8 +203,21 @@ std::optional<Command> parse(int argc, char** argv)
     return cmd;
 }
 
+int keygen(const Command& cmd)
+{
+    const auto key = zar::SecretKey::generate();
+    zar::write_key_files(*cmd.keygen, key, cmd.overwrite);
+    std::cout << "secret key: " << printable(cmd.keygen->string()) << " (keep it private)\n"
+              << "public key: " << printable(cmd.keygen->string()) << ".pub (fingerprint "
+              << zar::fingerprint(key.public_key()) << ")\n";
+    return 0;
+}
+
 int run(Command& cmd)
 {
+    if (cmd.keygen)
+        return keygen(cmd);
+
     // File names can hold anything, including terminal control sequences.
     cmd.options.on_warning = [](std::string_view message) {
         std::cerr << "zar: " << printable(message) << '\n';
@@ -208,6 +240,10 @@ int run(Command& cmd)
             std::cerr << ", " << zar::cli::human_size(stats.deduplicated_bytes) << " deduplicated";
         if (stats.hole_bytes)
             std::cerr << ", " << zar::cli::human_size(stats.hole_bytes) << " in holes";
+        if (stats.signed_by)
+            std::cerr << ", signed";
+        else if (cmd.options.hash)
+            std::cerr << ", hashed";
         std::cerr << '\n';
     }
     return stats.warnings ? 1 : 0;

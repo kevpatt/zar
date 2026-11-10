@@ -7,6 +7,7 @@
 #include "zar/format.hpp"
 #include "zar/index.hpp"
 #include "zar/output.hpp"
+#include "zar/signing.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -41,6 +42,16 @@ struct CreateOptions {
     bool dedup_copied = false;
     bool head_index = false;    // also put the index first, for streaming (§5.4)
 
+    // Store each block's hash (§6.7), so the archive can be verified, and
+    // signed, now or later.
+    bool hash = false;
+    // Sign the archive with these keys (§5.6), which implies hash. Not with
+    // solid_limit: a solid archive can't be signed.
+    std::vector<SecretKey> sign;
+    std::optional<std::uint64_t> sequence;    // what the signature says
+    std::optional<std::int64_t> sign_time;
+    std::optional<std::string> sign_name;
+
     // Store each file of at most this many bytes as a single block, whatever
     // the chunk size.
     std::optional<std::uint64_t> contiguous_limit;
@@ -73,6 +84,7 @@ struct CreateStats {
     std::uint64_t hole_bytes = 0;            // holes in sparse files, stored as such
     std::uint64_t copied_entries = 0;        // rezar: entries kept from the source archive
     std::uint64_t copied_bytes = 0;          // and the payload bytes of their blocks
+    std::size_t signed_by = 0;               // keys that signed it
     std::uint64_t warnings = 0;
     bool solid = false;         // the solid form was kept
     bool dictionary = false;    // files were compressed with a trained dictionary
@@ -130,7 +142,9 @@ struct Addition {
 // `source` whose data is copied block for block, never decompressed or
 // recompressed, and `additions`, read from `source_dir`. Missing parent
 // directories of additions are added too. New files are compressed with the
-// source's dictionary, if the kept entries use one.
+// source's dictionary, if the kept entries use one. Hashes the kept entries
+// have are checked as their blocks are copied, and kept; if any have them, or
+// with options.hash or sign, every block in the new archive is hashed.
 //
 // Throws for a solid source, whose data can't be copied without
 // recompressing it, and, like create_archive(), for problems with an

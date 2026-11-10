@@ -132,15 +132,17 @@ void Compressor::work()
         }
 
         try {
-            CompressedChunk chunk{BlockType::DataRaw, {}};
+            CompressedChunk chunk{BlockType::DataRaw, {}, {}};
             if (job.compress) {
                 check(ZSTD_CCtx_refCDict(cctx.get(), job.dict.get()), "zstd dictionary");
                 auto packed = compress_with(cctx.get(), job.data);
                 if (packed.size() < job.data.size())
-                    chunk = {BlockType::DataZstd, std::move(packed)};
+                    chunk = {BlockType::DataZstd, std::move(packed), {}};
             }
             if (chunk.type == BlockType::DataRaw)
                 chunk.payload = std::move(job.data);
+            if (hash_)
+                chunk.hash = block_hash(chunk.type, chunk.payload);
             job.result.set_value(std::move(chunk));
         } catch (...) {
             job.result.set_exception(std::current_exception());

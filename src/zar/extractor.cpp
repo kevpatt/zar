@@ -621,7 +621,7 @@ struct Extractor::Impl {
                             throw StreamLost(error);
                         if (!block)
                             throw FormatError(error);
-                        return reader.decode_chunk(ref.job->entry, block->first, block->second,
+                        return reader.decode_chunk(ref.job->entry, ref.index, block->first, block->second,
                                                    ref.job->lengths[ref.index], decompress);
                     });
                 });

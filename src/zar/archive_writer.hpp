@@ -8,6 +8,7 @@
 #include "zar/format.hpp"
 #include "zar/output.hpp"
 
+#include <functional>
 #include <optional>
 
 namespace zar {
@@ -33,10 +34,16 @@ public:
     bool can_read_back() const noexcept;
     Bytes read_payload(std::int64_t offset, std::size_t size);
 
+    // Given the offset of a copy of the root index, the payload of a
+    // SIGNATURE block that names it (§5.6).
+    using SignRoot = std::function<Bytes(std::int64_t index_offset)>;
+
     // Writes the root index and the trailer. The zar header points to the
     // index too: to a copy at the front with head_index, otherwise (if the
-    // output is seekable) to the same block the trailer references.
-    void finish(BlockType index_type, ByteView index);
+    // output is seekable) to the same block the trailer references. With
+    // `sign`, each copy of the index is followed by a SIGNATURE block naming
+    // it, and the header and trailer point to those instead.
+    void finish(BlockType index_type, ByteView index, const SignRoot& sign = {});
 
 private:
     Output& sink() noexcept { return spool_ ? *spool_ : out_; }

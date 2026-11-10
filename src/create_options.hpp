@@ -10,6 +10,8 @@
 
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <getopt.h>
 #include <initializer_list>
 #include <string>
@@ -112,6 +114,10 @@ enum CreateOption {
     kNames,
     kCompressAll,
     kContiguous,
+    kHash,
+    kSign,
+    kSequence,
+    kSignName,
 };
 
 // The tool's own options, then these: a getopt_long table. Short options:
@@ -130,6 +136,10 @@ inline std::vector<option> option_table(std::initializer_list<option> own)
         {"names", required_argument, nullptr, kNames},
         {"compress-all", no_argument, nullptr, kCompressAll},
         {"contiguous", optional_argument, nullptr, kContiguous},
+        {"hash", no_argument, nullptr, kHash},
+        {"sign", required_argument, nullptr, kSign},
+        {"sequence", required_argument, nullptr, kSequence},
+        {"name", required_argument, nullptr, kSignName},
         {nullptr, 0, nullptr, 0},
     });
     return table;
@@ -150,8 +160,31 @@ inline bool parse_create_option(int code, const char* arg, CreateOptions& option
     case kNames: options.names = parse_names(text); return true;
     case kCompressAll: options.compress_all = true; return true;
     case kContiguous: options.contiguous_limit = parse_contiguous(arg); return true;
+    case kHash: options.hash = true; return true;
+    case kSign: options.sign.push_back(read_secret_key(text)); return true;
+    case kSequence: options.sequence = parse_number(text, "sequence number"); return true;
+    case kSignName:
+        if (!is_valid_utf8(text))
+            throw UsageError("--name must be UTF-8");
+        options.sign_name = std::string(text);
+        return true;
     default: return false;
     }
+}
+
+// Once the options are all parsed: checks the signing options, and sets the
+// time to sign, which is now unless SOURCE_DATE_EPOCH says otherwise.
+inline void finish_signing_options(CreateOptions& options)
+{
+    if (options.sign.empty()) {
+        if (options.sequence || options.sign_name)
+            throw UsageError("--sequence and --name go with --sign");
+        return;
+    }
+    if (const char* epoch = std::getenv("SOURCE_DATE_EPOCH"); epoch && *epoch)
+        options.sign_time = static_cast<std::int64_t>(parse_number(epoch, "SOURCE_DATE_EPOCH"));
+    else
+        options.sign_time = static_cast<std::int64_t>(std::time(nullptr));
 }
 
 // Their --help lines.
@@ -170,6 +203,17 @@ inline constexpr std::string_view kCreateOptionsHelp =
       --contiguous[=SIZE]
                          store each file of at most SIZE bytes as one block
                          instead of in chunks (with no SIZE, files up to 4G)
+)";
+
+// --help lines for the options that hash and sign the archive.
+inline constexpr std::string_view kSigningOptionsHelp =
+    R"(      --hash             store each block's BLAKE3 hash, so readers can
+                         verify every block (and so it can be signed later)
+      --sign=KEYFILE     sign the archive with a secret key from zar
+                         --keygen; may be repeated. Implies --hash.
+      --sequence=N       with --sign: a release number to sign, so a reader
+                         can refuse an archive older than one it has seen
+      --name=TEXT        with --sign: what the archive is, such as a channel
 )";
 
 } // namespace zar::cli

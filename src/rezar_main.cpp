@@ -58,10 +58,18 @@ constexpr std::string_view kUsage = R"(usage: rezar [options] -o OUTPUT ARCHIVE
                          also put the index at the front, so the archive
                          can be extracted from a pipe (default: as in
                          ARCHIVE; on without a value)
+      --verify=PUBFILE   first check that ARCHIVE is signed by this public
+                         key; may be repeated, for several. Hashes in
+                         ARCHIVE are always checked as blocks are copied.
   -v, --verbose          list paths as they are added, and print a summary
       --help             show this help
       --version          show version information
 
+Hashes and signatures. The new archive keeps ARCHIVE's hashes (and hashes
+what's added, too), but not its signature, since its root is new:
+)";
+
+constexpr std::string_view kUsageMiddle = R"(
 For the files added, as with zar:
 )";
 
@@ -93,6 +101,7 @@ enum LongOnly {
     kDelete,
     kDedup,
     kHeadIndex,
+    kVerify,
     kHelp,
     kVersion,
 };
@@ -108,6 +117,7 @@ struct Command {
     bool verbose = false;
     std::optional<std::uint8_t> align_log2;    // unset: as in the archive
     std::optional<bool> head_index;            // unset: as in the archive
+    std::vector<zar::PublicKey> verify;        // --verify: accepted signers of ARCHIVE
     zar::EditLists lists;
     // (which list, file), read once the options are all known
     std::vector<std::pair<std::vector<std::string> zar::EditLists::*, std::string>> list_files;
@@ -116,7 +126,8 @@ struct Command {
 void print_help()
 {
     zar::cli::print_banner(std::cout, "rezar", kDescription);
-    std::cout << kUsage << zar::cli::kCreateOptionsHelp << kUsageTail;
+    std::cout << kUsage << zar::cli::kSigningOptionsHelp << kUsageMiddle << zar::cli::kCreateOptionsHelp
+              << kUsageTail;
 }
 
 // Returns nullopt when the command was fully handled (--help, --version).
@@ -138,6 +149,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"dry-run", no_argument, nullptr, 'n'},
         {"dedup", required_argument, nullptr, kDedup},
         {"head-index", optional_argument, nullptr, kHeadIndex},
+        {"verify", required_argument, nullptr, kVerify},
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, kHelp},
         {"version", no_argument, nullptr, kVersion},
@@ -174,6 +186,7 @@ std::optional<Command> parse(int argc, char** argv)
             cmd.options.dedup_copied = arg == "deep";
             break;
         case zar::cli::kAlign: cmd.align_log2 = zar::cli::parse_alignment(optarg); break;
+        case kVerify: cmd.verify.push_back(zar::read_public_key(arg)); break;
         case kHeadIndex:
             if (!optarg || arg == "on")
                 cmd.head_index = true;
@@ -194,6 +207,7 @@ std::optional<Command> parse(int argc, char** argv)
         }
     }
 
+    zar::cli::finish_signing_options(cmd.options);
     if (optind >= argc)
         throw UsageError("no archive given");
     cmd.archive = argv[optind++];
@@ -263,6 +277,12 @@ int run(Command& cmd)
     }
 
     auto source = zar::ArchiveReader::open(cmd.archive, print_warning);
+    if (!cmd.verify.empty()) {
+        if (!source.signature())
+            throw std::runtime_error(cmd.archive + ": not signed, so it can't be verified");
+        if (!source.signed_by(cmd.verify))
+            throw std::runtime_error(cmd.archive + ": not signed by any key given to --verify");
+    }
     const auto plan = zar::plan_edit(source.entries(), cmd.lists);
     if (cmd.dry_run) {
         print_plan(plan);
@@ -295,6 +315,8 @@ int run(Command& cmd)
             std::cerr << ", " << zar::cli::human_size(stats.deduplicated_bytes) << " deduplicated";
         if (stats.hole_bytes)
             std::cerr << ", " << zar::cli::human_size(stats.hole_bytes) << " in holes";
+        if (stats.signed_by)
+            std::cerr << ", signed";
         std::cerr << ": " << zar::cli::human_size(stats.archive_bytes) << '\n';
     }
     return stats.warnings ? 1 : 0;

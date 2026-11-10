@@ -7,6 +7,7 @@
 
 #include "zar/format.hpp"
 #include "zar/index.hpp"
+#include "zar/signature.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -45,6 +46,17 @@ public:
     // archive inside it, which open() and open_stream() decompress.
     bool solid() const noexcept { return solid_; }
 
+    // A signed archive's SIGNATURE block (§5.6). Opening one checks that its
+    // root index matches, and that every block is hashed (so the signature
+    // covers everything), but not who signed it: see signed_by().
+    const std::optional<SignatureBlock>& signature() const noexcept { return signature_; }
+
+    // The first of `keys` that validly signed the archive, if any.
+    std::optional<PublicKey> signed_by(std::span<const PublicKey> keys) const
+    {
+        return signature_ ? signature_->signed_by(keys) : std::nullopt;
+    }
+
     ArchiveReader(ArchiveReader&&) noexcept;
     ~ArchiveReader();
 
@@ -64,14 +76,15 @@ public:
     // checking SIZE, CHUNK_SIZE, and CHUNKS against each other (§6.5).
     static std::vector<std::uint64_t> chunk_lengths(const Entry& entry);
 
-    // Reads, verifies, and (if `decompress`) decompresses one chunk. Without
+    // Reads, verifies, and (if `decompress`) decompresses one chunk. Its hash
+    // (§6.7), if the entry has hashes, is checked first. Without
     // decompression it still checks the zstd frame's declared content size,
     // and returns an empty buffer.
     Bytes chunk(const Entry& entry, std::size_t index, std::uint64_t expected_length,
                 bool decompress) const;
 
     // The same, for a block already read (e.g. by next_block()).
-    Bytes decode_chunk(const Entry& entry, const BlockHeader& block, ByteView payload,
+    Bytes decode_chunk(const Entry& entry, std::size_t index, const BlockHeader& block, ByteView payload,
                        std::uint64_t expected_length, bool decompress) const;
 
     // Stream only: reads the block at `offset`, skipping anything before it.
@@ -89,16 +102,20 @@ private:
 
     ArchiveReader(std::unique_ptr<File> file, ArchiveHeader header, std::uint64_t base);
     void read_at(std::uint64_t position, std::span<std::uint8_t> out) const;
-    Bytes index_payload(std::int64_t offset) const;
+    Bytes index_payload(std::int64_t offset, const std::optional<Digest>& hash) const;
+    void load_root(std::int64_t offset);
+    void check_complete(std::span<const Entry> entries) const;
     void load_index(std::int64_t offset, const Entry* parent, std::size_t depth,
-                    std::set<std::int64_t>& seen, std::vector<Entry>& out) const;
-    const ZSTD_DDict_s* dictionary(std::int64_t offset) const;
+                    std::set<std::int64_t>& seen, std::vector<Entry>& out,
+                    const std::optional<Digest>& hash) const;
+    const ZSTD_DDict_s* dictionary(std::int64_t offset, const std::optional<Digest>& hash) const;
 
     std::unique_ptr<File> file_;    // also holds the dictionary cache
     ArchiveHeader header_;
     std::uint64_t base_;    // file position of offset 0
     std::vector<Entry> entries_;
     bool solid_ = false;
+    std::optional<SignatureBlock> signature_;
 };
 
 } // namespace zar

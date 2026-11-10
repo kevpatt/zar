@@ -4,6 +4,7 @@
 #include "zar/archive_reader.hpp"
 
 #include "zar/crc32c.hpp"
+#include "zar/hash.hpp"
 #include "zar/posix.hpp"
 
 #include <algorithm>
@@ -34,13 +35,17 @@ struct ArchiveReader::File {
     Bytes head;                       // stream: bytes [0, base)
     std::uint64_t stream_position = 0;    // stream: bytes consumed so far
 
+    struct Dictionary {
+        ZSTD_DDict* dict;
+        Digest hash;    // its block hash, for entries that name one
+    };
     std::mutex dictionaries_mutex;
-    std::map<std::int64_t, ZSTD_DDict*> dictionaries;
+    std::map<std::int64_t, Dictionary> dictionaries;
 
     ~File()
     {
-        for (const auto& [offset, dict] : dictionaries)
-            ZSTD_freeDDict(dict);
+        for (const auto& [offset, d] : dictionaries)
+            ZSTD_freeDDict(d.dict);
         if (fd >= 0 && owns_fd)
             ::close(fd);
     }
@@ -394,10 +399,7 @@ ArchiveReader ArchiveReader::from_file(std::unique_ptr<File> file,
                 inner.solid_ = true;
                 return inner;
             }
-            std::vector<Entry> entries;
-            std::set<std::int64_t> seen;
-            reader.load_index(roots[i], nullptr, 0, seen, entries);
-            reader.entries_ = last_wins(std::move(entries));
+            reader.load_root(roots[i]);
             break;
         } catch (const FormatError& e) {
             if (i + 1 == roots.size())
@@ -434,12 +436,14 @@ void ArchiveReader::read_at(std::uint64_t position, std::span<std::uint8_t> out)
     file_->read_at(position, out);
 }
 
-Bytes ArchiveReader::index_payload(std::int64_t offset) const
+Bytes ArchiveReader::index_payload(std::int64_t offset, const std::optional<Digest>& hash) const
 {
     const auto block = block_header(offset);
     if (block.type != BlockType::IndexRaw && block.type != BlockType::IndexZstd)
         throw FormatError(at(offset) + " is not an index");
     auto bytes = payload(block);
+    if (hash && !digest_matches(*hash, block_hash(block.type, bytes)))
+        throw FormatError(at(offset) + " fails its hash");
     if (block.type == BlockType::IndexRaw)
         return bytes;
 
@@ -449,17 +453,58 @@ Bytes ArchiveReader::index_payload(std::int64_t offset) const
     return decompress_frame(bytes, size, nullptr, offset);
 }
 
+// The root (§5): an index, or a SIGNATURE block naming one. Solid archives
+// are handled before this.
+void ArchiveReader::load_root(std::int64_t offset)
+{
+    std::int64_t index = offset;
+    std::optional<Digest> hash;
+    if (const auto block = block_header(offset); block.type == BlockType::Signature) {
+        auto signature = decode_signature(payload(block));
+        index = signature.statement.root;
+        hash = signature.statement.root_hash;
+        signature_ = std::move(signature);
+    }
+    std::vector<Entry> entries;
+    std::set<std::int64_t> seen;
+    load_index(index, nullptr, 0, seen, entries, hash);
+    if (signature_)
+        check_complete(entries);
+    entries_ = last_wins(std::move(entries));
+}
+
+// A signed archive must hash everything it refers to (§5.6), or the
+// signature wouldn't cover it.
+void ArchiveReader::check_complete(std::span<const Entry> entries) const
+{
+    for (const auto& e : entries) {
+        const auto incomplete = [&](std::string_view what) {
+            throw FormatError(e.path + ": signed archive, but " + std::string(what));
+        };
+        if (e.unknown_hashes)
+            incomplete("it uses a hash algorithm this version doesn't know");
+        if (!e.chunks.empty() && e.chunk_hashes.empty())
+            incomplete("its chunks have no hashes");
+        if (e.dict && !e.dict_hash)
+            incomplete("its dictionary has no hash");
+        if (e.subindex && !e.subindex_hash)
+            incomplete("its sub-index has no hash");
+    }
+}
+
 // Indexes must form a tree (§6.6): every index block is loaded at most once,
-// which rules out both cycles and shared sub-indexes.
+// which rules out both cycles and shared sub-indexes. `hash`, if known, is
+// checked before the block is decompressed.
 void ArchiveReader::load_index(std::int64_t offset, const Entry* parent, std::size_t depth,
-                               std::set<std::int64_t>& seen, std::vector<Entry>& out) const
+                               std::set<std::int64_t>& seen, std::vector<Entry>& out,
+                               const std::optional<Digest>& hash) const
 {
     if (!seen.insert(offset).second)
         throw FormatError(at(offset) + " is used as an index more than once");
     if (depth >= kMaxIndexDepth)
         throw FormatError("sub-indexes nest too deeply");
 
-    for (auto& entry : decode_index(index_payload(offset))) {
+    for (auto& entry : decode_index(index_payload(offset, hash))) {
         if (parent) {
             entry.path = parent->path + '/' + entry.path;
             entry.flags |= parent->flags & entry_flags::kPathRaw;
@@ -467,27 +512,32 @@ void ArchiveReader::load_index(std::int64_t offset, const Entry* parent, std::si
         out.push_back(std::move(entry));
         if (out.back().type == EntryType::Dir && out.back().subindex) {
             const Entry dir = out.back();    // `out` may reallocate
-            load_index(*dir.subindex, &dir, depth + 1, seen, out);
+            load_index(*dir.subindex, &dir, depth + 1, seen, out, dir.subindex_hash);
         }
     }
 }
 
-const ZSTD_DDict* ArchiveReader::dictionary(std::int64_t offset) const
+const ZSTD_DDict* ArchiveReader::dictionary(std::int64_t offset, const std::optional<Digest>& hash) const
 {
     std::lock_guard lock(file_->dictionaries_mutex);
     auto& dictionaries = file_->dictionaries;
-    if (const auto it = dictionaries.find(offset); it != dictionaries.end())
-        return it->second;
-
-    const auto block = block_header(offset);
-    if (block.type != BlockType::ZstdDict)
-        throw FormatError(at(offset) + " is not a dictionary");
-    const auto bytes = payload(block);
-    ZSTD_DDict* dict = ZSTD_createDDict(bytes.data(), bytes.size());
-    if (!dict)
-        throw FormatError(at(offset) + " is not a valid zstd dictionary");
-    dictionaries.emplace(offset, dict);
-    return dict;
+    auto it = dictionaries.find(offset);
+    if (it == dictionaries.end()) {
+        const auto block = block_header(offset);
+        if (block.type != BlockType::ZstdDict)
+            throw FormatError(at(offset) + " is not a dictionary");
+        const auto bytes = payload(block);
+        const auto digest = block_hash(block.type, bytes);
+        if (hash && !digest_matches(*hash, digest))    // before zstd sees it
+            throw FormatError(at(offset) + " fails its hash");
+        ZSTD_DDict* dict = ZSTD_createDDict(bytes.data(), bytes.size());
+        if (!dict)
+            throw FormatError(at(offset) + " is not a valid zstd dictionary");
+        it = dictionaries.emplace(offset, File::Dictionary{dict, digest}).first;
+    }
+    if (hash && !digest_matches(*hash, it->second.hash))    // entries may disagree
+        throw FormatError(at(offset) + " fails its hash");
+    return it->second.dict;
 }
 
 std::vector<std::uint64_t> ArchiveReader::chunk_lengths(const Entry& entry)
@@ -512,6 +562,14 @@ std::vector<std::uint64_t> ArchiveReader::chunk_lengths(const Entry& entry)
     if (count != entry.chunks.size())
         throw FormatError("has " + std::to_string(entry.chunks.size()) + " chunks; its size implies " +
                           std::to_string(count));
+    if (!entry.chunk_hashes.empty()) {    // §6.7
+        if (entry.chunk_hashes.size() != entry.chunks.size())
+            throw FormatError("has " + std::to_string(entry.chunk_hashes.size()) + " chunk hashes for " +
+                              std::to_string(entry.chunks.size()) + " chunks");
+        for (std::size_t i = 0; i < entry.chunks.size(); ++i)
+            if (entry.chunks[i] == kNoOffset && entry.chunk_hashes[i] != kHoleDigest)
+                throw FormatError("has a hole whose hash isn't zero");
+    }
 
     std::vector<std::uint64_t> lengths(entry.chunks.size(), chunk);
     lengths.back() = size - chunk * (count - 1);
@@ -522,15 +580,19 @@ Bytes ArchiveReader::chunk(const Entry& entry, std::size_t index, std::uint64_t 
                            bool decompress) const
 {
     const auto block = block_header(entry.chunks.at(index));
-    return decode_chunk(entry, block, payload(block), expected_length, decompress);
+    return decode_chunk(entry, index, block, payload(block), expected_length, decompress);
 }
 
-Bytes ArchiveReader::decode_chunk(const Entry& entry, const BlockHeader& block, ByteView bytes,
-                                  std::uint64_t expected_length, bool decompress) const
+Bytes ArchiveReader::decode_chunk(const Entry& entry, std::size_t index, const BlockHeader& block,
+                                  ByteView bytes, std::uint64_t expected_length, bool decompress) const
 {
     const auto offset = block.offset;
     if (block.type != BlockType::DataRaw && block.type != BlockType::DataZstd)
         throw FormatError(at(offset) + " is not a data block");
+    // Before anything else looks at the bytes, zstd above all.
+    if (!entry.chunk_hashes.empty() &&
+        !digest_matches(entry.chunk_hashes.at(index), block_hash(block.type, bytes)))
+        throw FormatError(at(offset) + " fails its hash");
 
     if (block.type == BlockType::DataRaw) {
         if (bytes.size() != expected_length)
@@ -538,7 +600,7 @@ Bytes ArchiveReader::decode_chunk(const Entry& entry, const BlockHeader& block, 
         return decompress ? Bytes(bytes.begin(), bytes.end()) : Bytes{};
     }
 
-    const ZSTD_DDict* dict = entry.dict ? dictionary(*entry.dict) : nullptr;
+    const ZSTD_DDict* dict = entry.dict ? dictionary(*entry.dict, entry.dict_hash) : nullptr;
     if (frame_content_size(bytes, offset) != expected_length)
         throw FormatError(at(offset) + " has the wrong decompressed length");
     return decompress ? decompress_frame(bytes, expected_length, dict, offset) : Bytes{};
@@ -605,10 +667,7 @@ ArchiveReader ArchiveReader::open_stream(int fd, std::string name,
     file->read_next(file->head, header.base_offset - kHeaderSize);    // base_offset >= kHeaderSize (§2.2)
 
     ArchiveReader reader(std::move(file), header, header.base_offset);
-    std::vector<Entry> entries;
-    std::set<std::int64_t> seen;
-    reader.load_index(header.index_offset, nullptr, 0, seen, entries);
-    reader.entries_ = last_wins(std::move(entries));
+    reader.load_root(header.index_offset);
     return reader;
 }
 

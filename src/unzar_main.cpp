@@ -7,6 +7,7 @@
 #include "zar/format.hpp"
 #include "zar/names.hpp"
 
+#include <algorithm>
 #include <ctime>
 #include <functional>
 #include <getopt.h>
@@ -58,9 +59,12 @@ archives created with zar --head-index.
                          stops decompressing once it passes SIZE. Without
                          it, the limit is the free space where the data
                          would go. Holes left as holes don't count.
+      --verify=PUBFILE   require a valid signature by this public key (from
+                         zar --keygen); may be repeated, for several. Block
+                         hashes are checked whenever an archive has them.
   -h, --human-readable   show sizes as 512, 1.0K, 31.4M, 2.0G, ...
-  -v, --verbose          with --list, also show permissions and owner;
-                         print a summary at the end
+  -v, --verbose          with --list, also show permissions and owner, and
+                         the signature; print a summary at the end
       --help             show this help
       --version          show version information
 
@@ -84,9 +88,10 @@ struct Command {
     bool list = false;
     bool verbose = false;
     bool human = false;
+    std::vector<zar::PublicKey> verify;    // --verify: accepted signers
 };
 
-enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kSparse, kHelp, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kSparse, kVerify, kHelp, kVersion };
 
 void print_help()
 {
@@ -109,6 +114,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"max-size", required_argument, nullptr, kMaxSize},
         {"hard-links", no_argument, nullptr, kHardLinks},
         {"sparse", required_argument, nullptr, kSparse},
+        {"verify", required_argument, nullptr, kVerify},
         {"verbose", no_argument, nullptr, 'v'},
         {"human-readable", no_argument, nullptr, 'h'},
         {"help", no_argument, nullptr, kHelp},
@@ -153,6 +159,7 @@ std::optional<Command> parse(int argc, char** argv)
             else
                 throw UsageError("--sparse must be keep, auto, or never");
             break;
+        case kVerify: cmd.verify.push_back(zar::read_public_key(optarg)); break;
         case 'v': cmd.verbose = true; break;
         case 'h': cmd.human = true; break;
         case kHelp:
@@ -289,6 +296,46 @@ void print_warning(std::string_view message)
     std::cerr << "unzar: " << printable(message) << '\n';
 }
 
+// --verify: the archive must be signed by one of the keys given. Without it,
+// a signed archive's hashes are still checked, but not who signed it.
+void check_signer(const zar::ArchiveReader& reader, const Command& cmd)
+{
+    const bool is_signed = reader.signature().has_value();
+    if (cmd.verify.empty()) {
+        if (is_signed)
+            std::cerr << "unzar: note: the archive is signed, but its signature wasn't checked "
+                         "(use --verify=KEYFILE.pub)\n";
+        return;
+    }
+    if (!is_signed)
+        throw std::runtime_error(cmd.archive + ": not signed, so it can't be verified");
+    if (!reader.signed_by(cmd.verify))
+        throw std::runtime_error(cmd.archive + ": not signed by any key given to --verify");
+}
+
+// -lv: what the signature says, and whose it is.
+void print_signature(const zar::SignatureBlock& signature, const Command& cmd)
+{
+    const auto& s = signature.statement;
+    std::cout << "signed";
+    if (s.sequence)
+        std::cout << ", sequence " << *s.sequence;
+    if (s.time)
+        std::cout << ", " << format_time(zar::Timestamp{*s.time, {}});
+    if (s.name)
+        std::cout << ", name " << printable(*s.name);
+    std::cout << '\n';
+    for (const auto& signer : signature.signers) {
+        const bool asked = std::ranges::find(cmd.verify, signer.key) != cmd.verify.end();
+        const bool valid = asked && zar::check_signature(signer.key, signer.signature, signature.message);
+        std::cout << "  key " << zar::fingerprint(signer.key) << ": "
+                  << (!asked ? "not checked" : valid ? "verified" : "INVALID") << '\n';
+    }
+    if (signature.other_signers)
+        std::cout << "  and " << signature.other_signers << " in algorithms this unzar doesn't know\n";
+    std::cout << '\n';
+}
+
 int run(Command& cmd)
 {
     std::uint64_t warnings = 0;    // besides the extractor's, which it counts
@@ -299,6 +346,9 @@ int run(Command& cmd)
     cmd.options.on_warning = print_warning;
 
     auto reader = open_archive(cmd.archive, warn, cmd.options.size_limit);
+    check_signer(reader, cmd);
+    if (cmd.list && cmd.verbose && reader.signature())
+        print_signature(*reader.signature(), cmd);
 
     std::vector<zar::Entry> chosen;
     std::set<std::string_view> matched;
