@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.6.0). Both tools work and are well
+> **Status:** development (0.7.0). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -38,6 +38,7 @@ $ unzar project.zar project/src/main.cpp
 - [Deduplication](#deduplication)
 - [Sparse files](#sparse-files)
 - [Streaming through pipes](#streaming-through-pipes)
+- [Hashes and signatures](#hashes-and-signatures)
 - [Safety](#safety)
 - [The archive format](#the-archive-format)
 - [Project layout](#project-layout)
@@ -52,6 +53,10 @@ $ unzar project.zar project/src/main.cpp
   payload, and every file a CRC of its whole content. `unzar --scan` checks
   an archive's structure and checksums without decompressing anything;
   `--test` decompresses and verifies everything.
+- **Signed archives.** `--hash` stores a BLAKE3 hash of every block, and
+  `--sign` an Ed25519 signature over them all, so `unzar --verify` can tell
+  an archive is exactly what its publisher made, checking each block before
+  it's decompressed, even when extracting a single file.
 - **Fast.** Compression and extraction run chunk by chunk on every core.
   CRC-32C uses the CPU's CRC instructions on ARM64 and x86.
 - **Streaming.** `zar` can write to a pipe, and with `--head-index`, `unzar`
@@ -97,6 +102,7 @@ $ unzar project.zar project/src/main.cpp
 | Add or delete files without recompressing the rest | ✅ `rezar` | ❌ | ✅ |
 | Sparse files kept sparse | ✅ (per chunk) | ✅ GNU tar `--sparse`, bsdtar | ❌ |
 | Checksums | every block, and every file | whole stream (optional) | every file |
+| Built-in signatures, checked per file | ✅ `--sign`, `--verify` | ❌ (sign the whole file separately) | ⚠️ `jarsigner` for JARs |
 | Verify without decompressing | ✅ `--scan` | ❌ | ❌ |
 | Write to a pipe | ✅ | ✅ | ⚠️ limited |
 | Extract from a pipe | ✅ with `--head-index` | ✅ | ⚠️ limited |
@@ -137,8 +143,9 @@ Elsewhere, build zar from source.
 
 ## Building
 
-You need CMake 3.20 or newer, libzstd 1.4 or newer, and a C++20 compiler
-(zar is developed with Apple Clang 17). On macOS it builds against the
+You need CMake 3.20 or newer, libzstd 1.4 or newer, and C and C++20
+compilers (zar is developed with Apple Clang 17); the C compiler builds the
+bundled BLAKE3 and Monocypher. On macOS it builds against the
 macOS 13 SDK and newer.
 
 ```sh
@@ -188,6 +195,8 @@ Useful CMake options:
 | `ZAR_WARNINGS_AS_ERRORS` | `OFF` | treat compiler warnings as errors |
 | `ZAR_BUILD_FUZZERS` | `OFF` | build the fuzz target instead of an installable build |
 | `ZAR_USE_SYSTEM_XXHASH` | `OFF` | link an installed libxxhash 0.8 or newer (found like libzstd) instead of compiling in the bundled copy |
+| `ZAR_USE_SYSTEM_BLAKE3` | `OFF` | link an installed libblake3 (found with pkg-config) instead of compiling in the bundled copy |
+| `ZAR_USE_SYSTEM_MONOCYPHER` | `OFF` | link an installed Monocypher 4 (found with pkg-config, built with its Ed25519 module) instead of the bundled copy |
 
 The version comes from `project()` in `CMakeLists.txt`. Each build also
 records the git revision (with `-dirty` if there are uncommitted changes)
@@ -256,6 +265,10 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `--head-index` | also put the index at the front, so the archive can be extracted from a pipe (the index is written twice) |
 | `--solid=SIZE` | first try compressing the whole archive as one stream, and keep that if it's at most SIZE bytes; otherwise write a normal archive |
 | `--dict-over-solid=PERCENT` | when the solid archive fits, also try a dictionary archive, and keep it instead if it's at most PERCENT of the solid size and also fits (default 120; 0 never tries) |
+| `--hash` | store each block's BLAKE3 hash; see [Hashes and signatures](#hashes-and-signatures) |
+| `--sign=KEYFILE` | sign the archive with a secret key from `--keygen` (may be repeated); implies `--hash` |
+| `--sequence=N`, `--name=TEXT` | with `--sign`: a release number, and what the archive is (a channel, say), both signed |
+| `--keygen=KEYFILE` | make a key pair: `KEYFILE` (secret, mode 0600) and `KEYFILE.pub` |
 | `-v, --verbose` | list files as they are added, and print a summary |
 | `--help`, `--version` | |
 
@@ -327,6 +340,7 @@ src/sub/
 | `--dirs=MODE` | existing directories: `merge` (default) extracts into them; `replace` first deletes each one that is extracted whole (not the parents of a selected path). Either needs `-y`. |
 | `--hard-links` | recreate hard links with `link(2)` where their targets are extracted too; by default each is extracted as an independent copy. Falls back to a copy where the filesystem refuses. |
 | `--sparse=MODE` | sparse files: `keep` (default) leaves holes where the archive has them; `auto` also wherever a whole chunk is zeros; `never` writes every byte. See [Sparse files](#sparse-files). |
+| `--verify=PUBFILE` | require a valid signature by this public key (may be repeated, for several); see [Hashes and signatures](#hashes-and-signatures) |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`); without it, the limit is the free space where the data would go |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
@@ -402,6 +416,11 @@ The options for new files are those of `zar`: `-l`, `-j`, `--chunk-size`,
 `--contiguous`. `--align` and `--head-index[=on|off]` apply to the whole
 archive. A solid archive can't be edited, since everything in it would be
 recompressed. See `rezar --help` or `man rezar` for the rest.
+
+`rezar` checks the hashes of every block it copies, keeps them, and hashes
+what it adds when the archive had hashes (or with `--hash`). The result has
+a new root, so it's no longer signed unless `--sign` signs it again;
+`--verify=PUBFILE` checks the original's signature first.
 
 ## Solid archives
 
@@ -540,6 +559,50 @@ Archives without a head index can still be extracted from a pipe if you save
 them to a file first. If standard input is a redirected file
 (`unzar - < proj.zar`), `unzar` reads it directly.
 
+## Hashes and signatures
+
+```sh
+zar --keygen=release.key                        # release.key and release.key.pub
+zar --sign=release.key --sequence=42 proj       # a signed proj.zar
+unzar --verify=release.key.pub proj.zar         # extract only if it checks out
+unzar -lv --verify=release.key.pub proj.zar     # show who signed it, and what
+```
+
+CRC-32C catches accidental damage, but anyone can recompute it. For
+tampering, `zar --hash` also stores a BLAKE3 hash of every block in the
+index, and `zar --sign=KEYFILE` signs the root index's hash with Ed25519.
+Since the index holds every block's hash, that one signature covers the
+whole archive.
+
+Verification runs down from the signature, one block at a time, and every
+block is checked before it's decompressed, so nothing unauthenticated
+reaches zstd. Extracting one file checks just that file's blocks and the
+index: a reader fetching a single file from a big signed archive verifies
+only what it reads. `unzar` checks every hash an archive has, in `--test`
+and `--scan` too, whether or not it's given a key. `--verify=PUBFILE`
+also requires a valid signature from that key; without it, `unzar` notes
+that the signature went unchecked.
+
+Keys are one-line text files: `zar-ed25519-secret` or `zar-ed25519-public`,
+then 64 hex digits. Secret keys must be readable only by their owner, like
+SSH keys. `--sign` may be given several times, to sign with several keys
+during a key rotation, and `--verify` several times, to accept any of
+several keys. `unzar -lv` shows each key's fingerprint.
+
+The signature also covers `--sequence=N`, `--name=TEXT`, and the time of
+signing (`SOURCE_DATE_EPOCH` if set). A valid signature on an old archive
+stays valid, so an updater that mustn't go backwards should compare the
+sequence with the newest it has installed, and check the name, so that an
+archive signed for one channel isn't accepted on another. Deciding which
+keys to trust is up to you: `unzar` never trusts a key just because the
+archive names it.
+
+Hashes add 32 bytes per chunk to the index, and a BLAKE3 pass over each
+block when writing and reading, which is cheaper than decompressing it. A
+solid archive can't be signed, since it would have to be decompressed
+before anything in it could be checked. The format is specified in
+[FORMAT.md](FORMAT.md), §5.6 and §6.7.
+
 ## Safety
 
 `unzar` is written to be safe on untrusted archives:
@@ -580,8 +643,8 @@ them to a file first. If standard input is a redirected file
 
 The test suite includes deliberately malicious archives for each of these
 cases, and `fuzz/` has a fuzz target for the reader (see below). CRC-32C
-detects accidental damage, not tampering; cryptographic signatures are
-[on the roadmap](TODO.md).
+detects accidental damage, not tampering; for that, sign archives (see
+[Hashes and signatures](#hashes-and-signatures)).
 
 ## The archive format
 
@@ -644,6 +707,10 @@ src/
                        temporary files, and user lookups
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated
+    hash.*             BLAKE3 block hashes
+    signing.*          Ed25519 keys, signatures, and key files
+    signature.*        SIGNATURE blocks
+    fields.hpp         tagged fields, for the index and SIGNATURE blocks
     names.*            UTF-8 and path rules
     policy.*           which files are already compressed
     bytes.hpp          little-endian integers and varints
@@ -653,6 +720,8 @@ tests/                 unit and end-to-end tests, and cli_test.sh for the
                        commands themselves (all run with ctest)
 fuzz/                  a fuzz target for everything unzar reads
 third_party/xxhash/    xxHash 0.8.3 (BSD 2-Clause), for XXH3-128
+third_party/blake3/    BLAKE3 1.8.7 (CC0 / Apache 2.0), for block hashes
+third_party/monocypher/ Monocypher 4.0.3 (BSD 2-Clause / CC0), for Ed25519
 ```
 
 The tests include end-to-end round trips, damaged and malicious archives,
@@ -675,8 +744,8 @@ cmake --build build-fuzz --target zar_fuzz
 build-fuzz/zar_fuzz -runs=100000 -artifact=crash.zar
 ```
 
-A fuzzing build skips CRC checks, so that mutations get past them; it has
-no install rules, and its commands must not be used.
+A fuzzing build skips CRC and hash checks, so that mutations get past them;
+it has no install rules, and its commands must not be used.
 
 ## Roadmap
 
@@ -685,14 +754,17 @@ application bundle format, read in place by a loader:
 
 - storing libraries uncompressed, so their single, page-aligned blocks can
   be `mmap`ed,
-- cryptographic hashes and a signed index,
 - reproducible timestamps.
 
 ## License
 
 zar is released under the [BSD 3-Clause License](LICENSE.txt). It includes
 [xxHash](https://github.com/Cyan4973/xxHash) by Yann Collet, under the
-[BSD 2-Clause License](third_party/xxhash/LICENSE), unless it's built with
-`ZAR_USE_SYSTEM_XXHASH`.
+[BSD 2-Clause License](third_party/xxhash/LICENSE),
+[BLAKE3](https://github.com/BLAKE3-team/BLAKE3), under
+[CC0 1.0](third_party/blake3/LICENSE_CC0) or Apache 2.0, and
+[Monocypher](https://monocypher.org) by Loup Vaillant, under the
+[2-clause BSD licence or CC0](third_party/monocypher/LICENCE.md), each
+unless it's built with the matching `ZAR_USE_SYSTEM_*` option.
 
 Copyright (C) 2026 Kevin H. Patterson

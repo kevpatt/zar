@@ -1,6 +1,18 @@
 # Proposal: BLAKE3 hashes and Ed25519 signatures
 
-Status: **proposal** (2026-11-10), for format 0.6.0. Not implemented.
+Status: **implemented** in format 0.6.0 (zar 0.7.0), as specified in FORMAT.md
+§5.6 and §6.7, with these differences:
+
+- **CONTENT_HASH** (§4) is left for later (TODO.md).
+- **Head and tail SIGNATURE blocks** (§5.2) are not identical: each names its
+  own copy of the root index in ROOT, and they agree in every other field.
+  Identical blocks would have had to name the same copy, losing the fallback
+  from a damaged head copy to the tail's.
+- **Solid archives can't be signed:** a signed solid archive would have to be
+  decompressed before anything in it could be checked.
+- **Readers check hashes whenever an archive has them,** not only when
+  verifying a signature, and reject a signed archive that uses a hash
+  algorithm they don't know.
 
 This is TODO.md's item 2, "Cryptographic integrity": a cryptographic hash for every block an
 archive's contents depend on, and a signature over the root, so that one signature covers

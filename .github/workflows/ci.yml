@@ -83,6 +83,10 @@ jobs:
           build/zar -o corpus/head.zar --chunk-size=4K --head-index src
           build/zar -o corpus/dict.zar --chunk-size=4K --head-index --dict=4K src
           build/zar -o corpus/solid.zar --solid=1M --dict-over-solid=0 src
+          build/zar --keygen=fuzz.key
+          build/zar -o corpus/hashed.zar --chunk-size=4K --hash src
+          build/zar -o corpus/signed.zar --chunk-size=4K --sign=fuzz.key --sequence=1 src
+          build/zar -o corpus/signed-head.zar --chunk-size=4K --head-index --sign=fuzz.key src
       - run: build/zar_fuzz -max_total_time=120 -timeout=30 -artifact_prefix=crash- corpus
       - if: failure()
         uses: actions/upload-artifact@v4

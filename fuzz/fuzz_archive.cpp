@@ -20,6 +20,7 @@
 #include "zar/posix.hpp"
 #include "zar/thread_pool.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <span>
@@ -166,6 +167,18 @@ std::vector<Bytes> make_seeds()
     zar::CreateOptions dict = head;
     dict.dict_size = 1024;
     add(dict);
+    zar::CreateOptions hashed = dict;
+    hashed.hash = true;
+    add(hashed);
+    zar::CreateOptions signed_archive = head;
+    std::array<std::uint8_t, 32> seed{};
+    seed.fill(7);
+    signed_archive.sign.push_back(zar::SecretKey::from_seed(seed));
+    signed_archive.sequence = 1;
+    signed_archive.sign_name = "fuzz";
+    add(signed_archive);
+    signed_archive.head_index = false;
+    add(signed_archive);
     zar::CreateOptions solid;
     solid.solid_limit = 1 << 20;
     solid.dict_over_solid = 0;

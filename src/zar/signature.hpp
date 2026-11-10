@@ -30,7 +30,7 @@ struct SignedRoot {
 struct SignatureBlock {
     struct Signer {
         PublicKey key;
-        Signature signature;
+        Ed25519Signature signature;
     };
 
     SignedRoot statement;

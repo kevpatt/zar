@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd October 29, 2026
+.Dd November 10, 2026
 .Dt ZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -15,6 +15,9 @@
 .Fl m
 .Fl o Ar archive
 .Ar path ...
+.Nm
+.Op Fl y
+.Fl \-keygen Ns = Ns Ar keyfile
 .Sh DESCRIPTION
 .Nm
 archives a file or directory tree.
@@ -184,6 +187,41 @@ dictionary, and keep it instead if it is at most
 .Ar percent
 of the solid archive's size (and fits too).
 The default is 120; 0 never tries.
+.It Fl \-hash
+Store a BLAKE3 hash of every block in the index, so that
+.Xr unzar 1
+can verify each block before decompressing it, and the archive can be
+signed later without hashing it again.
+.It Fl \-sign Ns = Ns Ar keyfile
+Sign the archive with the Ed25519 secret key in
+.Ar keyfile ,
+made by
+.Fl \-keygen .
+The signature covers the root index's hash, and so every block; see
+.Sx SIGNED ARCHIVES .
+May be given more than once, to sign with several keys.
+Implies
+.Fl \-hash .
+A solid archive can't be signed.
+.It Fl \-sequence Ns = Ns Ar n
+With
+.Fl \-sign :
+a release number to sign, so that a reader can refuse an archive older than
+one it has already seen.
+.It Fl \-name Ns = Ns Ar text
+With
+.Fl \-sign :
+what the archive is, such as the name of a release channel, to sign.
+.It Fl \-keygen Ns = Ns Ar keyfile
+Make a new Ed25519 key pair and write the secret key to
+.Ar keyfile ,
+readable only by its owner, and the public key, for
+.Nm unzar Fl \-verify ,
+to
+.Ar keyfile Ns Pa .pub .
+Neither may exist yet, unless
+.Fl y
+is given.
 .It Fl v , Fl \-verbose
 List each path on standard error as it is added, and print a summary at the
 end, including how much data was deduplicated or in holes.
@@ -210,8 +248,31 @@ Sizes take an optional
 or
 .Cm T
 suffix, for binary multiples.
+.Sh SIGNED ARCHIVES
+A signed archive's index holds the BLAKE3 hash of every block, and a
+signature, at the archive's root, covers the index's hash, so one signature
+covers everything.
+.Xr unzar 1
+checks each block against its hash before decompressing it, and with
+.Fl \-verify
+also requires a valid signature by a key it is given.
+The signature also covers the time of signing and, if given, the
+.Fl \-sequence
+and
+.Fl \-name .
+.Pp
+Key files are one line of text:
+.Ql zar-ed25519-secret
+or
+.Ql zar-ed25519-public
+and 64 hexadecimal digits.
+A secret key must be readable only by its owner.
 .Sh ENVIRONMENT
 .Bl -tag -width Ds
+.It Ev SOURCE_DATE_EPOCH
+With
+.Fl \-sign ,
+the time to sign, in seconds since the epoch, instead of the current time.
 .It Ev TMPDIR
 Where temporary files go when writing to standard output (with
 .Fl \-head-index
@@ -251,6 +312,11 @@ Send an archive through a pipe to another machine and extract it there:
 Package many small files as compactly as possible, if it comes to at most
 1 MiB:
 .Dl $ zar --solid=1M config
+.Pp
+Make a key pair, and sign a release with it:
+.Dl $ zar --keygen=release.key
+.Dl $ zar --sign=release.key --sequence=42 --name=stable app
+.Dl $ unzar --verify=release.key.pub app.zar
 .Sh SEE ALSO
 .Xr rezar 1 ,
 .Xr unzar 1 ,

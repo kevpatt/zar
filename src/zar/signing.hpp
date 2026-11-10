@@ -21,7 +21,7 @@ namespace zar {
 inline constexpr std::size_t kPublicKeySize = 32;
 inline constexpr std::size_t kSignatureSize = 64;
 using PublicKey = std::array<std::uint8_t, kPublicKeySize>;
-using Signature = std::array<std::uint8_t, kSignatureSize>;
+using Ed25519Signature = std::array<std::uint8_t, kSignatureSize>;
 
 class SecretKey {
 public:
@@ -34,7 +34,7 @@ public:
     ~SecretKey();    // wipes the key from memory
 
     const PublicKey& public_key() const noexcept { return public_; }
-    Signature sign(ByteView message) const;
+    Ed25519Signature sign(ByteView message) const;
 
     // The key file's text, which holds the secret.
     std::string to_text() const;
@@ -47,7 +47,7 @@ private:
 };
 
 // Whether `signature` is `key`'s valid signature of `message`.
-bool check_signature(const PublicKey& key, const Signature& signature, ByteView message);
+bool check_signature(const PublicKey& key, const Ed25519Signature& signature, ByteView message);
 
 // A short name for a key, for people to compare: 16 hex digits of the
 // key's BLAKE3 hash.

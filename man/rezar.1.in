@@ -138,6 +138,22 @@ The default is to do so if
 has one;
 .Cm on
 without a value.
+.It Fl \-verify Ns = Ns Ar pubfile
+First check that
+.Ar archive
+is signed by the public key in
+.Ar pubfile ;
+may be given more than once, to accept any of several keys.
+.It Fl \-hash , Fl \-sign Ns = Ns Ar keyfile , Fl \-sequence Ns = Ns Ar n , Fl \-name Ns = Ns Ar text
+Hash and sign the new archive, as in
+.Xr zar 1 .
+The hashes
+.Ar archive
+already has are checked as each block is copied, and kept, and if it has any,
+what is added is hashed too.
+Its signature is not kept, since the new archive has a new root: sign it
+again with
+.Fl \-sign .
 .It Fl v , Fl \-verbose
 List each path on standard error as it is added, and print a summary at the
 end.

@@ -16,6 +16,7 @@
 #include "zar/posix.hpp"
 #include "zar/thread_pool.hpp"
 
+#include <algorithm>
 #include <fcntl.h>
 #include <functional>
 #include <unistd.h>
@@ -215,7 +216,7 @@ TEST(signed_archives_name_their_root_and_signers)
         CHECK(reader.signed_by(key1) == key1[0]);
         CHECK(reader.signed_by(key2) == key2[0]);
         CHECK(!reader.signed_by(stranger));
-        CHECK(root_offset(archive) < 0 == head_index);
+        CHECK((root_offset(archive) < 0) == head_index);
         CHECK(check(archive).empty());
 
         if (head_index) {    // and from a pipe

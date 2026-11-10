@@ -6,6 +6,7 @@
 #include "zar/hash.hpp"
 #include "zar/posix.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <fcntl.h>
 #include <monocypher-ed25519.h>
@@ -112,9 +113,9 @@ SecretKey::~SecretKey()
     crypto_wipe(secret_.data(), secret_.size());
 }
 
-Signature SecretKey::sign(ByteView message) const
+Ed25519Signature SecretKey::sign(ByteView message) const
 {
-    Signature signature;
+    Ed25519Signature signature;
     crypto_ed25519_sign(signature.data(), secret_.data(), message.data(), message.size());
     return signature;
 }
@@ -124,7 +125,7 @@ std::string SecretKey::to_text() const
     return std::string(kSecretPrefix) + to_hex(ByteView(secret_).first(32)) + '\n';
 }
 
-bool check_signature(const PublicKey& key, const Signature& signature, ByteView message)
+bool check_signature(const PublicKey& key, const Ed25519Signature& signature, ByteView message)
 {
     return crypto_ed25519_check(signature.data(), key.data(), message.data(), message.size()) == 0;
 }

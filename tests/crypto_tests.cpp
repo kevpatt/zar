@@ -176,8 +176,8 @@ TEST(signature_blocks_reject_malformed_payloads)
     Bytes unsigned_payload{1};
     FieldWriter field(unsigned_payload);
     field.fixed(0x01, std::uint64_t{0});
-    Bytes hash{1};
-    hash.resize(1 + kDigestSize);
+    Bytes hash(1 + kDigestSize, 0);    // BLAKE3, and a digest of zeros
+    hash[0] = 1;
     field.bytes(0x02, ByteView(hash));
     CHECK_THROWS_WITH(decode_signature(unsigned_payload), "no signatures");
 
@@ -191,7 +191,10 @@ TEST(signature_blocks_reject_malformed_payloads)
     more.fixed(0x01, std::uint64_t{0});
     more.bytes(0x02, ByteView(hash));
     more.bytes(0x7f, std::string_view("from the future"));
-    Bytes message(std::string_view("zar signature v1").begin(), std::string_view("zar signature v1").end());
+    constexpr std::string_view kContext = "zar signature v1";
+    Bytes message;
+    message.reserve(kContext.size() + 1 + extended.size());
+    message.insert(message.end(), kContext.begin(), kContext.end());
     message.push_back(0);
     message.insert(message.end(), extended.begin(), extended.end());
     Bytes sig{1};

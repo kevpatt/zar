@@ -33,6 +33,7 @@ else()
         target_compile_definitions(zar_blake3 PRIVATE
             BLAKE3_USE_NEON=0 BLAKE3_NO_SSE2 BLAKE3_NO_SSE41 BLAKE3_NO_AVX2 BLAKE3_NO_AVX512)
     endif()
+    target_compile_options(zar_blake3 PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)    # upstream's code
     set(ZAR_BLAKE3_TARGET zar_blake3)
 endif()
 
@@ -43,5 +44,6 @@ else()
     set(dir ${CMAKE_CURRENT_SOURCE_DIR}/third_party/monocypher)
     add_library(zar_monocypher STATIC ${dir}/monocypher.c ${dir}/monocypher-ed25519.c)
     target_include_directories(zar_monocypher SYSTEM PUBLIC ${dir})
+    target_compile_options(zar_monocypher PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
     set(ZAR_MONOCYPHER_TARGET zar_monocypher)
 endif()

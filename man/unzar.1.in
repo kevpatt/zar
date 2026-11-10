@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd October 29, 2026
+.Dd November 10, 2026
 .Dt UNZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -126,12 +126,30 @@ Without this option, extraction is limited to the free space at the
 destination, and a solid archive to the free space in
 .Ev TMPDIR .
 Holes left as holes count toward neither limit.
+.It Fl \-verify Ns = Ns Ar pubfile
+Require a valid signature by the public key in
+.Ar pubfile ,
+made by
+.Nm zar Fl \-keygen .
+May be given more than once, to accept any of several keys.
+An archive that isn't signed, or isn't signed by any of the keys, is
+rejected before anything is extracted.
+Without this option, a signed archive is read as any other, with a note that
+its signature wasn't checked.
+Either way, every block hash an archive has is checked, before the block is
+decompressed.
 .It Fl h , Fl \-human-readable
 Show sizes as 512, 1.0K, 31.4M, 2.0G, and so on.
 .It Fl v , Fl \-verbose
 With
 .Fl l ,
-also show each entry's permissions and owner.
+also show each entry's permissions and owner, and before the listing, a
+signed archive's sequence, time, and name, and each signer's key
+fingerprint, marked
+.Ql verified
+if it is one of the
+.Fl \-verify
+keys.
 Print a summary at the end.
 .It Fl \-help
 Show a summary of the options.
@@ -191,6 +209,9 @@ Replace an earlier extraction:
 .Pp
 Extract an archive as it downloads:
 .Dl $ curl -s https://example.com/proj.zar | unzar -
+.Pp
+Extract a release only if it is signed by a known key:
+.Dl $ unzar --verify=release.key.pub app.zar
 .Sh SEE ALSO
 .Xr rezar 1 ,
 .Xr zar 1 ,
@@ -211,3 +232,17 @@ set-group-ID bits only along with it.
 Names are escaped whenever they are printed.
 .Pp
 The CRC-32C checksums detect accidental damage, not tampering.
+For tampering, archives made with
+.Nm zar Fl \-hash
+hold a BLAKE3 hash of every block, which
+.Nm
+checks before decompressing it, and
+.Nm zar Fl \-sign
+signs them all.
+Only
+.Fl \-verify
+says whose signature to trust:
+.Nm
+never trusts a key just because the archive names it, and a valid signature
+on an old archive stays valid, so an updater should also compare its
+sequence or time with what it already has.

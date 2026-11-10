@@ -10,16 +10,27 @@ maps native libraries straight out of an APK).
    gives each file a single page-aligned block, but zstd still compresses it
    if that helps. To `mmap` a library, it must be stored as-is: add
    something like `--store='*.so'` (or by extension).
-2. **Cryptographic integrity.** CRC-32C only catches accidental damage. For
-   apps from untrusted sources, add a cryptographic hash per block or per
-   file, plus a signed index so one signature covers everything. Needs a new
-   block type and new index fields in FORMAT.md.
-3. **Reproducible builds.** An option to set every stored timestamp to a fixed
+2. **Reproducible builds.** An option to set every stored timestamp to a fixed
    value (like `SOURCE_DATE_EPOCH`), so packages are byte-for-byte
    reproducible. Entries are already sorted.
-4. **Manifest convention.** Name, version, entry point, permissions: keep this
+3. **Manifest convention.** Name, version, entry point, permissions: keep this
    as an ordinary file inside the bundle, by convention, rather than in the
    format.
+
+## Signing
+
+BLAKE3 block hashes and Ed25519 signatures are done (`--hash`, `--sign`,
+`--verify`; FORMAT.md §5.6, §6.7). Left from PROPOSAL-signing.md:
+
+- **CONTENT_HASH** (tag `0x0C`): an optional BLAKE3 hash of each file's
+  whole content, the cryptographic counterpart of CONTENT_CRC, for checking
+  an extracted file end to end or comparing files across archives chunked
+  differently. It costs a second pass over everything.
+- **Detached signatures** (`archive.zar.sig`, a SIGNATURE payload on its
+  own) for archives that can't be rewritten. The signed message doesn't
+  depend on where the block lives, so this needs no format change.
+- **Rollback protection** is the application's job, but unzar could help:
+  an option to require a SEQUENCE above a given number, or a NAME.
 
 ## Dictionaries
 

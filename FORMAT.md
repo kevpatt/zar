@@ -1,12 +1,14 @@
 # The zar archive format
 
-Version 0.5.0 (draft)
+Version 0.6.0 (draft)
 
 A zar archive is a sequence of **blocks** behind a fixed **zar header**.
 Every block is self-describing and independently checksummed, and every
 piece of file content lives in its own block (except the holes of sparse
 files, which need none), so any file — or any chunk of a file — can be read
-and decompressed without touching the rest of the archive.
+and decompressed without touching the rest of the archive. Optionally, the
+index holds a cryptographic hash of every block it refers to, and a
+signature over the root covers the whole archive (§5.6, §6.7).
 
 ## 1. Conventions
 
@@ -127,6 +129,7 @@ block records its own offset, a recovery tool scanning a damaged archive at
 | `0x0005` | ZSTD_DICT    | a zstd dictionary (as produced by `ZDICT_*`)       |
 | `0x0006` | TRAILER      | §5                                                 |
 | `0x0007` | ARCHIVE_ZSTD | one zstd frame decompressing to a whole archive (§5.5) |
+| `0x0008` | SIGNATURE    | a signed statement naming the root index (§5.6)    |
 | `0x8000`–`0xFFFF` | —   | reserved for private/experimental use              |
 
 Every zstd frame in a zar archive:
@@ -141,7 +144,9 @@ unknown types.
 ## 5. Locating the root index
 
 The root index can be referenced from two places: `index_offset` in the zar
-header, and a **trailer** at the end of the archive.
+header, and a **trailer** at the end of the archive. The **root** they
+reference is usually the root index itself, but it may instead be an
+ARCHIVE_ZSTD block (§5.5) or a SIGNATURE block naming the root index (§5.6).
 
 ### 5.1 Trailer
 
@@ -179,7 +184,8 @@ A writer may append to an existing archive by writing new blocks, a new root
 index, and a new trailer after the old end of the archive. It must also
 rewrite the 32-byte zar header in place, setting `index_offset` to -1 or to
 the new index. Superseded blocks, including the old trailer, become
-unreferenced data.
+unreferenced data. An appended archive has a new root, so a signed archive
+must be signed again (§5.6).
 
 ### 5.4 Head index and streaming
 
@@ -219,6 +225,112 @@ price doesn't matter.
   from a stream (§5.4) with no further structure.
 - The frame may omit its content size, so readers must be prepared to
   decompress without knowing the final size in advance.
+- A solid archive can't be signed (§5.6): its frame would have to be
+  decompressed before anything in it could be checked. Neither the outer
+  nor the inner archive may have a SIGNATURE root.
+
+### 5.6 Signatures
+
+A signature covers the whole archive by signing the root index's hash. The
+index holds the hash of every block it refers to (§6.7), sub-indexes
+included, so verification runs down the tree, one block at a time, each
+checked before it is decompressed or otherwise used.
+
+**A signed archive's root is a SIGNATURE block.** The zar header's
+`index_offset` and the trailer point at it, as they would at an ARCHIVE_ZSTD
+block, and it names the root index. Readers that don't know the type
+reject the archive, which is right, since they couldn't verify it. A
+reader that knows the type but has no keys follows it to the index.
+
+Its payload is a version byte, then fields encoded as index fields are
+(§6.1: varint tag, varint length, value):
+
+```
+u8 version = 1
+field*
+```
+
+| Tag    | Name      | Value                                              |          |
+|-------:|-----------|----------------------------------------------------|----------|
+| `0x01` | ROOT      | i64: the root INDEX_RAW or INDEX_ZSTD block        | required |
+| `0x02` | ROOT_HASH | `u8 alg` + digest (§6.7): that block's block hash  | required |
+| `0x03` | SEQUENCE  | u32 / u64: the publisher's release counter          | optional |
+| `0x04` | TIME      | i32 / i64: seconds since the Unix epoch, when signed | optional |
+| `0x05` | NAME      | bytes (UTF-8): what this is, such as a channel's name | optional |
+| `0x10` | SIG       | `u8 sig_alg` + public key + signature              | one or more, **last** |
+
+Each tag other than SIG may appear at most once. Unknown tags are skipped,
+as in the index, but they are part of what is signed. Signature algorithms
+(`sig_alg`):
+
+| Value   | Algorithm | Public key | Signature |
+|--------:|-----------|-----------:|----------:|
+| 0       | invalid   |            |           |
+| 1       | Ed25519 (RFC 8032, pure, not prehashed) | 32 bytes | 64 bytes |
+| 2–127   | reserved  |            |           |
+| 128–255 | private/experimental use | |      |
+
+So an Ed25519 SIG field's value is 97 bytes long. A reader skips SIG fields
+in algorithms it doesn't know.
+
+**The signed message** is
+
+```
+"zar signature v1" || 0x00 || payload[0 .. first SIG field)
+```
+
+that is, the 16-byte context string, a NUL byte, and the payload from its
+version byte up to, but not including, the first SIG field. Every SIG field
+signs the same message, so several keys may sign one archive, for example
+during a key rotation. No other field may follow a SIG field.
+
+**Where SIGNATURE blocks go.** A writer puts one after the root index, so a
+writer to a pipe can sign: the index's hash is known once the index is
+written. With a head index (§5.4), there are two: one before the base,
+after the head copy of the index, which the zar header's (negative)
+`index_offset` points at, and one after the tail copy, which the trailer
+points at. Each names its own copy of the root index (`ROOT` differs), and
+the two must agree in every other field, including `ROOT_HASH`, since the
+copies are identical. A reader uses the header's root and falls back to the
+trailer's if that fails verification, as for unsigned index copies (§5.2).
+
+**Signed archives must be complete.** In an archive whose root is a
+SIGNATURE block, every FILE and HARDLINK with `CHUNKS` must have
+`CHUNK_HASHES`, every `DICT` must have a `DICT_HASH`, and every `SUBINDEX`
+must have a `SUBINDEX_HASH`, all in a hash algorithm the reader knows.
+Readers reject a signed archive that breaks this rule, rather than skipping
+the check for the entries without hashes, which would leave holes in the
+signature's coverage.
+
+**Verifying.** A reader that requires a signature:
+
+1. Reads the root reference and the SIGNATURE block, checking its CRCs as
+   for any block.
+2. Checks that a SIG field has a key the caller accepts and a valid
+   signature of the message. Which keys to accept is the caller's decision:
+   a reader must never trust a key just because the archive names it.
+3. Reads the ROOT block and checks its block hash against ROOT_HASH before
+   decompressing it.
+4. For each entry it uses: each sub-index on its path against
+   `SUBINDEX_HASH`, the dictionary against `DICT_HASH`, and each chunk it
+   reads against `CHUNK_HASHES`, each before decompressing it.
+5. Checks CONTENT_CRC as usual.
+
+A reader that extracts one file verifies only that file's blocks and the
+indexes on its path. A reader that doesn't require a signature should still
+check the hashes it meets, and should say that the signature went
+unchecked.
+
+**What the format leaves to the application:** which keys to trust;
+**rollback** (a valid signature on an old archive stays valid, so an
+updater that must not go backwards compares SEQUENCE or TIME with the
+newest it has installed); and what NAME must be, so that an archive signed
+for one channel isn't accepted on another.
+
+Copying blocks elsewhere, as an archive editor does, keeps every block hash
+valid, since a block's hash doesn't depend on its offset. Only the
+signature is lost, because the copy has a new root, which must be signed
+again.
 
 ## 6. Index
 
@@ -271,7 +383,8 @@ Numeric values are little-endian with a width given by the field's
 and 8 bytes only when it doesn't, so a 32-bit size is the default and a
 64-bit size is used only when needed. `MODE` is always 2 bytes, the
 `*_NSEC` fields are always 4 bytes, and offsets (`CHUNKS`, `DICT`,
-`SUBINDEX`) are always 8 bytes each.
+`SUBINDEX`) are always 8 bytes each. Hash fields are an algorithm byte
+followed by digests (§6.7).
 
 ### 6.5 Fields
 
@@ -285,6 +398,9 @@ and 8 bytes only when it doesn't, so a 32-bit size is the default and a
 | `0x06` | CONTENT_CRC   | u32                 | FILE, HARDLINK      |
 | `0x07` | LINK_TARGET   | bytes               | SYMLINK, HARDLINK   |
 | `0x08` | SUBINDEX      | i64                 | DIR                 |
+| `0x09` | CHUNK_HASHES  | `u8 alg` + digest × n | FILE, HARDLINK    |
+| `0x0A` | DICT_HASH     | `u8 alg` + digest   | FILE, HARDLINK      |
+| `0x0B` | SUBINDEX_HASH | `u8 alg` + digest   | DIR                 |
 | `0x10` | MODE          | u16                 | all                 |
 | `0x11` | UID           | u32 / u64           | all                 |
 | `0x12` | GID           | u32 / u64           | all                 |
@@ -330,6 +446,16 @@ Each tag may appear at most once per entry.
   entry it is linked to.
 - **SUBINDEX** — offset of an INDEX block whose entries live under this
   directory (§6.6).
+- **CHUNK_HASHES** — one digest per `CHUNKS` offset, in the same order: the
+  block hash (§6.7) of the block that offset references. A hole's digest is
+  all zeros, and readers check that it is. The number of digests must equal
+  the number of `CHUNKS`. A block shared by several chunks or entries has
+  the same digest in each place.
+- **DICT_HASH** — the block hash of the ZSTD_DICT block `DICT` references.
+  A dictionary changes what every chunk decompresses to, so it is covered
+  too.
+- **SUBINDEX_HASH** — the block hash of the INDEX block `SUBINDEX`
+  references, so a signature on the root covers every sub-index below it.
 - **MODE** — permission bits (`07777`). The file type is given by
   `entry_type`, never by `MODE`.
 - **UID/GID, UNAME/GNAME** — ownership. Either form, both, or neither may be
@@ -343,8 +469,9 @@ Each tag may appear at most once per entry.
   Writers omit them unless asked.
 
 A HARDLINK entry carries the same `SIZE`, `CHUNK_SIZE`, `CHUNKS`, and `DICT`
-as its target, so the data is stored once and the entry can be extracted
-on its own. Extractors may instead create a real hard link with `link(2)`.
+(and their hashes, if any) as its target, so the data is stored once and the
+entry can be extracted on its own. Extractors may instead create a real hard
+link with `link(2)`.
 
 ### 6.6 Sub-indexes
 
@@ -365,6 +492,37 @@ nest.
 A path may still name a deeper descendant directly (`a/b/c` in the root
 index) even if `a` has a sub-index. If two entries resolve to the same path,
 the one encountered later in a depth-first walk of the indexes wins.
+
+### 6.7 Hashes
+
+An archive may hold a cryptographic hash of every block its contents depend
+on, so a reader can detect tampering, which CRC-32C doesn't: CRCs catch
+accidental damage, and anyone can recompute them. Hashes are optional in an
+unsigned archive, and required in a signed one (§5.6).
+
+```
+block_hash(B) = HASH( type(B) as u16 LE  ||  payload(B) )
+```
+
+A block's hash covers its `type` and its stored payload, exactly the
+`payload_size` bytes after the header, without padding. Including the type
+stops a DATA_ZSTD block from being presented as DATA_RAW, or the reverse,
+with the same bytes. The offset, size, and CRCs are not hashed, so a block
+copied elsewhere keeps its hash.
+
+Every hash field starts with an algorithm byte:
+
+| Value   | Algorithm  | Digest   |
+|--------:|------------|---------:|
+| 0       | invalid    |          |
+| 1       | BLAKE3-256 | 32 bytes |
+| 2–127   | reserved   |          |
+| 128–255 | private/experimental use | |
+
+A reader that meets a hash in an algorithm it doesn't know treats it as
+absent, so it can still read an unsigned archive, but it rejects a signed
+archive that uses one (§5.6). A reader that knows the algorithm checks each
+block against its hash before decompressing it or otherwise using it.
 
 ## 7. Paths
 
@@ -403,6 +561,9 @@ is promised, and a minor version may add things older readers must reject.
 
 Changes in recent versions:
 
+- **0.6.0** — hashes and signatures: the CHUNK_HASHES, DICT_HASH, and
+  SUBINDEX_HASH fields (§6.5, §6.7), which older readers skip, and the
+  SIGNATURE block (§5.6), which as a root older readers reject.
 - **0.5.0** — holes: a `CHUNKS` offset of -1 is a chunk of zeros with no
   block (§6.5). Readers of earlier versions reject such entries.
 - **0.3.6** — `base_offset` must be 0 or at least 32 (§2.2).
