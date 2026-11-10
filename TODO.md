@@ -32,6 +32,65 @@ BLAKE3 block hashes and Ed25519 signatures are done (`--hash`, `--sign`,
 - **Rollback protection** is the application's job, but unzar could help:
   an option to require a SEQUENCE above a given number, or a NAME.
 
+## Mounting
+
+A read-only FUSE mount, which shows off random access better than anything:
+`zar --mount ARCHIVE DIR` (or a separate `zarfs`), using libfuse 3 on Linux
+and macFUSE or FUSE-T on macOS.
+
+- Opening the archive reads only the index; each `read()` decompresses just
+  the chunks it covers, through a small cache of decompressed chunks.
+- Block hashes are checked as chunks are read, and `--verify=KEYFILE.pub`
+  checks the signature before mounting, so a signed archive can be used in
+  place without being unpacked.
+- Holes read as zeros and report as holes (`SEEK_HOLE`); hard links share
+  an inode number; owners, modes, and times come from the index.
+- An optional dependency: built only if libfuse is found.
+
+## Encryption
+
+Signing proves who made an archive, but anyone can read it. Encryption with
+AEAD per block fits the design, since every block is already independent:
+
+- **Cipher:** XChaCha20-Poly1305, which Monocypher (already vendored)
+  provides. Its 24-byte nonces can be random per block, so blocks stay
+  valid when rezar copies them to a new offset.
+- **Keys:** a random archive key, wrapped for each recipient: by a
+  passphrase through Argon2id (also in Monocypher), or for X25519 public
+  keys, so an archive can be made for someone without a shared secret.
+- **What's covered:** compress, then encrypt. The index must be encrypted
+  too, or file names and sizes leak. The block type and position belong in
+  the associated data, so blocks can't be swapped.
+- **With hashes and signatures:** hash the ciphertext, so anyone can check
+  integrity and signatures without the key, and the reader rejects tampering
+  before decrypting.
+- **Leaks to decide on:** deduplication reveals which chunks are equal, and
+  block sizes reveal roughly how big each file is. Possibly allow padding,
+  and turn deduplication off (or key it) when encrypting.
+- A format change, and one that needs outside review before anyone relies
+  on it.
+
+## Appending
+
+rezar always writes a new archive. The format also allows appending (§5.3):
+new blocks, a new index, and a new trailer after the old end, with the
+header rewritten to point at the new root. Adding a file to a big archive
+would then cost only the file, at the price of leaving replaced or deleted
+data in place until the next full rewrite.
+
+- `zar --append ARCHIVE PATH...`, or `rezar --in-place`, with the new index
+  sharing the old entries' blocks.
+- Deduplication against the existing blocks, as `rezar --dedup=deep` does.
+- Only for a seekable file, and not for a solid archive. An archive with a
+  head index (`--head-index`) loses it: the old copy is left stale, so the
+  rewritten header must point at the new tail index, and the archive can no
+  longer be read from a stream.
+- A signed archive must be signed again, since its root changes. The old
+  signature could be kept, or a new SIGNATURE field could name the previous
+  root, giving a chain of signed versions.
+- Safe against a crash midway: write everything new first and rewrite the
+  header last, so a reader sees either the old archive or the new one.
+
 ## Dictionaries
 
 `--dict` and `--dict-over-solid` are done. Possible improvements:
@@ -47,11 +106,6 @@ BLAKE3 block hashes and Ed25519 signatures are done (`--hash`, `--sign`,
 
 ## rezar
 
-- **Editing in place.** rezar always writes a new archive. The format also
-  allows appending (§5.3): new blocks, a new index, and a new trailer after
-  the old end, with the header rewritten. That would make adding a file to a
-  big archive cost only the file, at the price of leaving deleted data in
-  place until the next full rewrite.
 - **Solid archives.** rezar refuses them, since their data can only be
   copied by recompressing everything. It could do that when asked, or turn
   them into normal archives.
