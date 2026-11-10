@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.7.0). Both tools work and are well
+> **Status:** development (0.7.1). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -182,7 +182,7 @@ zar builds and passes its full test suite on both macOS and Linux: on macOS
 CI (`.github/workflows/ci.yml`) builds and tests every push on Linux
 (x64 and arm64) and macOS, with the sanitizers and a short fuzzing run. It
 also builds the `.deb` and `.rpm` packages and tries them on Debian,
-Fedora, and openSUSE.
+Ubuntu, AlmaLinux 9 and 10 (for RHEL), Fedora, and openSUSE.
 It uses only POSIX APIs and should build on the BSDs, but those aren't
 tested yet.
 

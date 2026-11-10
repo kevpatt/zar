@@ -14,6 +14,7 @@
 #include <iostream>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -382,10 +383,15 @@ int run(Command& cmd)
                                                                          : "scanned";
         const auto bytes = cmd.human ? zar::cli::human_size(stats.bytes)
                                      : std::to_string(stats.bytes) + " bytes";
-        std::cerr << verb << ' ' << stats.files << " files, " << stats.directories
-                  << " directories, " << stats.symlinks << " symlinks, " << stats.hardlinks
-                  << " hard links (" << bytes << ")"
-                  << (warnings ? "" : "; no problems found") << '\n';
+        // In one piece, after the listing, so it doesn't land in the middle
+        // of it when stdout and stderr share a terminal.
+        std::ostringstream summary;
+        summary << verb << ' ' << stats.files << " files, " << stats.directories
+                << " directories, " << stats.symlinks << " symlinks, " << stats.hardlinks
+                << " hard links (" << bytes << ")"
+                << (warnings ? "" : "; no problems found") << '\n';
+        std::cout.flush();
+        std::cerr << summary.str();
     }
     return warnings ? 1 : 0;
 }

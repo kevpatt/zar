@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zar
-    VERSION 0.7.0
+    VERSION 0.7.1
     DESCRIPTION "Random-access zstd archiver"
     LANGUAGES C CXX)
 
@@ -180,7 +180,9 @@ else()
 verifies, and extracts it. Every file, and every chunk of a large file, is
 compressed and checksummed on its own, so any file can be read without
 decompressing the rest. Archives can be streamed through pipes, keep sparse
-files sparse, and store duplicate data once.")
+files sparse, and store duplicate data once. An archive can carry a BLAKE3
+hash of every block and be signed with Ed25519 keys, so unzar can check
+that nothing was changed and who made it.")
 
     set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)    # zar_<version>_<arch>.deb
     set(CPACK_DEBIAN_PACKAGE_SECTION utils)
@@ -188,7 +190,9 @@ files sparse, and store duplicate data once.")
     set(CPACK_DEBIAN_PACKAGE_DESCRIPTION "random-access archiver built on zstd\n${zar_package_description}")
 
     set(CPACK_RPM_FILE_NAME RPM-DEFAULT)       # zar-<version>-1.<arch>.rpm
-    set(CPACK_RPM_PACKAGE_LICENSE BSD-3-Clause)
+    # zar, xxHash (BSD-2-Clause), and BLAKE3 and Monocypher (each offered
+    # under CC0, among others).
+    set(CPACK_RPM_PACKAGE_LICENSE "BSD-3-Clause AND BSD-2-Clause AND CC0-1.0")
     set(CPACK_RPM_PACKAGE_GROUP Applications/Archiving)
     set(CPACK_RPM_PACKAGE_DESCRIPTION "${zar_package_description}")
     # Owned by the system's filesystem package, not this one.

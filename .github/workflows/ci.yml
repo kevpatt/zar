@@ -201,6 +201,9 @@ jobs:
         include:
           - { image: "debian:12", install: "apt-get update && apt-get install -y ./zar_*_amd64.deb" }
           - { image: "fedora:latest", install: "dnf install -y ./zar-*.x86_64.rpm" }
+          - { image: "ubuntu:24.04", install: "apt-get update && apt-get install -y ./zar_*_amd64.deb" }
+          - { image: "almalinux:9", install: "dnf install -y ./zar-*.x86_64.rpm" }
+          - { image: "almalinux:10", install: "dnf install -y ./zar-*.x86_64.rpm" }
           - { image: "opensuse/leap:15.6", install: "zypper --non-interactive install --allow-unsigned-rpm ./zar-*.x86_64.rpm" }
     steps:
       - uses: actions/download-artifact@v4
@@ -215,6 +218,8 @@ jobs:
           zar in && unzar -l in.zar && unzar -C out in.zar
           test "$(cat out/in/a.txt)" = hello && test "$(cat out/in/sub/b.txt)" = world
           rezar --delete=in/sub/b.txt -o less.zar in.zar && unzar -C less less.zar && test ! -e less/in/sub/b.txt
+          zar --keygen=key && zar --sign=key -o signed.zar in && unzar --verify=key.pub -t signed.zar
+          zar --keygen=other && ! unzar --verify=other.pub -t signed.zar
 
   release:
     name: Attach the packages to the release
