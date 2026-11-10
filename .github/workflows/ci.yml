@@ -113,7 +113,7 @@ jobs:
       # (-Wrestrict, GCC bug 105329); the test jobs check warnings.
       - run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
-                -DCMAKE_CXX_COMPILER=g++-12
+                -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12
           cmake --build build
       - run: ctest --test-dir build --output-on-failure
       - name: Build the package
@@ -162,6 +162,7 @@ jobs:
       - run: useradd --create-home builder && chown -R builder .
       - run: |
           runuser -u builder -- cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+                -DCMAKE_C_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/gcc \
                 -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/g++
           runuser -u builder -- cmake --build build --parallel
       - run: runuser -u builder -- ctest --test-dir build --output-on-failure
