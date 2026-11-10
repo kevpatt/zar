@@ -138,7 +138,7 @@ said "rezar --dedup=bogus" 'on, off, or deep'
 # Signing: key pairs, signed archives, and verifying them.
 expect 0 "zar --keygen" "$zar" --keygen="$work/k1.key"
 expect 0 "zar --keygen, a second key" "$zar" --keygen="$work/k2.key"
-[ "$(stat -f %Lp "$work/k1.key" 2>/dev/null || stat -c %a "$work/k1.key")" = 600 ] || fail "zar --keygen: secret key isn't mode 600"
+case $(ls -l "$work/k1.key") in -rw-------*) ;; *) fail "zar --keygen: secret key isn't mode 600" ;; esac
 expect 2 "zar --keygen over a key" "$zar" --keygen="$work/k1.key"
 said "zar --keygen over a key" 'already exists'
 expect 0 "zar --sign" "$zar" -y --sign="$work/k1.key" --sequence=3 --name=nightly -o "$work/signed.zar" "$work/proj"
