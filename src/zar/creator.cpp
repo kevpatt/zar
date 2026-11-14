@@ -147,6 +147,7 @@ private:
         std::optional<ChunkHash> hash;    // to remember the block by, once written
         std::optional<Stored> reuse;      // a duplicate of this block
         bool hole = false;                // zeros, stored as no block at all
+        std::uint64_t length = 0;         // uncompressed, whatever it is
     };
 
     // A block copied from another archive (rezar), not yet hashed for dedup.
@@ -170,9 +171,10 @@ private:
 
     std::optional<Name> child_name(const Name& parent, std::string_view component,
                                    const fs::path& where);
-    void add(const fs::path& path, const Name& name, const struct stat& st, bool recurse = true);
+    void add(const fs::path& path, const Name& name, const struct stat& st, bool recurse = true,
+             bool input = false);
     void add_directory_contents(const fs::path& dir, const Name& name);
-    void add_file(const fs::path& path, const Name& name, const struct stat& st);
+    void add_file(const fs::path& path, const Name& name, const struct stat& st, bool device = false);
     void add_symlink(const fs::path& path, const Name& name, const struct stat& st);
 
     Entry make_entry(EntryType type, const Name& name, const struct stat& st);
@@ -181,7 +183,8 @@ private:
     const std::optional<std::string>& cached_group(gid_t gid);
 
     void queue_chunk(Bytes chunk, std::size_t entry, bool compress);
-    void queue_hole(std::size_t entry);
+    void queue_hole(std::size_t entry, std::uint64_t length);
+    void report_written(std::uint64_t data, std::uint64_t stored);
     void hash_copied(std::uint64_t length);
     std::optional<Stored> find_duplicate(const ChunkHash& hash, ByteView chunk);
     void drain(std::size_t keep);
@@ -209,6 +212,8 @@ private:
     std::unordered_map<ChunkHash, Known, ChunkHash::Hasher> known_;
     std::uint64_t queued_ = 0;     // chunks queued so far
     std::uint64_t written_ = 0;    // chunks written so far, in queue order
+    std::uint64_t data_written_ = 0;      // for on_written
+    std::uint64_t stored_written_ = 0;
     // Copied blocks by uncompressed length, for dedup_copied: hashed only
     // when a new chunk of that length comes by, since only then can they match.
     std::unordered_map<std::uint64_t, std::vector<Copied>> unhashed_;
@@ -267,13 +272,21 @@ void Creator::add_input(const InputSpec& input)
     if (input.must_be_directory && !S_ISDIR(st.st_mode))
         throw std::runtime_error(input.path.string() + ": not a directory");
 
+    // --read-devices: a symlink given as an input, such as one of Linux's
+    // /dev/disk/by-id links, stands for the device it leads to.
+    if (options_.read_devices && S_ISLNK(st.st_mode)) {
+        struct stat target {};
+        if (::stat(input.path.c_str(), &target) == 0 && (S_ISBLK(target.st_mode) || S_ISCHR(target.st_mode)))
+            st = target;
+    }
+
     if (input.contents)
         add_directory_contents(input.path, Name{});
     else if (auto name = child_name(Name{}, input.name, input.path))
-        add(input.path, *name, st);
+        add(input.path, *name, st, true, true);
 }
 
-void Creator::add(const fs::path& path, const Name& name, const struct stat& st, bool recurse)
+void Creator::add(const fs::path& path, const Name& name, const struct stat& st, bool recurse, bool input)
 {
     if (identity_.is_file(st.st_dev, st.st_ino))
         return;    // the archive being written, or the one it replaces
@@ -299,6 +312,15 @@ void Creator::add(const fs::path& path, const Name& name, const struct stat& st,
         break;
     case S_IFLNK:
         add_symlink(path, name, st);
+        break;
+    case S_IFBLK:
+    case S_IFCHR:
+        if (input && options_.read_devices)
+            add_file(path, name, st, true);
+        else if (input)
+            warn(path.string() + ": skipped; a device (--read-devices stores a disk's contents)");
+        else
+            warn(path.string() + ": skipped; not a regular file, directory, or symlink");
         break;
     default:
         warn(path.string() + ": skipped; not a regular file, directory, or symlink");
@@ -374,10 +396,16 @@ void Creator::copy_entries(const ArchiveReader& source, std::span<const Entry> k
             const auto lengths = ArchiveReader::chunk_lengths(entry);    // checks the hashes' count
             for (std::size_t i = 0; i < entry.chunks.size(); ++i) {
                 auto& chunk = entry.chunks[i];
+                if (options_.on_progress && entry.type == EntryType::File)
+                    options_.on_progress(lengths[i]);
+                // The ratio counts a file's data once, not again for its links.
+                const auto data = entry.type == EntryType::File ? lengths[i] : 0;
                 if (chunk == kNoOffset) {    // a hole
                     hashes.push_back(kHoleDigest);
+                    report_written(data, 0);
                     continue;
                 }
+                std::uint64_t stored_bytes = 0;    // unless it's new, it's shared
                 auto it = copied.find(chunk);
                 if (it == copied.end()) {
                     const auto block = source.block_header(chunk);
@@ -390,9 +418,11 @@ void Creator::copy_entries(const ArchiveReader& source, std::span<const Entry> k
                     const Stored stored{writer_->write_block(block.type, payload), block.type, digest};
                     it = copied.emplace(chunk, stored).first;
                     stats_.copied_bytes += payload.size();
+                    stored_bytes = kHeaderSize + payload.size();
                     if (dedup_ && options_.dedup_copied)
                         unhashed_[lengths[i]].push_back({stored, payload.size()});
                 }
+                report_written(data, stored_bytes);
                 if (hash && !it->second.hash)    // copied earlier, for an entry without hashes
                     it->second.hash = block_hash(it->second.type, source.payload(source.block_header(chunk)));
                 if (hashed && !digest_matches(entry.chunk_hashes[i], *it->second.hash))
@@ -421,10 +451,10 @@ void Creator::copy_entries(const ArchiveReader& source, std::span<const Entry> k
     }
 }
 
-void Creator::add_file(const fs::path& path, const Name& name, const struct stat& st)
+void Creator::add_file(const fs::path& path, const Name& name, const struct stat& st, bool device)
 {
     const FileId id{st.st_dev, st.st_ino};
-    const bool multiply_linked = st.st_nlink > 1;
+    const bool multiply_linked = !device && st.st_nlink > 1;
 
     if (multiply_linked) {
         if (const auto it = first_link_.find(id); it != first_link_.end()) {
@@ -444,16 +474,34 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     if (before_open_for_test)
         before_open_for_test(path);
     // Without O_NONBLOCK, a FIFO swapped in since lstat() would block forever.
-    const UniqueFd fd(::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC));
+    // A device given through a symlink is opened through it; either way, the
+    // check below makes sure it's what was examined.
+    const int follow = device ? 0 : O_NOFOLLOW;
+    const UniqueFd fd(::open(path.c_str(), O_RDONLY | follow | O_NONBLOCK | O_CLOEXEC));
     if (!fd) {
         warn(path.string() + ": " + errno_text());
         return;
     }
     struct stat opened {};
-    if (::fstat(fd.get(), &opened) != 0 || !S_ISREG(opened.st_mode) || opened.st_dev != st.st_dev ||
+    const auto same_kind = [&] {
+        if (device)
+            return (opened.st_mode & S_IFMT) == (st.st_mode & S_IFMT) && opened.st_rdev == st.st_rdev;
+        return S_ISREG(opened.st_mode);
+    };
+    if (::fstat(fd.get(), &opened) != 0 || !same_kind() || opened.st_dev != st.st_dev ||
         opened.st_ino != st.st_ino) {
         warn(path.string() + ": skipped; it was replaced while being archived");
         return;
+    }
+    // A device's stat() size is 0; the disk says how big it is.
+    std::uint64_t expected = static_cast<std::uint64_t>(opened.st_size);
+    if (device) {
+        const auto size = device_size(fd.get());
+        if (!size) {
+            warn(path.string() + ": skipped; not a disk, so it has no size to archive");
+            return;
+        }
+        expected = *size;
     }
     if (options_.on_entry)
         options_.on_entry(name.path);
@@ -464,7 +512,6 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
 
     const bool compressible = options_.compress_all || !is_precompressed(name.path);
     const bool compress = compressible && pass_ == Pass::Normal;
-    const auto expected = static_cast<std::uint64_t>(opened.st_size);
     const bool contiguous = options_.contiguous_limit && expected <= *options_.contiguous_limit;
     const auto chunk_size = contiguous ? std::max<std::uint64_t>(expected, 1) : options_.chunk_size;
     std::uint64_t total = 0;
@@ -485,13 +532,17 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
     // full (§6.5) even if the file changes while we read it.
     while (total < expected) {
         const auto want = static_cast<std::size_t>(std::min(chunk_size, expected - total));
-        if (holes.is_hole(total, want)) {    // all zeros, and not worth reading (§6.5)
+        // A device has no holes to find (lseek's SEEK_DATA means nothing
+        // there), though deduplication stores its runs of zeros only once.
+        if (!device && holes.is_hole(total, want)) {    // all zeros, and not worth reading (§6.5)
             crc = crc32c_zeros(crc, want);
             total += want;
             ++chunk_count;
             stats_.hole_bytes += want;
+            if (options_.on_progress)
+                options_.on_progress(want);
             if (pass_ != Pass::Sample)
-                queue_hole(index);
+                queue_hole(index, want);
             continue;
         }
         Bytes chunk(want);
@@ -503,6 +554,8 @@ void Creator::add_file(const fs::path& path, const Name& name, const struct stat
             crc = crc32c(crc, chunk);
             total += chunk.size();
             ++chunk_count;
+            if (options_.on_progress)
+                options_.on_progress(chunk.size());
             if (samples_ && compressible)
                 samples_->add(chunk);
             if (pass_ != Pass::Sample)
@@ -635,7 +688,7 @@ void Creator::queue_chunk(Bytes chunk, std::size_t entry, bool compress)
         hash = hash_chunk(chunk);
         if (const auto stored = find_duplicate(*hash, chunk)) {
             stats_.deduplicated_bytes += chunk.size();
-            pending_.push_back({{}, entry, 0, std::nullopt, stored});
+            pending_.push_back({{}, entry, 0, std::nullopt, stored, false, chunk.size()});
             ++queued_;
             return;
         }
@@ -645,16 +698,16 @@ void Creator::queue_chunk(Bytes chunk, std::size_t entry, bool compress)
     }
 
     const auto size = chunk.size();
-    pending_.push_back({compressor_.submit(std::move(chunk), compress), entry, size, hash, std::nullopt});
+    pending_.push_back({compressor_.submit(std::move(chunk), compress), entry, size, hash, std::nullopt, false, size});
     pending_bytes_ += size;
     ++queued_;
     drain(threads_ * 4);
 }
 
 // Queues a chunk that is all zeros, which is stored as a hole: no block.
-void Creator::queue_hole(std::size_t entry)
+void Creator::queue_hole(std::size_t entry, std::uint64_t length)
 {
-    pending_.push_back({{}, entry, 0, std::nullopt, std::nullopt, true});
+    pending_.push_back({{}, entry, 0, std::nullopt, std::nullopt, true, length});
     ++queued_;
     drain(threads_ * 4);
 }
@@ -730,14 +783,17 @@ void Creator::write_next()
         entry.chunks.push_back(kNoOffset);
         if (hashing_)
             entry.chunk_hashes.push_back(kHoleDigest);
+        report_written(pending.length, 0);
         return;
     }
     Stored stored{};
     if (pending.reuse) {
         stored = *pending.reuse;
+        report_written(pending.length, 0);
     } else {
         const auto chunk = pending.chunk.get();
         stored = {writer_->write_block(chunk.type, chunk.payload), chunk.type, chunk.hash};
+        report_written(pending.length, kHeaderSize + chunk.payload.size());
         if (pending.hash) {
             auto& known = known_.at(*pending.hash);
             known.stored = stored;
@@ -755,6 +811,14 @@ void Creator::write_next()
             entry.dict_hash = dict_hash_;
         stats_.dictionary = true;
     }
+}
+
+void Creator::report_written(std::uint64_t data, std::uint64_t stored)
+{
+    data_written_ += data;
+    stored_written_ += stored;
+    if (options_.on_written && pass_ == Pass::Normal)
+        options_.on_written(data_written_, stored_written_);
 }
 
 CreateStats Creator::finish()
@@ -850,9 +914,11 @@ fs::path default_archive_path(const InputSpec& input)
 namespace {
 
 CreateStats create(Output& out, const Output& identity, std::span<const InputSpec> specs,
-                   const CreateOptions& options, Pass pass, SampleCollector* samples = nullptr,
-                   const Bytes* dict = nullptr)
+                   const CreateOptions& options, Pass pass, std::string_view stage,
+                   SampleCollector* samples = nullptr, const Bytes* dict = nullptr)
 {
+    if (options.on_stage)
+        options.on_stage(stage);
     const bool check_duplicates = specs.size() > 1 || options.names == NameMode::Latin1;
     Creator creator(out, identity, options, check_duplicates, pass, samples, dict);
     for (const auto& spec : specs)
@@ -891,7 +957,7 @@ std::optional<Bytes> train_dictionary(Output& out, std::span<const InputSpec> sp
 {
     HeldReports ignored;
     SampleCollector samples;
-    create(out, out, specs, ignored.quiet(options), Pass::Sample, &samples);
+    create(out, out, specs, ignored.quiet(options), Pass::Sample, "sampling", &samples);
     return samples.train(dict_size);
 }
 
@@ -922,7 +988,7 @@ std::optional<SolidFrame> try_solid(Output& out, std::span<const InputSpec> spec
     try {
         const auto threads = options.threads ? options.threads : default_thread_count();
         auto sink = Output::compressing(solid.frame, options.level, threads, limit - overhead, out);
-        solid.stats = create(sink, out, specs, inner, Pass::Raw, samples);
+        solid.stats = create(sink, out, specs, inner, Pass::Raw, "solid", samples);
         sink.commit();
         solid.crc = sink.compressed_crc();
     } catch (const SizeLimitExceeded&) {
@@ -951,7 +1017,7 @@ std::optional<CreateStats> try_small(Output& out, std::span<const InputSpec> spe
     if (dict) {
         HeldReports reports;
         auto spool = out.make_spool();
-        auto stats = create(spool, out, specs, reports.quiet(options), Pass::Normal, nullptr, &*dict);
+        auto stats = create(spool, out, specs, reports.quiet(options), Pass::Normal, "dictionary", nullptr, &*dict);
         const auto size = spool.position();
         if (size <= *options.solid_limit && size * 100 <= solid_size * options.dict_over_solid) {
             spool.copy_to(out);
@@ -992,7 +1058,45 @@ CreateStats create_archive(Output& out, std::span<const fs::path> inputs,
     std::optional<Bytes> dict;
     if (options.dict_size)
         dict = train_dictionary(out, specs, options, *options.dict_size);
-    return create(out, out, specs, options, Pass::Normal, nullptr, dict ? &*dict : nullptr);
+    return create(out, out, specs, options, Pass::Normal, "", nullptr, dict ? &*dict : nullptr);
+}
+
+std::uint64_t measure_inputs(std::span<const fs::path> paths, bool read_devices)
+{
+    std::set<std::pair<dev_t, ino_t>> seen;    // files with several links count once
+    std::uint64_t total = 0;
+    const auto count = [&](const struct stat& st) {
+        if (S_ISREG(st.st_mode) && seen.emplace(st.st_dev, st.st_ino).second)
+            total += static_cast<std::uint64_t>(st.st_size);
+    };
+    for (const auto& path : paths) {
+        const bool follow = path.native().ends_with('/') || path.native().ends_with("/.");
+        struct stat st {};
+        if ((follow ? ::stat(path.c_str(), &st) : ::lstat(path.c_str(), &st)) != 0)
+            continue;
+        if (read_devices && S_ISLNK(st.st_mode)) {
+            struct stat target {};
+            if (::stat(path.c_str(), &target) == 0 && (S_ISBLK(target.st_mode) || S_ISCHR(target.st_mode)))
+                st = target;
+        }
+        if (read_devices && (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode))) {
+            const UniqueFd fd(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+            if (fd)
+                total += device_size(fd.get()).value_or(0);
+            continue;
+        }
+        count(st);
+        if (!S_ISDIR(st.st_mode))
+            continue;
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(path, fs::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            struct stat child {};
+            if (::lstat(it->path().c_str(), &child) == 0)
+                count(child);
+        }
+    }
+    return total;
 }
 
 CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<const Entry> keep,
@@ -1049,6 +1153,8 @@ CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<
     rebuilt.hash = options.hash || std::ranges::any_of(keep, [](const Entry& e) {
         return !e.chunk_hashes.empty() || e.dict_hash.has_value();
     });
+    if (options.on_stage)
+        options.on_stage("");
     Creator creator(out, out, rebuilt, true, Pass::Normal, nullptr, dict_at ? &dict : nullptr);
     creator.sort_entries();
     creator.copy_entries(source, keep);

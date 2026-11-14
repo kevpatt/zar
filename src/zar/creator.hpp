@@ -56,6 +56,11 @@ struct CreateOptions {
     // the chunk size.
     std::optional<std::uint64_t> contiguous_limit;
 
+    // Store a block device, or a disk's raw device, given as an input (or
+    // through a symlink given as one) as a FILE holding the disk's contents.
+    // Devices inside directories are still skipped.
+    bool read_devices = false;
+
     // Train a zstd dictionary of at most this many bytes on the files, and
     // compress them with it.
     std::optional<std::uint64_t> dict_size;
@@ -71,6 +76,21 @@ struct CreateOptions {
 
     std::function<void(std::string_view)> on_warning;
     std::function<void(std::string_view)> on_entry;    // each archive path as it's added
+
+    // Progress, on the creating thread. on_stage is called as each pass over
+    // the inputs begins: "" for the archive itself, or a trial or preparatory
+    // pass ("solid", "dictionary", "sampling"), which reads everything too.
+    // on_progress is called with the bytes of file data just read, found in
+    // holes, or (rebuild_archive) copied, as uncompressed lengths; a pass
+    // adds up to what measure_inputs() reports, plus any files kept.
+    std::function<void(std::string_view stage)> on_stage;
+    std::function<void(std::uint64_t bytes)> on_progress;
+    // And as blocks are written, the cumulative totals for this pass: file
+    // data written (uncompressed, holes and duplicates included) and the
+    // bytes it took (blocks with their headers; not padding or the index),
+    // for a compression ratio. Not during a solid pass, whose blocks are
+    // compressed again as a whole.
+    std::function<void(std::uint64_t data, std::uint64_t stored)> on_written;
 };
 
 struct CreateStats {
@@ -152,6 +172,13 @@ struct Addition {
 CreateStats rebuild_archive(Output& out, const ArchiveReader& source, std::span<const Entry> keep,
                             std::span<const Addition> additions,
                             const std::filesystem::path& source_dir, const CreateOptions& options);
+
+// The bytes of file data that archiving `paths` reads, for progress
+// reports: regular files' sizes (each file once, however many links it
+// has), walking directories without following symlinks, and with
+// read_devices, the size of a disk given directly. A path ending in '/'
+// follows a symlink, as in parse_input(). What can't be read counts as 0.
+std::uint64_t measure_inputs(std::span<const std::filesystem::path> paths, bool read_devices);
 
 // For tests: called just before each file is opened to be read, so a test
 // can change it at that moment.

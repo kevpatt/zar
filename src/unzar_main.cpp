@@ -3,6 +3,7 @@
 //
 // unzar — extract, test, scan, or list an archive.
 #include "cli.hpp"
+#include "progress.hpp"
 #include "zar/extractor.hpp"
 #include "zar/format.hpp"
 #include "zar/names.hpp"
@@ -66,6 +67,8 @@ archives created with zar --head-index.
   -h, --human-readable   show sizes as 512, 1.0K, 31.4M, 2.0G, ...
   -v, --verbose          with --list, also show permissions and owner, and
                          the signature; print a summary at the end
+      --progress         show progress on the terminal: how much is done,
+                         the rate, and the time left
       --help             show this help
       --version          show version information
 
@@ -88,11 +91,12 @@ struct Command {
     std::vector<std::string> selections;
     bool list = false;
     bool verbose = false;
+    bool progress = false;
     bool human = false;
     std::vector<zar::PublicKey> verify;    // --verify: accepted signers
 };
 
-enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kSparse, kVerify, kHelp, kVersion };
+enum LongOnly { kScan = 256, kDirs, kMaxSize, kHardLinks, kSparse, kVerify, kProgress, kHelp, kVersion };
 
 void print_help()
 {
@@ -116,6 +120,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"hard-links", no_argument, nullptr, kHardLinks},
         {"sparse", required_argument, nullptr, kSparse},
         {"verify", required_argument, nullptr, kVerify},
+        {"progress", no_argument, nullptr, kProgress},
         {"verbose", no_argument, nullptr, 'v'},
         {"human-readable", no_argument, nullptr, 'h'},
         {"help", no_argument, nullptr, kHelp},
@@ -162,6 +167,7 @@ std::optional<Command> parse(int argc, char** argv)
             break;
         case kVerify: cmd.verify.push_back(zar::read_public_key(optarg)); break;
         case 'v': cmd.verbose = true; break;
+        case kProgress: cmd.progress = true; break;
         case 'h': cmd.human = true; break;
         case kHelp:
             print_help();
@@ -294,7 +300,7 @@ zar::ArchiveReader open_archive(const std::string& archive,
 // Archive paths are untrusted: escaped, they can't send terminal controls.
 void print_warning(std::string_view message)
 {
-    std::cerr << "unzar: " << printable(message) << '\n';
+    zar::cli::Progress::around([&] { std::cerr << "unzar: " << printable(message) << '\n'; });
 }
 
 // --verify: the archive must be signed by one of the keys given. Without it,
@@ -360,21 +366,36 @@ int run(Command& cmd)
         if (!matched.contains(s))
             warn(s + ": not found in archive");
 
+    // File data to get through: hard links are copies unless made as links.
+    using zar::cli::Progress;
+    std::optional<Progress> progress;
+    if (cmd.progress && Progress::available()) {
+        std::uint64_t total = 0;
+        for (const auto& entry : chosen)
+            if (entry.type == zar::EntryType::File ||
+                (entry.type == zar::EntryType::Hardlink && !cmd.options.hard_links))
+                total += entry.size.value_or(0);
+        progress.emplace();
+        progress->stage("", total);
+        cmd.options.on_progress = [&progress](std::uint64_t bytes) { progress->add(bytes); };
+    }
+
     const auto groups = zar::group_by_directory(chosen);
     Listing listing(cmd.verbose, cmd.human);
     zar::Extractor extractor(reader, cmd.options);
     extractor.prepare(groups);
     for (const auto& group : groups) {
         if (cmd.list)
-            listing.directory(group);
+            Progress::around([&] { listing.directory(group); });
         extractor.enter(group);
         for (const auto* entry : group.members) {
             if (cmd.list)
-                listing.member(*entry);
+                Progress::around([&] { listing.member(*entry); });
             extractor.extract(*entry);
         }
     }
     const auto stats = extractor.finish();
+    progress.reset();
     warnings += stats.warnings;
 
     if (cmd.verbose) {

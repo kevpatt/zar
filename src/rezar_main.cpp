@@ -4,6 +4,7 @@
 // rezar — add, replace, or delete paths in an archive, writing a new one.
 #include "cli.hpp"
 #include "create_options.hpp"
+#include "progress.hpp"
 #include "zar/archive_reader.hpp"
 #include "zar/creator.hpp"
 #include "zar/editor.hpp"
@@ -63,6 +64,8 @@ constexpr std::string_view kUsage = R"(usage: rezar [options] -o OUTPUT ARCHIVE
                          key; may be repeated, for several. Hashes in
                          ARCHIVE are always checked as blocks are copied.
   -v, --verbose          list paths as they are added, and print a summary
+      --progress         show progress on the terminal: how much is done,
+                         the rate, and the time left
       --help             show this help
       --version          show version information
 
@@ -93,6 +96,7 @@ using zar::cli::UsageError;
 
 enum LongOnly {
     kAddList = 256,    // past every short option
+    kProgress,
     kReplaceList,
     kAddReplaceList,
     kDeleteList,
@@ -116,6 +120,7 @@ struct Command {
     bool null_separated = false;
     bool dry_run = false;
     bool verbose = false;
+    bool progress = false;
     std::optional<std::uint8_t> align_log2;    // unset: as in the archive
     std::optional<bool> head_index;            // unset: as in the archive
     std::vector<zar::PublicKey> verify;        // --verify: accepted signers of ARCHIVE
@@ -152,6 +157,7 @@ std::optional<Command> parse(int argc, char** argv)
         {"head-index", optional_argument, nullptr, kHeadIndex},
         {"verify", required_argument, nullptr, kVerify},
         {"verbose", no_argument, nullptr, 'v'},
+        {"progress", no_argument, nullptr, kProgress},
         {"help", no_argument, nullptr, kHelp},
         {"version", no_argument, nullptr, kVersion},
     });
@@ -197,6 +203,7 @@ std::optional<Command> parse(int argc, char** argv)
                 throw UsageError("--head-index must be on or off");
             break;
         case 'v': cmd.verbose = true; break;
+        case kProgress: cmd.progress = true; break;
         case kHelp:
             print_help();
             return std::nullopt;
@@ -244,7 +251,7 @@ std::vector<std::string> read_list(const std::string& file, bool null_separated)
 
 void print_warning(std::string_view message)
 {
-    std::cerr << "rezar: " << printable(message) << '\n';
+    zar::cli::Progress::around([&] { std::cerr << "rezar: " << printable(message) << '\n'; });
 }
 
 // Whether `a` and `b` name the same existing file.
@@ -298,12 +305,36 @@ int run(Command& cmd)
     options.align_log2 = cmd.align_log2.value_or(header.align_log2);
     options.head_index = cmd.head_index.value_or(header.index_offset < 0);
     options.on_warning = print_warning;
+    using zar::cli::Progress;
     if (cmd.verbose)
-        options.on_entry = [](std::string_view path) { std::cerr << printable(path) << '\n'; };
+        options.on_entry = [](std::string_view path) {
+            Progress::around([&] { std::cerr << printable(path) << '\n'; });
+        };
 
     auto out = zar::Output::create_file(cmd.output, cmd.overwrite);
+    // The files kept, which are copied, and those added, which are read.
+    std::optional<Progress> progress;
+    if (cmd.progress && Progress::available()) {
+        progress.emplace();
+        progress->stage("measuring", 0);
+        std::uint64_t total = 0;
+        for (const auto& entry : plan.keep)
+            if (entry.type == zar::EntryType::File)
+                total += entry.size.value_or(0);
+        std::vector<fs::path> added;
+        for (const auto& addition : plan.additions)
+            if (addition.kind != zar::Addition::Kind::Directory)
+                added.push_back(cmd.directory / addition.path);
+        total += zar::measure_inputs(added, false);
+        options.on_stage = [&progress, total](std::string_view stage) { progress->stage(stage, total); };
+        options.on_progress = [&progress](std::uint64_t bytes) { progress->add(bytes); };
+        options.on_written = [&progress](std::uint64_t data, std::uint64_t stored) {
+            progress->written(data, stored);
+        };
+    }
     const auto stats = zar::rebuild_archive(out, source, plan.keep, plan.additions, cmd.directory, options);
     out.commit();
+    progress.reset();
 
     if (cmd.verbose) {
         std::cerr << "kept " << stats.copied_entries << " entries ("

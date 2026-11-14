@@ -8,10 +8,19 @@
 #include <cstdlib>
 #include <grp.h>
 #include <pwd.h>
+#include <sys/ioctl.h>
 #include <sys/statvfs.h>
 #include <system_error>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <sys/disk.h>    // DKIOCGETBLOCKCOUNT, DKIOCGETBLOCKSIZE
+#elif defined(__linux__)
+#include <linux/fs.h>    // BLKGETSIZE64
+#elif defined(__FreeBSD__) || defined(__DragonFly__)
+#include <sys/disk.h>    // DIOCGMEDIASIZE
+#endif
 
 namespace zar {
 namespace {
@@ -131,6 +140,28 @@ bool HoleFinder::is_hole(std::uint64_t from, std::uint64_t length)
 #endif
     }
     return from + length <= data_;
+}
+
+std::optional<std::uint64_t> device_size(int fd)
+{
+#if defined(__APPLE__)
+    std::uint64_t blocks = 0;
+    std::uint32_t block_size = 0;
+    if (::ioctl(fd, DKIOCGETBLOCKCOUNT, &blocks) == 0 && ::ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) == 0 &&
+        block_size > 0)
+        return blocks * block_size;
+#elif defined(__linux__)
+    std::uint64_t size = 0;
+    if (::ioctl(fd, BLKGETSIZE64, &size) == 0)
+        return size;
+#elif defined(DIOCGMEDIASIZE)
+    off_t size = 0;
+    if (::ioctl(fd, DIOCGMEDIASIZE, &size) == 0 && size >= 0)
+        return static_cast<std::uint64_t>(size);
+#else
+    (void)fd;
+#endif
+    return std::nullopt;
 }
 
 std::optional<std::uint64_t> free_space(const std::filesystem::path& path)

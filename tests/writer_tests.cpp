@@ -20,6 +20,7 @@
 #include <map>
 #include <random>
 #include <sys/stat.h>
+#include <tuple>
 #include <unistd.h>
 #include <zstd.h>
 
@@ -529,4 +530,43 @@ TEST(writer_skips_files_replaced_while_reading)
     CHECK(archive.find("keep") != nullptr);
     CHECK(archive.find("swap") == nullptr);
     CHECK(warnings.size() == 1 && warnings[0].find("replaced while being archived") != std::string::npos);
+}
+
+// Devices are read only with read_devices, only as inputs, and only if
+// they're disks: something like /dev/zero has no size, and would never end.
+// (Reading a real disk needs one: CI archives a loop device.)
+TEST(devices_are_read_only_when_asked_and_only_disks)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "dir/file", text("data"));
+    fs::create_symlink("/dev/null", tmp.path() / "dir/null");
+    fs::create_symlink("/dev/zero", tmp.path() / "zero");
+
+    const auto run = [&](std::vector<fs::path> inputs, bool read_devices) {
+        CreateOptions options;
+        options.read_devices = read_devices;
+        std::vector<std::string> warnings;
+        options.on_warning = [&](std::string_view m) { warnings.emplace_back(m); };
+        CreateStats stats;
+        const auto archive = build(tmp.path() / "a.zar", std::move(inputs), options, &stats);
+        return std::tuple{archive.entries.size(), stats.files, warnings};
+    };
+    const auto mentions = [](const std::vector<std::string>& warnings, std::string_view text) {
+        return warnings.size() == 1 && warnings[0].find(text) != std::string::npos;
+    };
+
+    // Without the option, a device given as an input is skipped, with a hint.
+    const auto [none, none_files, none_warnings] = run({"/dev/null"}, false);
+    CHECK(none == 0 && none_files == 0 && mentions(none_warnings, "--read-devices"));
+
+    // With it, devices that aren't disks are still skipped, directly or
+    // through a symlink, rather than read forever.
+    for (const auto& input : {fs::path("/dev/null"), fs::path("/dev/zero"), tmp.path() / "zero"}) {
+        const auto [count, files, warnings] = run({input}, true);
+        CHECK(count == 0 && files == 0 && mentions(warnings, "not a disk"));
+    }
+
+    // A symlink inside a directory stays a symlink, whatever it points at.
+    const auto [entries, files, warnings] = run({tmp.path() / "dir"}, true);
+    CHECK(entries == 3 && files == 1 && warnings.empty());
 }

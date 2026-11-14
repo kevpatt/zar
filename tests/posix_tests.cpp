@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <fcntl.h>
 #include <thread>
 #include <unistd.h>
 
@@ -94,4 +95,14 @@ TEST(output_never_replaces_a_file_that_appeared_without_overwrite)
     replacing.write(text("new"));
     replacing.commit();
     CHECK(read_file(path) == text("new"));
+}
+
+TEST(only_disks_have_a_device_size)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "f", text("not a disk"));
+    for (const auto& path : {tmp.path() / "f", fs::path("/dev/null"), fs::path("/dev/zero")}) {
+        const UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
+        CHECK(fd && !device_size(fd.get()));
+    }
 }

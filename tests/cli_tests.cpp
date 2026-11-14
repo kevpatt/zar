@@ -4,6 +4,7 @@
 #include "check.hpp"
 
 #include "cli.hpp"
+#include "progress.hpp"
 
 using zar::cli::human_size;
 
@@ -43,4 +44,17 @@ TEST(printable_names_cannot_control_the_terminal)
     CHECK(printable("tab\there\nnew") == "tab\\x09here\\x0anew");
     CHECK(printable("back\\slash") == "back\\\\slash");
     CHECK(printable("latin\xe9") == "latin\\xe9");                         // not UTF-8: bytes escaped
+}
+
+TEST(compression_ratios)
+{
+    using zar::cli::Progress;
+    CHECK(Progress::ratio(1095, 100) == "10.95:1");
+    CHECK(Progress::ratio(100, 110) == "1:1.10");
+    CHECK(Progress::ratio(7, 7) == "1.00:1");
+    CHECK(Progress::ratio(1000, 3) == "333.33:1");
+    CHECK(Progress::ratio(2, 3) == "1:1.50");
+    CHECK(Progress::ratio(200, 101) == "1.98:1");    // 1.980..., rounded
+    CHECK(Progress::ratio(1, 3) == "1:3.00");
+    CHECK(Progress::ratio(20'000'000, 5'000) == "4000.00:1");
 }

@@ -4,6 +4,7 @@
 // zar — create an archive.
 #include "cli.hpp"
 #include "create_options.hpp"
+#include "progress.hpp"
 #include "zar/creator.hpp"
 #include "zar/dictionary.hpp"
 #include "zar/format.hpp"
@@ -44,6 +45,10 @@ PATH is stored under its own name, so extracting recreates it:
                          directory's name)
   -m, --many             archive several PATHs into one archive (needs -o)
   -y, --yes              overwrite an existing archive
+      --read-devices     store a disk device given as PATH (/dev/sdb,
+                         /dev/rdisk4, or a symlink to one) as a file holding
+                         the disk's contents; devices in directories are
+                         still skipped
 )";
 
 // After the options shared with rezar.
@@ -67,6 +72,8 @@ constexpr std::string_view kUsageTail = R"(      --align[=N]        align block 
                          it's at most PERCENT of the solid size and fits too
                          (default 120; 0 never tries)
   -v, --verbose          list files as they are added, and print a summary
+      --progress         show progress on the terminal: how much is done,
+                         the rate, and the time left
       --help             show this help
       --version          show version information
 
@@ -92,6 +99,7 @@ struct Command {
     bool overwrite = false;
     bool many = false;
     bool verbose = false;
+    bool progress = false;
     std::vector<fs::path> inputs;
     std::optional<fs::path> keygen;
 };
@@ -103,6 +111,8 @@ enum LongOnly {
     kDict,
     kDictOverSolid,
     kKeygen,
+    kReadDevices,
+    kProgress,
     kHelp,
     kVersion,
 };
@@ -130,6 +140,8 @@ std::optional<Command> parse(int argc, char** argv)
         {"verbose", no_argument, nullptr, 'v'},
         {"help", no_argument, nullptr, kHelp},
         {"keygen", required_argument, nullptr, kKeygen},
+        {"read-devices", no_argument, nullptr, kReadDevices},
+        {"progress", no_argument, nullptr, kProgress},
         {"version", no_argument, nullptr, kVersion},
     });
 
@@ -174,6 +186,8 @@ std::optional<Command> parse(int argc, char** argv)
             print_help();
             return std::nullopt;
         case kKeygen: cmd.keygen = fs::path(std::string(arg)); break;
+        case kReadDevices: opt.read_devices = true; break;
+        case kProgress: cmd.progress = true; break;
         case kVersion:
             zar::cli::print_version(std::cout, "zar");
             return std::nullopt;
@@ -219,17 +233,32 @@ int run(Command& cmd)
     if (cmd.keygen)
         return keygen(cmd);
 
+    using zar::cli::Progress;
     // File names can hold anything, including terminal control sequences.
     cmd.options.on_warning = [](std::string_view message) {
-        std::cerr << "zar: " << printable(message) << '\n';
+        Progress::around([&] { std::cerr << "zar: " << printable(message) << '\n'; });
     };
     if (cmd.verbose)
-        cmd.options.on_entry = [](std::string_view path) { std::cerr << printable(path) << '\n'; };
+        cmd.options.on_entry = [](std::string_view path) {
+            Progress::around([&] { std::cerr << printable(path) << '\n'; });
+        };
 
     auto out = cmd.output == "-" ? zar::Output::standard_output()
                                  : zar::Output::create_file(cmd.output, cmd.overwrite);
+    std::optional<Progress> progress;
+    if (cmd.progress && Progress::available()) {
+        progress.emplace();
+        progress->stage("measuring", 0);
+        const auto total = zar::measure_inputs(cmd.inputs, cmd.options.read_devices);
+        cmd.options.on_stage = [&progress, total](std::string_view stage) { progress->stage(stage, total); };
+        cmd.options.on_progress = [&progress](std::uint64_t bytes) { progress->add(bytes); };
+        cmd.options.on_written = [&progress](std::uint64_t data, std::uint64_t stored) {
+            progress->written(data, stored);
+        };
+    }
     const auto stats = zar::create_archive(out, cmd.inputs, cmd.options);
     out.commit();
+    progress.reset();
 
     if (cmd.verbose) {
         std::cerr << stats.files << " files, " << stats.directories << " directories, "

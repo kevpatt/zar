@@ -41,6 +41,25 @@ jobs:
       - run: cmake -S . -B build -G Ninja -DZAR_WARNINGS_AS_ERRORS=ON
       - run: cmake --build build
       - run: ctest --test-dir build --output-on-failure
+      # zar --read-devices on a real disk, directly and through a symlink:
+      # a loop device on Linux, and a disk image attached without mounting
+      # it on macOS (both its block and its raw device).
+      - name: Archive a disk device
+        run: |
+          head -c 3000000 /dev/urandom > disk.img && truncate -s 16M disk.img
+          if [ "$RUNNER_OS" = Linux ]; then
+            dev=$(sudo losetup --find --show disk.img); sudo=sudo; devices=$dev
+          else
+            dev=$(hdiutil attach -imagekey diskimage-class=CRawDiskImage -nomount disk.img | awk '{print $1; exit}')
+            sudo=; devices="$dev ${dev/disk/rdisk}"
+          fi
+          ln -s "$dev" disk
+          for d in $devices disk; do
+            $sudo build/zar -y --read-devices -o d.zar "$d"
+            rm -rf out && build/unzar -C out d.zar
+            cmp "out/$(basename "$d")" disk.img
+          done
+          if [ "$RUNNER_OS" = Linux ]; then sudo losetup -d "$dev"; else hdiutil detach "$dev"; fi
 
   sanitizers:
     name: Sanitizers (${{ matrix.name }})

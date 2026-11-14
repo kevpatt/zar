@@ -51,6 +51,9 @@ struct ExtractOptions {
     // to the destination's free space.
     std::optional<std::uint64_t> size_limit;
     std::function<void(std::string_view)> on_warning;    // may be called from any thread
+    // Progress: the uncompressed length of each chunk of file data as it's
+    // done (holes included), from any thread.
+    std::function<void(std::uint64_t bytes)> on_progress;
 };
 
 struct ExtractStats {

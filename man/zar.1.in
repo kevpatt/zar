@@ -30,7 +30,10 @@ A chunk that lies entirely within a hole of a sparse file is recorded as a
 hole, without being read or stored, and
 .Xr unzar 1
 recreates it as a hole.
-Devices, FIFOs, and sockets are skipped with a warning.
+Devices, FIFOs, and sockets are skipped with a warning, though
+.Fl \-read-devices
+stores the contents of a disk given as a
+.Ar path .
 .Pp
 A
 .Ar path
@@ -93,6 +96,22 @@ Requires
 Two paths that would be stored under the same name are an error.
 .It Fl y , Fl \-yes
 Overwrite an existing archive.
+.It Fl \-read-devices
+Store a disk device given as a
+.Ar path ,
+such as
+.Pa /dev/sdb
+or
+.Pa /dev/rdisk4 ,
+or a symbolic link to one, as a regular file holding the disk's contents,
+named after the
+.Ar path .
+Devices inside directories are still skipped, and so are devices that
+aren't disks, such as
+.Pa /dev/zero .
+Use
+.Nm unzar Fl \-sparse Ns = Ns Cm auto
+to extract the image with holes where it is zeros.
 .It Fl l , Fl \-level Ns = Ns Ar n
 The zstd compression level, from the library's minimum (negative, fastest)
 to its maximum (22).
@@ -232,6 +251,17 @@ shows.
 List each path on standard error as it is added, and print a summary at the
 end, including how much data was deduplicated or in holes, and whether the
 archive was hashed or signed.
+.It Fl \-progress
+While working, keep a line at the bottom of the terminal showing how much
+file data is done, out of how much, the rate, and the time left.
+Only when standard error is a terminal.
+The data is counted as it is read, holes included; the sizes of the
+inputs are added up first, for the total.
+With
+.Fl \-solid
+or
+.Fl \-dict ,
+everything is read more than once, and each pass is labeled.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version
@@ -319,6 +349,10 @@ Send an archive through a pipe to another machine and extract it there:
 Package many small files as compactly as possible, if it comes to at most
 1 MiB:
 .Dl $ zar --solid=1M config
+.Pp
+Archive a whole USB drive, then extract it as a sparse image file:
+.Dl $ sudo zar --read-devices -o usb.zar /dev/sdb
+.Dl $ unzar --sparse=auto usb.zar
 .Pp
 Make a key pair, and sign a release with it:
 .Dl $ zar --keygen=release.key

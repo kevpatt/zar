@@ -157,6 +157,12 @@ if it is one of the
 .Fl \-verify
 keys.
 Print a summary at the end.
+.It Fl \-progress
+While working, keep a line at the bottom of the terminal showing how much
+file data is done, out of how much, the rate, and the time left.
+Only when standard error is a terminal.
+The data is the uncompressed size of what is extracted, tested, or
+scanned.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

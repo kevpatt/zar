@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.7.3). All three tools work and are well
+> **Status:** development (0.8.0). All three tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -247,6 +247,43 @@ store the same path (two directories both named `src`, say) are an error.
 By default zar stores permissions and modification times. Ownership,
 nanosecond timestamps, and access, change, and birth times are opt-in.
 
+### Disks
+
+Devices are normally skipped, but with `--read-devices`, a disk given as an
+input (`/dev/sdb`, `/dev/disk4` or the faster raw `/dev/rdisk4` on macOS, or
+a symlink to one, like Linux's `/dev/disk/by-id/...`) is stored as a file
+holding the disk's contents, named after the input:
+
+```sh
+sudo zar --read-devices -o usb.zar /dev/sdb    # stored as the file "sdb"
+unzar --sparse=auto usb.zar                    # an image file, sparse where it's zeros
+```
+
+Only devices given as inputs are read, never ones found inside a directory,
+and only disks: something like `/dev/zero`, which has no size, is skipped.
+Runs of zeros, like a disk's unused space, are stored once by deduplication.
+A disk has no holes for zar to find, so `unzar --sparse=auto` is what makes
+the image sparse again. To write it back to a disk, use `dd` or similar.
+Add `--progress` to see how far along a big disk is.
+
+### Progress
+
+`--progress`, for `zar`, `unzar`, and `rezar`, keeps one line at the bottom
+of the terminal up to date while they work:
+
+```
+1.2G / 4.0G  30.0%  412.5M/s  0:07 left
+```
+
+The amount is file data, uncompressed: read by `zar` (holes included),
+extracted, tested, or scanned by `unzar`, and copied or added by `rezar`. So
+the rate is how fast the files go by, whatever the compression ratio. `zar`
+first adds up the sizes of its inputs to know the total. With `--solid` or
+`--dict`, it reads everything more than once, and labels each pass
+(`solid:`, `dictionary:`, `sampling:`). The line is drawn only when standard
+error is a terminal, so logs and pipes stay clean, and it steps aside for
+`-v`, listings, and warnings.
+
 ### Options
 
 | Option | Meaning |
@@ -254,6 +291,7 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `-o, --output=FILE` | archive to write (`-` for stdout); see above for the default |
 | `-m, --many` | archive several inputs (requires `-o`) |
 | `-y, --yes` | overwrite an existing archive |
+| `--read-devices` | store a disk device given as an input as a file holding its contents; see [Disks](#disks) |
 | `-l, --level=N` | zstd compression level (default 3) |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--chunk-size=SIZE` | split files into independently compressed chunks of SIZE bytes: a power of two from 4K to 1G, with an optional `K`, `M`, or `G` suffix (default 1M) |
@@ -274,6 +312,7 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `--sequence=N`, `--name=TEXT` | with `--sign`: a release number, and what the archive is (a channel, say), both signed |
 | `--keygen=KEYFILE` | make a key pair: `KEYFILE` (secret, mode 0600) and `KEYFILE.pub` |
 | `-v, --verbose` | list files as they are added, and print a summary |
+| `--progress` | show progress on the terminal: how much is done, the rate, and the time left; see [Progress](#progress) |
 | `--help`, `--version` | |
 
 Short options can be combined, as in `zar -myv -o all.zar a b`. `-l`'s
@@ -349,6 +388,7 @@ src/sub/
 | `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`); without it, the limit is the free space where the data would go |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
 | `-v, --verbose` | add permissions and owner to the listing, and a signed archive's signature and signers before it; print a summary |
+| `--progress` | show progress on the terminal; see [Progress](#progress) |
 | `--help`, `--version` | |
 
 ### Exit status
@@ -418,7 +458,7 @@ matches a new chunk's, each once. `--dedup=off` turns deduplication off.
 The options for new files are those of `zar`: `-l`, `-j`, `--chunk-size`,
 `--owner`, `--nsec`, `--all-times`, `--names`, `--compress-all`, and
 `--contiguous`. `--align` and `--head-index[=on|off]` apply to the whole
-archive. A solid archive can't be edited, since everything in it would be
+archive, and `--progress` shows how far along it is. A solid archive can't be edited, since everything in it would be
 recompressed. See `rezar --help` or `man rezar` for the rest.
 
 `rezar` checks the hashes of every block it copies, keeps them, and hashes
@@ -707,6 +747,7 @@ src/
   rezar_main.cpp       the rezar command
   cli.hpp              command-line helpers shared by all three
   create_options.hpp   options for storing new files, shared by zar and rezar
+  progress.hpp         --progress's line on the terminal, for all three
   zar/                 libzar, the format library
     format.*           zar and block headers
     index.*            index entries

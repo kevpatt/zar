@@ -68,6 +68,11 @@ private:
     std::uint64_t data_end_ = 0;    // where that data ends
 };
 
+// The size of the disk behind a block device, or a disk's raw (character)
+// device, from the system's disk ioctls; nullopt for anything else, such as
+// /dev/zero, whose length has no end.
+std::optional<std::uint64_t> device_size(int fd);
+
 // Bytes available to unprivileged users on the filesystem holding `path`.
 std::optional<std::uint64_t> free_space(const std::filesystem::path& path);
 

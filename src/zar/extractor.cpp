@@ -520,6 +520,8 @@ struct Extractor::Impl {
                     j.fail(e.what());
                 }
             }
+            if (options.on_progress)
+                options.on_progress(length);
             chunk_done(j, 0);
         });
     }
@@ -568,6 +570,8 @@ struct Extractor::Impl {
                 job.fail(e.what());
             }
         }
+        if (options.on_progress)
+            options.on_progress(job.lengths[index]);
         chunk_done(job, job.lengths[index]);
     }
 

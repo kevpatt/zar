@@ -157,6 +157,12 @@ again with
 .It Fl v , Fl \-verbose
 List each path on standard error as it is added, and print a summary at the
 end.
+.It Fl \-progress
+While working, keep a line at the bottom of the terminal showing how much
+file data is done, out of how much, the rate, and the time left.
+Only when standard error is a terminal.
+The data is the uncompressed size of the files kept, as they are copied,
+and of those added, as they are read.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

@@ -13,6 +13,7 @@
 #include "zar/posix.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <fcntl.h>
 #include <iostream>
 #include <unistd.h>
@@ -364,4 +365,83 @@ TEST(rebuilding_refuses_solid_archives)
     CHECK(source.solid());
     auto out = Output::create_file(tmp.path() / "b.zar", true);
     CHECK_THROWS_WITH(rebuild_archive(out, source, source.entries(), {}, tmp.path(), {}), "solid");
+}
+
+// --progress divides what the library reports by what measure_inputs() (or
+// the index) says there is: each pass must add up to exactly that.
+TEST(progress_adds_up_to_the_measured_total)
+{
+    TempDir tmp;
+    const auto src = tmp.path() / "src";
+    write_file(src / "big", random_bytes(300'000, 1));
+    write_file(src / "small", text("small"));
+    fs::create_directories(src / "empty");
+    fs::create_hard_link(src / "big", src / "link");    // counted once
+    {
+        const UniqueFd fd(::open((src / "sparse").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0644));
+        CHECK(::ftruncate(fd.get(), 3 << 20) == 0);    // a hole, which counts too
+        CHECK(::pwrite(fd.get(), "x", 1, 1 << 20) == 1);
+    }
+    const std::uint64_t total = 300'000 + 5 + (3 << 20);
+    CHECK(measure_inputs(std::vector{src / "."}, false) == total);
+    CHECK(measure_inputs(std::vector{src / "small", src / "missing"}, false) == 5);
+
+    // Every pass, trial ones included, reads it all.
+    for (const bool small : {false, true}) {
+        CreateOptions options;
+        options.chunk_size = 64 << 10;
+        if (small)
+            options.solid_limit = 1 << 30;    // a solid pass, then a dictionary one
+        std::vector<std::pair<std::string, std::uint64_t>> passes;
+        std::pair<std::uint64_t, std::uint64_t> written{};    // the last report
+        options.on_stage = [&](std::string_view stage) { passes.emplace_back(stage, 0); written = {}; };
+        options.on_progress = [&](std::uint64_t bytes) { passes.back().second += bytes; };
+        options.on_written = [&](std::uint64_t data, std::uint64_t stored) {
+            CHECK(data >= written.first && stored >= written.second);    // cumulative
+            written = {data, stored};
+        };
+        make_archive(tmp.path() / "a.zar", src, options);
+        CHECK(passes.size() == (small ? 2u : 1u));
+        for (const auto& [stage, bytes] : passes)
+            CHECK(bytes == total);
+        // Every byte read is written; the hole and the duplicate take nothing.
+        CHECK(written.first == total);
+        CHECK(written.second > 250'000 && written.second < 400'000);
+        if (small)
+            CHECK(passes[0].first == "solid" && passes[1].first == "dictionary");
+    }
+    make_archive(tmp.path() / "a.zar", src, {});
+
+    // Extracting: the files' sizes, with the hard link as a copy.
+    std::atomic<std::uint64_t> extracted = 0;
+    {
+        auto reader = ArchiveReader::open(tmp.path() / "a.zar");
+        ExtractOptions options;
+        options.mode = ExtractMode::Test;
+        options.on_progress = [&](std::uint64_t bytes) { extracted += bytes; };
+        const auto groups = group_by_directory(reader.entries());
+        Extractor extractor(reader, options);
+        extractor.prepare(groups);
+        for (const auto& group : groups) {
+            extractor.enter(group);
+            for (const auto* member : group.members)
+                extractor.extract(*member);
+        }
+        extractor.finish();
+    }
+    CHECK(extracted == total + 300'000);
+
+    // Rebuilding: the files kept (not their links), then those added.
+    write_file(tmp.path() / "add/new", text("new file"));
+    CreateOptions options;
+    std::uint64_t rebuilt = 0;
+    options.on_progress = [&](std::uint64_t bytes) { rebuilt += bytes; };
+    std::uint64_t rebuilt_data = 0;
+    options.on_written = [&](std::uint64_t data, std::uint64_t) { rebuilt_data = data; };
+    EditLists lists;
+    lists.add = {"new"};
+    lists.remove = {"small"};
+    rebuild(tmp.path() / "a.zar", tmp.path() / "b.zar", lists, tmp.path() / "add", options);
+    CHECK(rebuilt == 300'000 + (3 << 20) + 8);
+    CHECK(rebuilt_data == rebuilt);
 }
