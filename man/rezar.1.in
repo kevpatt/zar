@@ -163,13 +163,15 @@ file data is done, out of how much, the rate, and the time left.
 Only when standard error is a terminal.
 The data is the uncompressed size of the files kept, as they are copied,
 and of those added, as they are read.
-The compression ratio so far of the new archive is shown too: the file data written, over the
-bytes it took, as in
+The compression ratio so far of the new archive is shown too: the file
+data written, over the bytes it took, as in
 .Ql 3.47:1 ,
 or
 .Ql 1:1.02
 if larger.
 Holes and duplicates count as data that took no space.
+When done, the line is left showing the totals, the average rate, and the
+time taken.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

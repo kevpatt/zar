@@ -3,7 +3,8 @@
 //
 // --progress: one line on stderr, redrawn twice a second, showing how much
 // of the data is done, the rate, the time left, and when compressing, the
-// compression ratio so far. Only on a terminal.
+// compression ratio so far. Only on a terminal. On success, finish() leaves
+// a last line with the totals.
 #pragma once
 
 #include "cli.hpp"
@@ -32,6 +33,27 @@ public:
 
     Progress() : thread_([this] { tick(); }) { active_ = this; }
 
+    // The run succeeded: stop, and leave a last line showing everything
+    // done, the final ratio, the average rate and the time it all took.
+    void finish()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            const auto now = Clock::now();
+            const auto done = done_.load(std::memory_order_relaxed);
+            std::string line = head(done);
+            const auto seconds = std::chrono::duration<double>(now - stage_start_).count();
+            if (seconds > 0)
+                line += "  " + human_size(static_cast<std::uint64_t>(static_cast<double>(done) / seconds)) + "/s";
+            line += "  in " + clock(std::chrono::duration<double>(now - start_).count());
+            std::fputs(("\r" + line + "\033[K\n").c_str(), stderr);
+            std::fflush(stderr);
+            shown_ = false;
+            stopping_ = true;
+        }
+        wake_.notify_all();
+    }
+
     ~Progress()
     {
         {
@@ -55,6 +77,7 @@ public:
         label_ = label;
         total_ = total;
         done_ = 0;
+        stage_start_ = Clock::now();
         data_ = 0;
         stored_ = 0;
         samples_.clear();
@@ -132,14 +155,7 @@ private:
         while (samples_.size() > 2 && now - samples_.front().first > std::chrono::seconds(5))
             samples_.pop_front();
 
-        std::string line;
-        if (!label_.empty())
-            line += label_ + ": ";
-        line += human_size(done);
-        if (total_)
-            line += " / " + human_size(total_) + "  " + percent(done);
-        if (data_ && stored_)
-            line += "  " + ratio(data_, stored_);
+        std::string line = head(done);
         const auto elapsed = std::chrono::duration<double>(now - samples_.front().first).count();
         if (elapsed >= 1) {
             const auto rate = static_cast<double>(done - samples_.front().second) / elapsed;
@@ -150,6 +166,20 @@ private:
         std::fputs(("\r" + line + "\033[K").c_str(), stderr);
         std::fflush(stderr);
         shown_ = true;
+    }
+
+    // With mutex_ held: the label, how much is done, and the ratio.
+    std::string head(std::uint64_t done) const
+    {
+        std::string line;
+        if (!label_.empty())
+            line += label_ + ": ";
+        line += human_size(done);
+        if (total_)
+            line += " / " + human_size(total_) + "  " + percent(done);
+        if (data_ && stored_)
+            line += "  " + ratio(data_, stored_);
+        return line;
     }
 
     std::string percent(std::uint64_t done) const
@@ -174,6 +204,8 @@ private:
     std::condition_variable wake_;
     bool stopping_ = false;
     bool shown_ = false;
+    const Clock::time_point start_ = Clock::now();
+    Clock::time_point stage_start_ = start_;
     std::string label_;
     std::uint64_t total_ = 0;
     std::atomic<std::uint64_t> done_ = 0;

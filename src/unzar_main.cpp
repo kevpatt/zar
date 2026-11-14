@@ -395,6 +395,8 @@ int run(Command& cmd)
         }
     }
     const auto stats = extractor.finish();
+    if (progress)
+        progress->finish();
     progress.reset();
     warnings += stats.warnings;
 

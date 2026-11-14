@@ -163,6 +163,8 @@ file data is done, out of how much, the rate, and the time left.
 Only when standard error is a terminal.
 The data is the uncompressed size of what is extracted, tested, or
 scanned.
+When done, the line is left showing the totals, the average rate, and the
+time taken.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

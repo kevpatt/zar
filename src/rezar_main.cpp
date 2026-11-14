@@ -335,6 +335,8 @@ int run(Command& cmd)
     }
     const auto stats = zar::rebuild_archive(out, source, plan.keep, plan.additions, cmd.directory, options);
     out.commit();
+    if (progress)
+        progress->finish();
     progress.reset();
 
     if (cmd.verbose) {

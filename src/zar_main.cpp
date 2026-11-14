@@ -259,6 +259,8 @@ int run(Command& cmd)
     }
     const auto stats = zar::create_archive(out, cmd.inputs, cmd.options);
     out.commit();
+    if (progress)
+        progress->finish();
     progress.reset();
 
     if (cmd.verbose) {

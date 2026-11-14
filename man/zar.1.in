@@ -270,6 +270,8 @@ or
 .Fl \-dict ,
 everything is read more than once, and each pass is labeled; a solid
 archive's trial pass shows no ratio, since it is compressed again as a whole.
+When done, the line is left showing the totals, the average rate, and the
+time taken.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.8.1). All three tools work and are well
+> **Status:** development (0.8.2). All three tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -295,6 +295,13 @@ compressed again as a whole.) With `--solid` or
 error is a terminal, so logs and pipes stay clean, and it steps aside for
 `-v`, listings, and warnings. `unzar` decompresses a solid archive whole
 before anything else, so that part shows no progress.
+
+When the command succeeds, the line is left in place with the final totals
+and ratio, the average rate, and how long the whole run took:
+
+```
+4.0G / 4.0G  100.0%  3.47:1  398.1M/s  in 0:10
+```
 
 ### Options
 
