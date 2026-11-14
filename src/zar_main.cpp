@@ -73,7 +73,8 @@ constexpr std::string_view kUsageTail = R"(      --align[=N]        align block 
                          (default 120; 0 never tries)
   -v, --verbose          list files as they are added, and print a summary
       --progress         show progress on the terminal: how much is done,
-                         the rate, and the time left
+                         the compression ratio so far, the rate, and the
+                         time left
       --help             show this help
       --version          show version information
 

@@ -78,6 +78,9 @@ $ unzar project.zar project/src/main.cpp
 - **Sparse files.** Holes in sparse files, such as disk images, are
   recorded rather than read and stored, and `unzar` recreates them as
   holes, so a mostly empty 100 GB image doesn't take 100 GB to extract.
+- **Disks and progress.** `--read-devices` archives a whole disk as an image
+  file, and `--progress` shows how far along any of the three commands is,
+  with the compression ratio so far.
 - **Alignment.** `--align` places payloads on cache-line or page boundaries,
   and `--contiguous` keeps each file in a single block, so stored data can be
   `mmap`ed straight from the archive. Archives end on the same boundary, so
@@ -184,8 +187,9 @@ zar builds and passes its full test suite on both macOS and Linux: on macOS
 (Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15,
 and CI also builds it with GCC 12 and 13 and with Clang.
 CI (`.github/workflows/ci.yml`) builds and tests every push on Linux
-(x64 and arm64) and macOS, with the sanitizers and a short fuzzing run. It
-also builds the `.deb` and `.rpm` packages and tries them on Debian,
+(x64 and arm64) and macOS, with the sanitizers and a short fuzzing run, and
+archives a real disk with `--read-devices` (a loop device on Linux, a disk
+image on macOS). It also builds the `.deb` and `.rpm` packages and tries them on Debian,
 Ubuntu, AlmaLinux 9 and 10 (for RHEL), Fedora, and openSUSE.
 It uses only POSIX APIs and should build on the BSDs, but those aren't
 tested yet.
@@ -234,6 +238,7 @@ zar follows POSIX path resolution:
 | `notes.txt` | `notes.txt` | `notes.txt` |
 | `link` (a symlink) | the symlink itself | the symlink |
 | `link/` | the directory it points to, named `link` | `link/` |
+| `/dev/sdb`, with `--read-devices` | the disk's contents, as the file `sdb` | `sdb`, an image file |
 
 Without `-o`, the archive is named after the input and written in the
 current directory: `proj`, `proj/`, `proj/.` and `~/src/proj` all produce
@@ -255,7 +260,7 @@ a symlink to one, like Linux's `/dev/disk/by-id/...`) is stored as a file
 holding the disk's contents, named after the input:
 
 ```sh
-sudo zar --read-devices -o usb.zar /dev/sdb    # stored as the file "sdb"
+sudo zar --read-devices --progress -o usb.zar /dev/sdb    # stored as the file "sdb"
 unzar --sparse=auto usb.zar                    # an image file, sparse where it's zeros
 ```
 
@@ -272,17 +277,24 @@ Add `--progress` to see how far along a big disk is.
 of the terminal up to date while they work:
 
 ```
-1.2G / 4.0G  30.0%  412.5M/s  0:07 left
+1.2G / 4.0G  30.0%  3.47:1  412.5M/s  0:07 left
 ```
 
 The amount is file data, uncompressed: read by `zar` (holes included),
 extracted, tested, or scanned by `unzar`, and copied or added by `rezar`. So
 the rate is how fast the files go by, whatever the compression ratio. `zar`
-first adds up the sizes of its inputs to know the total. With `--solid` or
+first adds up the sizes of its inputs to know the total.
+
+`zar` and `rezar` also show the compression ratio so far: all the file data
+written, over the bytes it took, such as `3.47:1`, or `1:1.02` if the
+archive is larger than the data. Holes and duplicates count as data that
+took no space. (A solid archive's trial pass shows no ratio, since it is
+compressed again as a whole.) With `--solid` or
 `--dict`, it reads everything more than once, and labels each pass
 (`solid:`, `dictionary:`, `sampling:`). The line is drawn only when standard
 error is a terminal, so logs and pipes stay clean, and it steps aside for
-`-v`, listings, and warnings.
+`-v`, listings, and warnings. `unzar` decompresses a solid archive whole
+before anything else, so that part shows no progress.
 
 ### Options
 
@@ -312,7 +324,7 @@ error is a terminal, so logs and pipes stay clean, and it steps aside for
 | `--sequence=N`, `--name=TEXT` | with `--sign`: a release number, and what the archive is (a channel, say), both signed |
 | `--keygen=KEYFILE` | make a key pair: `KEYFILE` (secret, mode 0600) and `KEYFILE.pub` |
 | `-v, --verbose` | list files as they are added, and print a summary |
-| `--progress` | show progress on the terminal: how much is done, the rate, and the time left; see [Progress](#progress) |
+| `--progress` | show progress on the terminal: how much is done, the compression ratio, the rate, and the time left; see [Progress](#progress) |
 | `--help`, `--version` | |
 
 Short options can be combined, as in `zar -myv -o all.zar a b`. `-l`'s
@@ -761,8 +773,8 @@ src/
     dictionary.*       collecting samples and training dictionaries
     dedup.*            chunk hashes for deduplication
     thread_pool.*      worker threads and in-flight limits for extraction
-    posix.*            file descriptors, I/O loops, holes, free space,
-                       temporary files, and user lookups
+    posix.*            file descriptors, I/O loops, holes, disk sizes, free
+                       space, temporary files, and user lookups
     output.*           buffered output, temporary files, solid compression
     crc32c.*           CRC-32C, hardware-accelerated
     hash.*             BLAKE3 block hashes

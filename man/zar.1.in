@@ -257,11 +257,19 @@ file data is done, out of how much, the rate, and the time left.
 Only when standard error is a terminal.
 The data is counted as it is read, holes included; the sizes of the
 inputs are added up first, for the total.
+The compression ratio so far is shown too: the file data written, over the
+bytes it took, as in
+.Ql 3.47:1 ,
+or
+.Ql 1:1.02
+if larger.
+Holes and duplicates count as data that took no space.
 With
 .Fl \-solid
 or
 .Fl \-dict ,
-everything is read more than once, and each pass is labeled.
+everything is read more than once, and each pass is labeled; a solid
+archive's trial pass shows no ratio, since it is compressed again as a whole.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version
@@ -351,7 +359,7 @@ Package many small files as compactly as possible, if it comes to at most
 .Dl $ zar --solid=1M config
 .Pp
 Archive a whole USB drive, then extract it as a sparse image file:
-.Dl $ sudo zar --read-devices -o usb.zar /dev/sdb
+.Dl $ sudo zar --read-devices --progress -o usb.zar /dev/sdb
 .Dl $ unzar --sparse=auto usb.zar
 .Pp
 Make a key pair, and sign a release with it:

@@ -65,7 +65,8 @@ constexpr std::string_view kUsage = R"(usage: rezar [options] -o OUTPUT ARCHIVE
                          ARCHIVE are always checked as blocks are copied.
   -v, --verbose          list paths as they are added, and print a summary
       --progress         show progress on the terminal: how much is done,
-                         the rate, and the time left
+                         the compression ratio so far, the rate, and the
+                         time left
       --help             show this help
       --version          show version information
 
