@@ -54,13 +54,20 @@ said "zar -mvyj2 -l3" 'proj\.zar'
 expect 2 "zar without -y" "$zar" -v -o "$archive" "$work/proj"
 said "zar without -y" 'exists'
 
-# A listing on its own only scans.
+# A listing on its own reads only the index: a damaged block goes unnoticed
+# until --scan or -t asks for the blocks to be checked.
 expect 0 "unzar -l" "$unzar" -l "$archive"
 listed "unzar -l"; wrote_nothing "unzar -l"
 expect 0 "unzar --list" "$unzar" --list "$archive"
 listed "unzar --list"; wrote_nothing "unzar --list"
 expect 0 "unzar -lv" "$unzar" -lv "$archive"
-said "unzar -lv" '^scanned '; wrote_nothing "unzar -lv"
+said "unzar -lv" '^listed 2 files'; wrote_nothing "unzar -lv"
+mkdir "$work/big"
+dd if=/dev/urandom of="$work/big/r" bs=1024 count=200 2>/dev/null
+"$zar" -o "$work/damaged.zar" "$work/big" || fail "zar big"
+printf XXXX | dd of="$work/damaged.zar" bs=1 seek=100000 conv=notrunc 2>/dev/null
+expect 0 "unzar -l of a damaged block" "$unzar" -l "$work/damaged.zar"
+expect 1 "unzar -l --scan of a damaged block" "$unzar" -l --scan "$work/damaged.zar"
 
 # -x adds extraction to a listing, and is the default without one.
 expect 0 "unzar -lx" "$unzar" -lx "$archive"

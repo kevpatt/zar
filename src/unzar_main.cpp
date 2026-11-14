@@ -39,9 +39,10 @@ archives created with zar --head-index.
   -C, --directory=DIR    extract into DIR (default: current directory)
   -l, --list             print a listing: each directory on its own line,
                          followed by its files with their size and mtime.
-                         On its own this scans; add -x or -t to extract or
-                         test as well.
-  -x, --extract          extract (the default, except with --list)
+                         On its own this reads only the index, so it's
+                         quick; add --scan, -t, or -x to check, test, or
+                         extract as well.
+  -x, --extract          extract (the default, without --list)
       --scan             check everything except decompression: block and
                          index checksums, sizes, and paths; write nothing
   -t, --test             like --scan, but also decompress and verify data
@@ -73,8 +74,9 @@ archives created with zar --head-index.
       --version          show version information
 
 -x, -t, and --scan choose the mode; give at most one. Without any, unzar
-extracts, or with --list, scans. So `unzar -l` lists an archive while
-checking it, and `unzar -lx` lists it while extracting.
+extracts, or with --list, only lists. So `unzar -l` lists an archive from
+its index, `unzar -l --scan` lists it while checking it, and `unzar -lx`
+lists it while extracting.
 
 Short options can be combined, as in -lxv; -j's count must be attached, as
 in -j4. If PATHs are given, only those entries (and directories' contents)
@@ -90,6 +92,7 @@ struct Command {
     std::string archive;
     std::vector<std::string> selections;
     bool list = false;
+    bool index_only = false;    // -l alone: list from the index, read no blocks
     bool verbose = false;
     bool progress = false;
     bool human = false;
@@ -179,7 +182,9 @@ std::optional<Command> parse(int argc, char** argv)
             throw UsageError("");
         }
     }
-    // A listing on its own shouldn't write anything.
+    // A listing on its own reads only the index: add --scan or -t to check
+    // the blocks too.
+    cmd.index_only = cmd.list && !mode;
     cmd.options.mode = mode.value_or(cmd.list ? zar::ExtractMode::Scan : zar::ExtractMode::Extract);
     if (optind >= argc)
         throw UsageError("no archive given");
@@ -343,6 +348,21 @@ void print_signature(const zar::SignatureBlock& signature, const Command& cmd)
     std::cout << '\n';
 }
 
+// -v's summary, in one piece, after the listing, so it doesn't land in the
+// middle of it when stdout and stderr share a terminal. A listing from the
+// index alone checked nothing, so it doesn't claim to have found no problems.
+void print_summary(std::string_view verb, const zar::ExtractStats& stats, std::uint64_t warnings,
+                   const Command& cmd)
+{
+    const auto bytes = cmd.human ? zar::cli::human_size(stats.bytes) : std::to_string(stats.bytes) + " bytes";
+    std::ostringstream summary;
+    summary << verb << ' ' << stats.files << " files, " << stats.directories << " directories, "
+            << stats.symlinks << " symlinks, " << stats.hardlinks << " hard links (" << bytes << ")"
+            << (warnings || cmd.index_only ? "" : "; no problems found") << '\n';
+    std::cout.flush();
+    std::cerr << summary.str();
+}
+
 int run(Command& cmd)
 {
     std::uint64_t warnings = 0;    // besides the extractor's, which it counts
@@ -366,6 +386,32 @@ int run(Command& cmd)
         if (!matched.contains(s))
             warn(s + ": not found in archive");
 
+    const auto groups = zar::group_by_directory(chosen);
+    Listing listing(cmd.verbose, cmd.human);
+    if (cmd.index_only) {
+        zar::ExtractStats stats;
+        for (const auto& group : groups) {
+            listing.directory(group);
+            if (group.entry)
+                ++stats.directories;
+            for (const auto* entry : group.members) {
+                listing.member(*entry);
+                switch (entry->type) {
+                case zar::EntryType::File:
+                    ++stats.files;
+                    stats.bytes += entry->size.value_or(0);
+                    break;
+                case zar::EntryType::Symlink: ++stats.symlinks; break;
+                case zar::EntryType::Hardlink: ++stats.hardlinks; break;
+                default: break;
+                }
+            }
+        }
+        if (cmd.verbose)
+            print_summary("listed", stats, warnings, cmd);
+        return warnings ? 1 : 0;
+    }
+
     // File data to get through: hard links are copies unless made as links.
     using zar::cli::Progress;
     std::optional<Progress> progress;
@@ -380,8 +426,6 @@ int run(Command& cmd)
         cmd.options.on_progress = [&progress](std::uint64_t bytes) { progress->add(bytes); };
     }
 
-    const auto groups = zar::group_by_directory(chosen);
-    Listing listing(cmd.verbose, cmd.human);
     zar::Extractor extractor(reader, cmd.options);
     extractor.prepare(groups);
     for (const auto& group : groups) {
@@ -400,22 +444,11 @@ int run(Command& cmd)
     progress.reset();
     warnings += stats.warnings;
 
-    if (cmd.verbose) {
-        const char* verb = cmd.options.mode == zar::ExtractMode::Extract ? "extracted"
-                           : cmd.options.mode == zar::ExtractMode::Test  ? "tested"
-                                                                         : "scanned";
-        const auto bytes = cmd.human ? zar::cli::human_size(stats.bytes)
-                                     : std::to_string(stats.bytes) + " bytes";
-        // In one piece, after the listing, so it doesn't land in the middle
-        // of it when stdout and stderr share a terminal.
-        std::ostringstream summary;
-        summary << verb << ' ' << stats.files << " files, " << stats.directories
-                << " directories, " << stats.symlinks << " symlinks, " << stats.hardlinks
-                << " hard links (" << bytes << ")"
-                << (warnings ? "" : "; no problems found") << '\n';
-        std::cout.flush();
-        std::cerr << summary.str();
-    }
+    if (cmd.verbose)
+        print_summary(cmd.options.mode == zar::ExtractMode::Extract ? "extracted"
+                      : cmd.options.mode == zar::ExtractMode::Test  ? "tested"
+                                                                    : "scanned",
+                      stats, warnings, cmd);
     return warnings ? 1 : 0;
 }
 

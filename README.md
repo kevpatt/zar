@@ -350,23 +350,25 @@ chunk that zstd fails to shrink is stored as-is.
 unzar proj.zar                    # extract into the current directory
 unzar -C /tmp/out proj.zar        # extract elsewhere
 unzar proj.zar proj/src           # extract one directory (or file)
-unzar -lh proj.zar                # list, checking the archive, sizes like 1.5M
+unzar -lh proj.zar                # list from the index, sizes like 1.5M
+unzar -l --scan proj.zar          # list, checking every block
 unzar -lx proj.zar                # list while extracting
 unzar --test proj.zar             # decompress and verify everything
 unzar -y --dirs=replace proj.zar  # replace an earlier extraction
 ```
 
-`unzar` runs in one of three modes, and `--list` combines with any of them:
+`unzar` runs in one of three modes, and `--list` combines with any of them, or lists alone:
 
 | Mode | Reads data | Decompresses | Writes files |
 |---|---|---|---|
 | `-x, --extract` (default) | ✅ | ✅ | ✅ |
 | `-t, --test` | ✅ | ✅ | ❌ |
-| `--scan` (default with `--list`) | ✅ | ❌ | ❌ |
+| `--scan` | ✅ | ❌ | ❌ |
 
-Give at most one mode. A listing on its own never writes anything:
-`unzar -l` lists and scans, `unzar -lt` lists and tests, and `unzar -lx`
-lists and extracts. Short options can be combined, as in `-lxv`; `-j`'s
+Give at most one mode. A listing on its own reads only the index, so
+`unzar -l` is quick even on a terabyte archive across a network, and checks
+only the index. `unzar -l --scan` lists and scans, `unzar -lt` lists and
+tests, and `unzar -lx` lists and extracts. Short options can be combined, as in `-lxv`; `-j`'s
 count must be attached, as in `-j4`.
 
 `--scan` still checks every block's checksums and every chunk's recorded
@@ -394,7 +396,7 @@ src/sub/
 | Option | Meaning |
 |---|---|
 | `-C, --directory=DIR` | extract into DIR (created if needed) |
-| `-l, --list` | print a listing as entries are processed; on its own, scans rather than extracting |
+| `-l, --list` | print a listing as entries are processed; on its own, reads only the index |
 | `-x, --extract` | extract (the default, except with `--list`) |
 | `--scan` | check checksums, sizes, and paths without decompressing; write nothing |
 | `-t, --test` | like `--scan`, but also decompress and verify all data |

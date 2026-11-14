@@ -52,10 +52,14 @@ Without any,
 .Nm
 extracts, or with
 .Fl \-list ,
-scans: so
+only lists, reading nothing but the archive's index, which is quick even
+for a huge archive: so
 .Nm
 .Fl l
-lists an archive without writing anything, and
+lists an archive,
+.Nm
+.Fl l \-scan
+lists it while checking every block, and
 .Nm
 .Fl lx
 lists it while extracting.
@@ -77,9 +81,11 @@ Print a listing: each directory on its own line, followed by its files with
 their size and modification time, separated by tabs.
 Control characters, backslashes, and bytes of names that aren't UTF-8 are
 escaped.
+On its own, it reads only the index; the index's checksums are checked,
+but not the blocks'.
 .It Fl x , Fl \-extract
 Extract.
-This is the default except with
+This is the default, without
 .Fl l .
 .It Fl \-scan
 Check everything except decompression: block and index checksums, sizes,
