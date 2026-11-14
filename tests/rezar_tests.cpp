@@ -386,12 +386,19 @@ TEST(progress_adds_up_to_the_measured_total)
     CHECK(measure_inputs(std::vector{src / "."}, false) == total);
     CHECK(measure_inputs(std::vector{src / "small", src / "missing"}, false) == 5);
 
-    // Every pass, trial ones included, reads it all.
-    for (const bool small : {false, true}) {
+    // Every pass, trial ones included, reads it all. (Whether a dictionary
+    // can be trained on so little depends on the zstd version, so these
+    // passes don't depend on it.)
+    enum Kind { Plain, Solid, Dict };
+    for (const auto kind : {Plain, Solid, Dict}) {
         CreateOptions options;
         options.chunk_size = 64 << 10;
-        if (small)
-            options.solid_limit = 1 << 30;    // a solid pass, then a dictionary one
+        if (kind == Solid) {
+            options.solid_limit = 1 << 30;    // kept: it fits
+            options.dict_over_solid = 0;
+        }
+        if (kind == Dict)
+            options.dict_size = 4 << 10;    // a sampling pass, then the archive
         std::vector<std::pair<std::string, std::uint64_t>> passes;
         std::pair<std::uint64_t, std::uint64_t> written{};    // the last report
         options.on_stage = [&](std::string_view stage) { passes.emplace_back(stage, 0); written = {}; };
@@ -401,14 +408,19 @@ TEST(progress_adds_up_to_the_measured_total)
             written = {data, stored};
         };
         make_archive(tmp.path() / "a.zar", src, options);
-        CHECK(passes.size() == (small ? 2u : 1u));
-        for (const auto& [stage, bytes] : passes)
-            CHECK(bytes == total);
-        // Every byte read is written; the hole and the duplicate take nothing.
-        CHECK(written.first == total);
-        CHECK(written.second > 250'000 && written.second < 400'000);
-        if (small)
-            CHECK(passes[0].first == "solid" && passes[1].first == "dictionary");
+        const std::vector<std::string> expected = kind == Plain   ? std::vector<std::string>{""}
+                                                  : kind == Solid ? std::vector<std::string>{"solid"}
+                                                                  : std::vector<std::string>{"sampling", ""};
+        CHECK(passes.size() == expected.size());
+        for (std::size_t i = 0; i < passes.size() && i < expected.size(); ++i)
+            CHECK(passes[i].first == expected[i] && passes[i].second == total);
+        if (kind == Solid) {
+            CHECK(written.first == 0);    // no ratio: it's compressed again as a whole
+        } else {
+            // Every byte read is written; the hole and the duplicate take nothing.
+            CHECK(written.first == total);
+            CHECK(written.second > 250'000 && written.second < 400'000);
+        }
     }
     make_archive(tmp.path() / "a.zar", src, {});
 
