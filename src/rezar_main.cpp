@@ -52,8 +52,9 @@ constexpr std::string_view kUsage = R"(usage: rezar [options] -o OUTPUT ARCHIVE
                          default); deep also reuses identical blocks already
                          in the archive, decompressing those of the same
                          length to compare them
-      --align[=N]        align block payloads to N bytes (default: as in
-                         ARCHIVE; with no N, the CPU's cache-line size)
+      --align[=N]        align block payloads, and the archive's end, to N
+                         bytes (default: as in ARCHIVE; with no N, the CPU's
+                         cache-line size)
       --head-index[=on|off]
                          also put the index at the front, so the archive
                          can be extracted from a pipe (default: as in

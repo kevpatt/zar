@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.7.1). Both tools work and are well
+> **Status:** development (0.7.2). Both tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -80,7 +80,9 @@ $ unzar project.zar project/src/main.cpp
   holes, so a mostly empty 100 GB image doesn't take 100 GB to extract.
 - **Alignment.** `--align` places payloads on cache-line or page boundaries,
   and `--contiguous` keeps each file in a single block, so stored data can be
-  `mmap`ed straight from the archive.
+  `mmap`ed straight from the archive. Archives end on the same boundary, so
+  ones concatenated end to end (appended to a boot image, say) stay aligned,
+  and each can be found from the end by following its trailer back.
 - **Safe extraction.** No absolute paths, no `..`, no writing through
   symlinks, nothing overwritten without `-y`, and an optional cap on how
   much will be decompressed.
@@ -253,7 +255,7 @@ nanosecond timestamps, and access, change, and birth times are opt-in.
 | `-l, --level=N` | zstd compression level (default 3) |
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--chunk-size=SIZE` | split files into independently compressed chunks of SIZE bytes: a power of two from 4K to 1G, with an optional `K`, `M`, or `G` suffix (default 1M) |
-| `--align[=N]` | align block payloads to N bytes; with no N, the CPU's cache-line size. The default is 8. N must be a power of two up to 1M; values below 8 pack tighter but leave fields unaligned. |
+| `--align[=N]` | align block payloads to N bytes; with no N, the CPU's cache-line size. The default is 8. N must be a power of two up to 1M; values below 8 pack tighter but leave fields unaligned. The archive's length is a multiple of N too, so concatenated archives stay aligned. |
 | `--owner[=WHICH]` | store ownership: `ids`, `names`, or `both` (the default when given); omitted otherwise |
 | `--nsec` | store the sub-second part of timestamps |
 | `--all-times` | store access, status-change, and birth times as well as modification time |

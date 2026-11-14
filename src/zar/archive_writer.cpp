@@ -22,13 +22,25 @@ constexpr std::uint64_t alignment_of(const ArchiveHeader& header) noexcept
     return std::uint64_t{1} << header.align_log2;
 }
 
+// Where a trailer goes when the archive so far ends at `relative`: the
+// first place, aligned to min(A, 8) as §5.1 requires, that also makes the
+// archive end at a multiple of `end_alignment` (at least that), so archives
+// concatenated end to end stay aligned (§2.1).
+constexpr std::uint64_t trailer_position(std::uint64_t relative, std::uint64_t alignment,
+                                         std::uint64_t end_alignment) noexcept
+{
+    const auto unit = std::max(end_alignment, std::min<std::uint64_t>(alignment, 8));
+    return round_up(relative + kTrailerSize, unit) - kTrailerSize;
+}
+
 // Ends an archive with a trailer (§5.1). `base` and `header` are the output
-// positions of the base and of the zar header.
+// positions of the base and of the zar header, which are a multiple of
+// `alignment` apart.
 void write_trailer(Output& out, std::uint64_t base, std::uint64_t header, std::int64_t root,
-                   std::uint64_t alignment)
+                   std::uint64_t alignment, std::uint64_t end_alignment)
 {
     const auto relative = out.position() - base;
-    const auto trailer_at = round_up(relative, std::min<std::uint64_t>(alignment, 8));
+    const auto trailer_at = trailer_position(relative, alignment, end_alignment);
     out.write_zeros(static_cast<std::size_t>(trailer_at - relative));
 
     std::uint8_t payload[16];
@@ -46,7 +58,7 @@ void write_trailer(Output& out, std::uint64_t base, std::uint64_t header, std::i
 
 } // namespace
 
-void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc)
+void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc, std::uint8_t end_align_log2)
 {
     const auto start = out.position();
     ArchiveHeader header;
@@ -61,13 +73,16 @@ void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc)
     out.write(block.encode());
     frame.copy_to(out);
 
-    write_trailer(out, start, start, header.index_offset, alignment_of(header));
+    write_trailer(out, start, start, header.index_offset, alignment_of(header),
+                  std::uint64_t{1} << end_align_log2);
 }
 
-std::uint64_t solid_archive_size(std::uint64_t frame_size)
+std::uint64_t solid_archive_size(std::uint64_t frame_size, std::uint8_t end_align_log2)
 {
-    // As in write_trailer(), with the default alignment.
-    return round_up(2 * kHeaderSize + frame_size, 8) + kTrailerSize;
+    // As in write_solid_archive(), whose header has the default alignment.
+    return trailer_position(2 * kHeaderSize + frame_size, std::uint64_t{1} << kAlignLog2Default,
+                            std::uint64_t{1} << end_align_log2) +
+           kTrailerSize;
 }
 
 ArchiveWriter::ArchiveWriter(Output& out, std::uint8_t align_log2, bool head_index)
@@ -142,7 +157,7 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index, const SignRoot&
 
     if (!spool_) {
         const auto root = write_root();
-        write_trailer(out_, origin_, start_, root, alignment());
+        write_trailer(out_, origin_, start_, root, alignment(), alignment());
         if (out_.seekable()) {
             header_.index_offset = root;
             out_.write_at(start_, header_.encode());
@@ -188,7 +203,7 @@ void ArchiveWriter::finish(BlockType index_type, ByteView index, const SignRoot&
     origin_ = start_ + base;
 
     const auto tail = write_root();    // the second copy (§5.2)
-    write_trailer(out_, origin_, start_, tail, alignment());
+    write_trailer(out_, origin_, start_, tail, alignment(), alignment());
 }
 
 } // namespace zar

@@ -62,9 +62,11 @@ private:
 // Writes a solid archive (§5.5): a zar header, one ARCHIVE_ZSTD block whose
 // payload is `frame` (a compressed archive, with the given CRC), and a
 // trailer. The header points at the block, so it can be read from a pipe.
-void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc);
+// The archive ends at a multiple of 1 << end_align_log2 (and of 8), like a
+// normal archive with that alignment, though its own alignment is the default.
+void write_solid_archive(Output& out, Output& frame, std::uint32_t frame_crc, std::uint8_t end_align_log2);
 
 // The size of what write_solid_archive() writes for a frame of this size.
-std::uint64_t solid_archive_size(std::uint64_t frame_size);
+std::uint64_t solid_archive_size(std::uint64_t frame_size, std::uint8_t end_align_log2);
 
 } // namespace zar

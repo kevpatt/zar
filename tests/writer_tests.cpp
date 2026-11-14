@@ -6,10 +6,12 @@
 #include "check.hpp"
 #include "util.hpp"
 
+#include "zar/archive_reader.hpp"
 #include "zar/crc32c.hpp"
 #include "zar/creator.hpp"
 #include "zar/dictionary.hpp"
 #include "zar/index.hpp"
+#include "zar/signing.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -215,6 +217,125 @@ TEST(writer_aligns_payloads)
         for (const auto& [path, entry] : archive.entries)
             for (const auto offset : entry.chunks)
                 CHECK((offset + 32) % (1 << log2) == 0);
+    }
+}
+
+// Every kind of archive ends at a multiple of its alignment, so archives
+// concatenated end to end stay aligned (§2.1), with the trailer still last.
+TEST(archives_end_on_their_alignment)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "in/a", random_bytes(5000, 1));
+    write_file(tmp.path() / "in/b", text("small"));
+    const auto path = tmp.path() / "out.zar";
+    std::array<std::uint8_t, 32> seed{};
+    seed.fill(7);
+
+    for (const int log2_int : {0, 2, 3, 4, 5, 6, 12}) {
+        const auto log2 = static_cast<std::uint8_t>(log2_int);
+        // plain, head index, signed with a head index, solid, signed,
+        // hashed: the signature or index is the last block before the trailer.
+        for (const int kind : {0, 1, 2, 3, 4, 5}) {
+            CreateOptions options;
+            options.align_log2 = log2;
+            options.head_index = kind == 1 || kind == 2;
+            options.hash = kind == 5;
+            if (kind == 2 || kind == 4) {
+                options.sign.push_back(SecretKey::from_seed(seed));
+                options.sign_time = 1'800'000'000;
+            }
+            if (kind == 3)
+                options.solid_limit = 1 << 20;
+            auto out = Output::create_file(path, true);
+            const auto stats = create_archive(out, std::vector{tmp.path() / "in" / "."}, options);
+            out.commit();
+            CHECK(stats.solid == (kind == 3));
+
+            const auto bytes = read_file(path);
+            CHECK(bytes.size() % (std::uint64_t{1} << log2) == 0);
+            const auto trailer_at = bytes.size() - kTrailerSize;
+            CHECK(trailer_at % std::min<std::uint64_t>(std::uint64_t{1} << log2, 8) == 0);
+            CHECK(load_le<std::uint16_t>(&bytes[trailer_at]) == static_cast<std::uint16_t>(BlockType::Trailer));
+            CHECK(load_le<std::uint64_t>(&bytes[bytes.size() - 8]) == trailer_at);
+            const auto reader = ArchiveReader::open(path);
+            CHECK(reader.entries().size() == 2);
+            CHECK(reader.signature().has_value() == (kind == 2 || kind == 4));
+        }
+    }
+}
+
+// Archives appended to an image (a kernel with drivers, say) can be found
+// from the end: each trailer leads to its zar header, which is where the
+// archive before it ends.
+TEST(concatenated_archives_can_be_found_from_the_end)
+{
+    TempDir tmp;
+    write_file(tmp.path() / "one/x", random_bytes(3000, 2));
+    write_file(tmp.path() / "two/y", text("second"));
+    write_file(tmp.path() / "three/z", random_bytes(70'000, 3));
+    std::array<std::uint8_t, 32> seed{};
+    seed.fill(9);
+
+    Bytes image = random_bytes(4096, 4);    // the "kernel", padded to the alignment
+    std::vector<std::uint64_t> starts;
+    for (const auto* dir : {"one", "two", "three"}) {
+        CreateOptions options;
+        options.align_log2 = 5;
+        if (std::string_view(dir) == "two") {    // a head index and a signature
+            options.head_index = true;
+            options.sign.push_back(SecretKey::from_seed(seed));
+            options.sign_time = 1'800'000'000;
+        }
+        if (std::string_view(dir) == "three")
+            options.solid_limit = 1 << 20;
+        const auto path = tmp.path() / (std::string(dir) + ".zar");
+        auto out = Output::create_file(path, true);
+        create_archive(out, std::vector{tmp.path() / dir / "."}, options);
+        out.commit();
+        starts.push_back(image.size());
+        const auto bytes = read_file(path);
+        image.insert(image.end(), bytes.begin(), bytes.end());
+    }
+
+    // Walk back from the end using only the format: the trailer's
+    // header_distance, then both CRCs and the trailer's own offset.
+    std::vector<std::uint64_t> found;
+    auto end = image.size();
+    while (end >= kHeaderSize + kTrailerSize) {
+        const auto trailer_at = end - kTrailerSize;
+        const auto distance = load_le<std::uint64_t>(&image[end - 8]);
+        if (distance < kHeaderSize || distance > trailer_at)
+            break;
+        const auto start = trailer_at - distance;
+        try {
+            HeaderBytes h;
+            std::copy_n(image.begin() + static_cast<std::ptrdiff_t>(start), kHeaderSize, h.begin());
+            const auto header = ArchiveHeader::decode(h);
+            std::copy_n(image.begin() + static_cast<std::ptrdiff_t>(trailer_at), kHeaderSize, h.begin());
+            const auto trailer = BlockHeader::decode(
+                h, static_cast<std::int64_t>(distance) - static_cast<std::int64_t>(header.base_offset));
+            const ByteView payload(&image[trailer_at + kHeaderSize], 16);
+            if (trailer.type != BlockType::Trailer || crc32c(payload) != trailer.payload_crc)
+                break;
+        } catch (const FormatError&) {
+            break;
+        }
+        found.push_back(start);
+        end = start;
+    }
+    CHECK(end == 4096);    // stopped at the kernel
+    CHECK(found == std::vector<std::uint64_t>(starts.rbegin(), starts.rend()));
+    for (const auto start : found)
+        CHECK(start % 32 == 0);
+
+    // A reader given the image up to the end of an archive finds that one.
+    const auto names = std::vector<std::string>{"x", "y", "z"};
+    for (std::size_t i = 0; i < starts.size(); ++i) {
+        const auto stop = i + 1 < starts.size() ? starts[i + 1] : image.size();
+        const auto path = tmp.path() / "image";
+        write_file(path, Bytes(image.begin(), image.begin() + static_cast<std::ptrdiff_t>(stop)));
+        const auto reader = ArchiveReader::open(path);
+        CHECK(reader.entries().size() == 1 && reader.entries()[0].path == names[i]);
     }
 }
 

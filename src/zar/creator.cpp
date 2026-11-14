@@ -915,7 +915,7 @@ std::optional<SolidFrame> try_solid(Output& out, std::span<const InputSpec> spec
     inner.align_log2 = 0;    // padding would only be compressed away
     inner.head_index = false;
     // The limit is on the whole archive: the frame plus its framing.
-    const auto overhead = solid_archive_size(0);
+    const auto overhead = solid_archive_size(0, options.align_log2);
     const auto limit = *options.solid_limit;
     if (limit <= overhead)
         return std::nullopt;
@@ -928,7 +928,7 @@ std::optional<SolidFrame> try_solid(Output& out, std::span<const InputSpec> spec
     } catch (const SizeLimitExceeded&) {
         return std::nullopt;
     }
-    if (solid_archive_size(solid.frame.position()) > limit)    // rounding in the framing
+    if (solid_archive_size(solid.frame.position(), options.align_log2) > limit)    // rounding in the framing
         return std::nullopt;
     return solid;
 }
@@ -944,7 +944,7 @@ std::optional<CreateStats> try_small(Output& out, std::span<const InputSpec> spe
     if (!solid)
         return std::nullopt;
 
-    const auto solid_size = solid_archive_size(solid->frame.position());
+    const auto solid_size = solid_archive_size(solid->frame.position(), options.align_log2);
     const auto dict = options.dict_over_solid
                           ? samples.train(options.dict_size.value_or(kDefaultDictSize))
                           : std::nullopt;
@@ -961,7 +961,7 @@ std::optional<CreateStats> try_small(Output& out, std::span<const InputSpec> spe
         }
     }
 
-    write_solid_archive(out, solid->frame, solid->crc);
+    write_solid_archive(out, solid->frame, solid->crc, options.align_log2);
     solid->reports.replay(options);
     solid->stats.solid = true;
     solid->stats.archive_bytes = out.position();

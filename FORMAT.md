@@ -53,6 +53,10 @@ only when explicitly asked to, trading alignment for slightly tighter packing.
   up to 32 bytes.
 - Gaps between blocks are filled with zero bytes.
 - The trailer (§5) is aligned to `min(A, 8)`.
+- A writer should end the archive at a multiple of `A`, by leaving a gap
+  before the trailer, not padding after it. Archives concatenated end to end
+  then all stay aligned, provided the first starts at a multiple of `A`,
+  and each is still well-formed from its first byte to its last (§5.1).
 
 Larger alignments let a reader load headers and payloads straight into
 aligned memory: 64 or 128 bytes matches common cache-line sizes, and 4096
@@ -165,6 +169,14 @@ trailer. Because the trailer records `header_distance`, a reader can find an
 archive from the end of a file even when other data precedes it. Such a
 reader checks the trailer's `header_crc`, follows `header_distance` to the
 zar header, validates that, and then checks the trailer's `offset`.
+
+The same steps find archives concatenated end to end, such as several
+appended to a boot image: the zar header found from the last trailer is
+where the archive before it ends, so its trailer is the 48 bytes before
+that header. Walking back stops when those bytes fail the checks above, or
+at a limit the reader already knows, such as the end of the image proper.
+A reader given the whole file finds only the last archive this way, and
+one that finds a zar header at the start of the file uses that archive.
 
 ### 5.2 Index copies
 

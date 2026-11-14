@@ -118,6 +118,9 @@ bytes, a power of two up to 1M.
 The default is 8; without
 .Ar n ,
 the CPU's cache-line size.
+The archive's length is a multiple of
+.Ar n
+too, so archives concatenated end to end stay aligned.
 .It Fl \-owner Ns Op = Ns Ar which
 Store file ownership:
 .Cm ids ,

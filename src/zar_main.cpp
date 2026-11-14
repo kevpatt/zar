@@ -47,8 +47,9 @@ PATH is stored under its own name, so extracting recreates it:
 )";
 
 // After the options shared with rezar.
-constexpr std::string_view kUsageTail = R"(      --align[=N]        align block payloads to N bytes (default 8; with no
-                         N, the CPU's cache-line size)
+constexpr std::string_view kUsageTail = R"(      --align[=N]        align block payloads, and the archive's end, to N
+                         bytes (default 8; with no N, the CPU's cache-line
+                         size)
       --dedup=on|off     store identical chunks only once (default: on,
                          except when writing to a pipe without --head-index)
       --dict[=SIZE]      train a zstd dictionary of at most SIZE bytes
