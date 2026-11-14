@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.7.2). Both tools work and are well
+> **Status:** development (0.7.2). All three tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -89,7 +89,8 @@ $ unzar project.zar project/src/main.cpp
 - **Predictable inputs.** `proj`, `proj/` and `proj/.` follow POSIX path
   resolution, so it's always clear what gets stored.
 - **Deterministic.** Entries are stored in sorted order, so archiving the
-  same files with the same options gives the same archive.
+  same files with the same options gives the same archive. (A signature
+  also records when it was made; set `SOURCE_DATE_EPOCH` to fix that.)
 - **Open format.** The format is [fully specified](FORMAT.md) and small
   enough to reimplement.
 
@@ -180,7 +181,8 @@ package of the same files, under `/usr`, like those on the releases page
 (they need `dpkg-dev` or `rpm-build`).
 
 zar builds and passes its full test suite on both macOS and Linux: on macOS
-(Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15.
+(Apple Silicon) with Apple Clang 17 and GCC 16, and on Linux with GCC 15,
+and CI also builds it with GCC 12 and 13 and with Clang.
 CI (`.github/workflows/ci.yml`) builds and tests every push on Linux
 (x64 and arm64) and macOS, with the sanitizers and a short fuzzing run. It
 also builds the `.deb` and `.rpm` packages and tries them on Debian,
@@ -346,7 +348,7 @@ src/sub/
 | `-j, --threads[=N]` | worker threads (default: one per CPU core) |
 | `--max-size=SIZE` | refuse to decompress more than SIZE bytes in all (e.g. `10G`); without it, the limit is the free space where the data would go |
 | `-h, --human-readable` | show sizes as `512`, `1.0K`, `31.4M`, `2.0G`, … |
-| `-v, --verbose` | add permissions and owner to the listing; print a summary |
+| `-v, --verbose` | add permissions and owner to the listing, and a signed archive's signature and signers before it; print a summary |
 | `--help`, `--version` | |
 
 ### Exit status
@@ -436,7 +438,7 @@ and compresses it whole, as one stream. If the result is at most SIZE bytes,
 that's the archive. If it grows past SIZE, zar abandons the attempt right
 then and writes a normal archive instead, so the attempt never costs more
 than SIZE bytes of output. Options like `--align` then apply to the normal
-archive.
+archive; a solid one only ends on that boundary.
 
 | Files | Normal | Solid |
 |---|---|---|
@@ -561,6 +563,13 @@ Archives without a head index can still be extracted from a pipe if you save
 them to a file first. If standard input is a redirected file
 (`unzar - < proj.zar`), `unzar` reads it directly.
 
+An archive needn't start at the beginning of its file. If it follows other
+data, such as a boot image it was appended to, `unzar` finds it from the
+trailer at the end, which records where the archive starts. Of several
+archives appended one after another, that finds the last; each one's start
+is where the one before it ends, so a loader can walk back through them all
+(FORMAT.md §5.1).
+
 ## Hashes and signatures
 
 ```sh
@@ -653,9 +662,9 @@ detects accidental damage, not tampering; for that, sign archives (see
 The format is specified in [FORMAT.md](FORMAT.md). In outline:
 
 ```
-+------------+---------+---------+-----+-------+---------+
-| zar header | block 0 | block 1 | ... | index | trailer |
-+------------+---------+---------+-----+-------+---------+
++------------+---------+---------+-----+-------+-------------+---------+
+| zar header | block 0 | block 1 | ... | index | [signature] | trailer |
++------------+---------+---------+-----+-------+-------------+---------+
    32 bytes    32-byte header + payload in every block
 ```
 
@@ -664,15 +673,17 @@ The format is specified in [FORMAT.md](FORMAT.md). In outline:
 - Everything else is a **block**: a 32-byte header (type, size, its own
   offset, and CRCs of both the header and the payload) followed by the
   payload. Blocks hold file data (compressed or stored), indexes,
-  dictionaries, or a whole compressed archive. A chunk of a sparse file's
-  hole has no block at all.
+  dictionaries, a whole compressed archive, or a signature. A chunk of a
+  sparse file's hole has no block at all.
 - The **index** lists every entry as a path plus optional, typed metadata
   fields, so new fields can be added without breaking older readers. Large
   directories can be split into sub-indexes.
 - A **trailer** at the end points to the index, so archives can be written
-  in one pass, even to a pipe.
+  in one pass, even to a pipe, and back to the zar header, so an archive can
+  be found from the end of a file.
 
-All integers are little-endian, all checksums CRC-32C, and all offsets
+All integers are little-endian, all checksums CRC-32C (with optional BLAKE3
+hashes for tampering), and all offsets
 relative to a movable base, so an index can be added at the front of an
 existing archive without changing any other offset.
 
@@ -683,8 +694,12 @@ existing archive without changing any other offset.
 CMakeLists.txt         the build, and .deb and .rpm packaging (cpack)
 FORMAT.md              the archive format specification
 LICENSE.txt            BSD 3-Clause
+PROPOSAL-signing.md    the design of hashes and signatures, and how it differs
+                       from what was built
 TODO.md                planned work
 cmake/build_info.cmake records the git revision and build time
+cmake/crypto.cmake     builds the bundled BLAKE3 and Monocypher, or finds
+                       installed ones
 man/                   manual pages for zar(1), unzar(1), and rezar(1)
 src/
   zar_main.cpp         the zar command
@@ -751,12 +766,16 @@ it has no install rules, and its commands must not be used.
 
 ## Roadmap
 
-See [TODO.md](TODO.md). The main plans are aimed at using zar as an
-application bundle format, read in place by a loader:
+See [TODO.md](TODO.md). The main plans:
 
-- storing libraries uncompressed, so their single, page-aligned blocks can
-  be `mmap`ed,
-- reproducible timestamps.
+- **Application bundles** read in place by a loader: storing libraries
+  uncompressed, so their single, page-aligned blocks can be `mmap`ed, and
+  reproducible timestamps.
+- **Mounting** an archive read-only with FUSE, decompressing only what's
+  read.
+- **Encryption**, with AEAD per block, so contents are private as well as
+  signed.
+- **Appending** to an archive in place, instead of writing a new one.
 
 ## License
 

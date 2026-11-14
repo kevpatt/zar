@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd November 10, 2026
+.Dd November 14, 2026
 .Dt ZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -183,7 +183,7 @@ A solid archive compresses many small files better, but can't be read at
 random: listing or extracting one file decompresses everything before it.
 Otherwise a normal archive is written, and
 .Fl \-align
-applies only then.
+applies to it fully; a solid archive only ends on that boundary.
 .It Fl \-dict-over-solid Ns = Ns Ar percent
 When the solid archive fits, also try a normal archive compressed with a
 dictionary, and keep it instead if it is at most
@@ -225,9 +225,13 @@ to
 Neither may exist yet, unless
 .Fl y
 is given.
+The public key's fingerprint is printed, to compare with what
+.Nm unzar Fl lv
+shows.
 .It Fl v , Fl \-verbose
 List each path on standard error as it is added, and print a summary at the
-end, including how much data was deduplicated or in holes.
+end, including how much data was deduplicated or in holes, and whether the
+archive was hashed or signed.
 .It Fl \-help
 Show a summary of the options.
 .It Fl \-version

@@ -168,7 +168,9 @@ is writing to a pipe, sets the header's `index_offset` to -1 and writes a
 trailer. Because the trailer records `header_distance`, a reader can find an
 archive from the end of a file even when other data precedes it. Such a
 reader checks the trailer's `header_crc`, follows `header_distance` to the
-zar header, validates that, and then checks the trailer's `offset`.
+zar header, validates that, and then checks the trailer's `offset`. A writer
+should write a trailer even when it can fill in the header, so that every
+archive can be found this way.
 
 The same steps find archives concatenated end to end, such as several
 appended to a boot image: the zar header found from the last trailer is
@@ -197,7 +199,10 @@ index, and a new trailer after the old end of the archive. It must also
 rewrite the 32-byte zar header in place, setting `index_offset` to -1 or to
 the new index. Superseded blocks, including the old trailer, become
 unreferenced data. An appended archive has a new root, so a signed archive
-must be signed again (§5.6).
+must be signed again (§5.6). A head index (§5.4) no longer matches the new
+root, so the header must not point at it, and the archive can't be read
+from a stream until it is rewritten. As always, the new trailer should end
+the archive at a multiple of `A` (§2.1).
 
 ### 5.4 Head index and streaming
 
@@ -573,6 +578,10 @@ is promised, and a minor version may add things older readers must reject.
 
 Changes in recent versions:
 
+- **0.6.0, later** — a writer should end an archive at a multiple of `A`
+  (§2.1) and always write a trailer, so archives concatenated end to end
+  stay aligned and can be found from the end (§5.1). Nothing changes for
+  readers.
 - **0.6.0** — hashes and signatures: the CHUNK_HASHES, DICT_HASH, and
   SUBINDEX_HASH fields (§6.5, §6.7), which older readers skip, and the
   SIGNATURE block (§5.6), which as a root older readers reject.

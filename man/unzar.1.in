@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd November 10, 2026
+.Dd November 14, 2026
 .Dt UNZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -23,6 +23,12 @@ is
 it is read from standard input: at random if that is a file, otherwise as
 a stream, which works for archives made with
 .Nm zar Fl \-head-index .
+.Pp
+An archive needn't start at the beginning of its file: if it follows other
+data, such as a boot image it was appended to,
+.Nm
+finds it from the trailer at its end.
+Of several archives appended one after another, that is the last.
 .Pp
 If any
 .Ar path

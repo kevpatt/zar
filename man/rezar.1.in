@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: BSD-3-Clause
 .\" Copyright (C) 2026 Kevin H. Patterson
-.Dd November 5, 2026
+.Dd November 14, 2026
 .Dt REZAR 1
 .Os zar @PROJECT_VERSION@
 .Sh NAME
@@ -123,7 +123,7 @@ the default.
 also reuses blocks already in the archive that hold the same data,
 decompressing those of the same length to compare them.
 .It Fl \-align Ns Op = Ns Ar n
-Align block payloads to
+Align block payloads, and the end of the archive, to
 .Ar n
 bytes, a power of two up to 1M; without
 .Ar n ,
