@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -30,8 +31,21 @@ mode_t current_umask()
     return mask;
 }
 
+// Whether link() failed because the filesystem has no hard links.
+bool links_unsupported(int error)
+{
+#if defined(EOPNOTSUPP) && EOPNOTSUPP != ENOTSUP
+    if (error == EOPNOTSUPP)
+        return true;
+#endif
+    return error == ENOTSUP || error == EPERM;    // EPERM: FAT on Linux
+}
+
 // Renames `from` to `to` unless `to` exists, atomically where the system
-// can; otherwise link() provides the same guarantee.
+// can; otherwise link() provides the same guarantee. Where neither works
+// (SMB shares, FAT), creating `to` with O_EXCL claims the name, and a plain
+// rename replaces that empty placeholder. Failing even that, a plain rename
+// if `to` doesn't exist, which leaves only a moment for one to appear.
 int rename_exclusive(const char* from, const char* to)
 {
 #if defined(__APPLE__)
@@ -45,10 +59,30 @@ int rename_exclusive(const char* from, const char* to)
     if (errno != ENOSYS && errno != EINVAL)
         return -1;
 #endif
-    if (::link(from, to) != 0)
+    if (::link(from, to) == 0) {
+        ::unlink(from);
+        return 0;
+    }
+    if (!links_unsupported(errno))
         return -1;
-    ::unlink(from);
-    return 0;
+    const int placeholder = ::open(to, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (placeholder < 0) {
+        if (errno == EEXIST)
+            return -1;
+        struct stat st {};
+        if (::lstat(to, &st) == 0) {
+            errno = EEXIST;
+            return -1;
+        }
+        return errno == ENOENT ? ::rename(from, to) : -1;
+    }
+    ::close(placeholder);
+    if (::rename(from, to) == 0)
+        return 0;
+    const int error = errno;
+    ::unlink(to);
+    errno = error;
+    return -1;
 }
 
 } // namespace
@@ -271,10 +305,17 @@ void Output::commit()
     fd_ = -1;
     const auto rc = replace_ ? ::rename(temp_path_.c_str(), final_path_.c_str())
                              : rename_exclusive(temp_path_.c_str(), final_path_.c_str());
-    if (rc != 0 && errno == EEXIST && !replace_)
-        throw std::runtime_error(final_path_.string() + " already exists (use -y to overwrite)");
-    if (rc != 0)
-        throw_errno(final_path_.string());
+    if (rc != 0) {
+        // The archive is complete: however long it took to make, keep it.
+        const int error = errno;
+        const auto kept = temp_path_.string();
+        temp_path_.clear();
+        const auto where = "; the finished archive was kept as " + kept;
+        if (error == EEXIST && !replace_)
+            throw std::runtime_error(final_path_.string() + " already exists (use -y to overwrite)" + where);
+        throw std::runtime_error(final_path_.string() + ": can't rename the archive into place: " +
+                                 std::strerror(error) + where);
+    }
     temp_path_.clear();
 }
 

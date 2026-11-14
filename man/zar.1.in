@@ -336,7 +336,8 @@ standard error.
 A fatal error: bad usage, a missing input, an existing archive without
 .Fl y ,
 and so on.
-No archive is left behind.
+No archive is left behind, except a finished one that couldn't be renamed
+into place, which is kept under its temporary name, given in the message.
 .El
 .Sh EXAMPLES
 Archive

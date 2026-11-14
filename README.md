@@ -21,7 +21,7 @@ project/
 $ unzar project.zar project/src/main.cpp
 ```
 
-> **Status:** development (0.8.0). All three tools work and are well
+> **Status:** development (0.8.1). All three tools work and are well
 > tested, but the [archive format](FORMAT.md) may still change before 1.0.
 
 ## Contents
@@ -414,7 +414,13 @@ All three commands exit with:
 | 2 | fatal error: bad usage, unreadable or invalid archive, existing targets without `-y`, ... |
 
 A fatal error in `zar` or `rezar` leaves no archive behind: each writes to a
-temporary file and renames it into place only on success.
+temporary file (`NAME.zar.XXXXXX`) and renames it into place only on
+success. The exception is a finished archive that can't be renamed, which
+is kept under its temporary name, given in the error, so a long run isn't
+lost. Without `-y`, the rename never replaces a file that appeared while
+the archive was being written, even on filesystems without an atomic way
+to say so, such as SMB shares, where zar first claims the name with an
+empty file.
 
 ## Editing archives with rezar
 

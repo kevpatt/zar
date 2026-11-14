@@ -207,7 +207,8 @@ A fatal error: bad usage, a mistake in the lists, an unreadable or solid
 archive, an existing output without
 .Fl y ,
 and so on.
-No archive is left behind.
+No archive is left behind, except a finished one that couldn't be renamed
+into place, which is kept under its temporary name, given in the message.
 .El
 .Sh EXAMPLES
 Replace one file and add a directory, read from
